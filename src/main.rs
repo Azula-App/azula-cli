@@ -10,8 +10,10 @@
 //! * `azula/term/0` — a remote shell ("SSH"-like) bridge over a PTY
 
 mod bridge;
+mod link;
 mod mcp;
 mod proto;
+mod registry;
 mod term;
 
 use anyhow::Result;
@@ -40,21 +42,41 @@ struct Cli {
 enum Command {
     /// Bind the iroh endpoint, print the ticket, and serve until Ctrl-C.
     Serve(ServeArgs),
-    /// Run the MCP↔iroh bridge: an MCP server (Streamable HTTP) that dials an
-    /// Azula app over iroh, so an LLM can connect to the app's session.
+    /// Run the MCP↔iroh bridge: an MCP server (Streamable HTTP) that manages
+    /// connections to one or more Azula app devices over iroh.
     ServeMcp(ServeMcpArgs),
+    /// Pair a new device: save its ticket to the registry.
+    Pair(PairArgs),
+    /// List all registered devices and their registry source.
+    Devices,
 }
 
 /// Options for the `serve-mcp` command (the MCP↔iroh bridge).
 #[derive(Debug, Clone, clap::Args)]
 struct ServeMcpArgs {
-    /// The Azula app's iroh ticket (its session "code") to bridge to.
-    #[arg(long, env = "AZULA_APP_TICKET")]
-    app_ticket: String,
-
     /// Address to serve the MCP-over-HTTP endpoint on (path is /mcp).
     #[arg(long, env = "AZULA_MCP_BIND", default_value = "127.0.0.1:8765")]
     bind: String,
+
+    /// A device ticket URL to connect to (repeatable). Each value is a URL or
+    /// bare ticket in any form accepted by `azula pair`.
+    #[arg(long = "device", value_name = "URL", action = clap::ArgAction::Append)]
+    device: Option<Vec<String>>,
+}
+
+/// Options for `azula pair`.
+#[derive(Debug, Clone, clap::Args)]
+struct PairArgs {
+    /// The device ticket URL or bare token.
+    url: String,
+
+    /// Display name for this device.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Save to the global (~/.azula) registry instead of the project registry.
+    #[arg(long)]
+    global: bool,
 }
 
 /// Options for the `serve` command (also used when run with no subcommand).
@@ -93,9 +115,102 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::ServeMcp(args)) => bridge::run(args.app_ticket, args.bind).await,
+        Some(Command::ServeMcp(args)) => {
+            bridge::run(args.bind, args.device.unwrap_or_default()).await
+        }
         Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Pair(args)) => cmd_pair(args),
+        Some(Command::Devices) => cmd_devices(),
         None => serve(cli.serve).await,
+    }
+}
+
+fn cmd_pair(args: PairArgs) -> Result<()> {
+    let token = match link::parse_ticket(&args.url) {
+        Some(t) => t,
+        None => {
+            eprintln!("error: could not extract a token from {:?}", args.url);
+            std::process::exit(1);
+        }
+    };
+
+    let name = args.name.unwrap_or_else(|| {
+        token.chars().take(8).collect()
+    });
+
+    let device = registry::Device {
+        name: name.clone(),
+        ticket: token.clone(),
+        added_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ),
+    };
+
+    let path = registry::add(device, args.global)?;
+
+    println!("Paired device '{}' (ticket: {}…)", name, token.chars().take(8).collect::<String>());
+    println!("Saved to: {}", path.display());
+    Ok(())
+}
+
+fn cmd_devices() -> Result<()> {
+    let known = registry::load();
+
+    if known.is_empty() {
+        println!("No devices registered. Use `azula pair <URL>` to add one.");
+        return Ok(());
+    }
+
+    // Determine which registry file each device came from for the "source" column.
+    let global_devices = registry::global_path()
+        .map(|p| {
+            if p.exists() {
+                load_names_from_file(&p)
+            } else {
+                vec![]
+            }
+        })
+        .unwrap_or_default();
+
+    let project_devices = registry::project_path()
+        .map(|p| {
+            if p.exists() {
+                load_names_from_file(&p)
+            } else {
+                vec![]
+            }
+        })
+        .unwrap_or_default();
+
+    println!("{:<20} {:<12} {}", "NAME", "FINGERPRINT", "SOURCE");
+    println!("{}", "-".repeat(48));
+    for d in &known {
+        let fingerprint: String = d.ticket.chars().take(8).collect();
+        let source = if project_devices.contains(&d.name) {
+            "project"
+        } else if global_devices.contains(&d.name) {
+            "global"
+        } else {
+            "?"
+        };
+        println!("{:<20} {:<12} {}", d.name, format!("{fingerprint}…"), source);
+    }
+    Ok(())
+}
+
+fn load_names_from_file(path: &std::path::Path) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Reg { devices: Vec<registry::Device> }
+    let data = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    match serde_json::from_str::<Reg>(&data) {
+        Ok(r) => r.devices.into_iter().map(|d| d.name).collect(),
+        Err(_) => vec![],
     }
 }
 

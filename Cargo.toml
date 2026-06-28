@@ -14,6 +14,7 @@ iroh = "1"
 iroh-tickets = "1"
 
 anyhow = "1"
+indexmap = { version = "2", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
