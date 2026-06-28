@@ -91,28 +91,112 @@ cargo run -- serve \
   --mcp-tool echo --mcp-message-arg message
 ```
 
-## `serve-mcp` — the MCP↔iroh bridge
+## `azula pair` — register a device
 
-The inverse of `serve`'s LLM channel, and the runtime behind
-`https://azula.app/mcp/<token>`: an **MCP server over Streamable HTTP** that an
-external LLM client connects to, bridged to a running Azula app over iroh.
+Save an azula app's ticket to the local device registry so `serve-mcp` can
+connect to it automatically.
 
 ```sh
-azula serve-mcp --app-ticket <APP_TICKET> [--bind 127.0.0.1:8765]
+azula pair <URL> [--name <NAME>] [--global]
 ```
 
-It dials the app on `azula/llm/0` using `--app-ticket` (the app's session code)
-and serves an MCP endpoint at `http://<bind>/mcp` exposing two tools to the LLM:
+`<URL>` accepts any of:
+- `https://azula.app/s/<token>`
+- `https://azula.app/connect/<token>`
+- `azula://connect?code=<token>`
+- a bare token string
 
-- `get_messages` — read (and drain) what the user typed in the app's azula
-  conversation.
-- `send_message { text }` — reply; appears as the streamed azula-assistant
-  message in the app.
+`--name` sets the display name (defaults to the first 8 characters of the
+token). `--global` writes to `~/.azula/devices.json` instead of the
+project-local `.azula/devices.json` (the project file is used when inside a git
+tree).
 
-If the app is unreachable the HTTP server still starts and the tools report
-"not connected". v1 is **one session per process** (one `--app-ticket`);
-multi-tenant routing by token is future work (see `../site/URLS.md`). Point
-`mcp.azula.app` (or a Worker proxy of `/mcp/<token>`) at the `--bind` address.
+```sh
+azula pair "https://azula.app/s/abc123" --name myphone
+azula pair "azula://connect?code=abc123" --name myphone --global
+```
+
+## `azula devices` — list registered devices
+
+Print the known device registry (merged from global and project files).
+
+```sh
+azula devices
+```
+
+Output example:
+
+```
+NAME                 FINGERPRINT  SOURCE
+------------------------------------------------
+laptop               testtoke…    project
+myphone              abc12345…    global
+```
+
+Source is `project` (`.azula/devices.json` at git root) or `global`
+(`~/.azula/devices.json`). Project entries win on name collision.
+
+## `serve-mcp` — multi-device MCP↔iroh bridge
+
+The inverse of `serve`'s LLM channel: an **MCP server over Streamable HTTP**
+that an external LLM client connects to, bridging that LLM to one or more
+running Azula app devices over iroh.
+
+```sh
+azula serve-mcp [--bind 127.0.0.1:8765] [--device <URL>]...
+```
+
+On startup the bridge loads the device registry (global + project) and
+best-effort dials every known device in the background. Dial failures are
+non-fatal — the HTTP server still starts and `list_devices` shows their status.
+
+`--device` is repeatable and accepts the same URL / token forms as `azula pair`.
+
+The MCP endpoint is at `http://<bind>/mcp`. Add it to any MCP-capable LLM
+client.
+
+### MCP tools
+
+| Tool             | Description                                              |
+| ---------------- | -------------------------------------------------------- |
+| `connect`        | Pair a new device by URL/token; dials immediately        |
+| `list_devices`   | Show all known devices and live connection status        |
+| `send_message`   | Send text to a device (lazy-reconnects if needed)        |
+| `get_messages`   | Drain the inbox of one device or all devices             |
+| `disconnect`     | Drop a live connection; optionally remove from registry  |
+
+### Flags / environment
+
+| Flag        | Env var            | Default           | Meaning                                    |
+| ----------- | ------------------ | ----------------- | ------------------------------------------ |
+| `--bind`    | `AZULA_MCP_BIND`   | `127.0.0.1:8765`  | Address to serve MCP-over-HTTP on          |
+| `--device`  | —                  | _(none)_          | Extra device URL (repeatable)              |
+
+### Registry files
+
+| Scope   | Path                           | When used                              |
+| ------- | ------------------------------ | -------------------------------------- |
+| project | `<git-root>/.azula/devices.json` | Inside a git tree; commit for team use |
+| global  | `~/.azula/devices.json`        | Always consulted; `azula pair --global`|
+| runtime | `$TMPDIR/azula/bridge.json`    | Live state: pid, bind, connection status |
+
+### Example session
+
+```sh
+# Pair two devices
+azula pair "https://azula.app/s/abc123" --name laptop
+azula pair "azula://connect?code=xyz789" --name phone
+
+# Start the bridge
+azula serve-mcp --bind 127.0.0.1:8765 &
+
+# Point your LLM client's MCP server at http://127.0.0.1:8765/mcp
+# Then use the MCP tools:
+#   list_devices            → shows laptop (connected) + phone (connected)
+#   send_message device=laptop text="hello"
+#   get_messages            → drains all inboxes
+#   disconnect device=phone forget=true
+```
 
 ## ALPNs
 
@@ -167,8 +251,11 @@ azula-cli/
 ├── README.md
 ├── .gitignore
 └── src/
-    ├── main.rs   # clap CLI, endpoint bind, ticket print, eager MCP connect, Router, Ctrl-C
-    ├── proto.rs  # Frame enum + read_frame / write_frame helpers
-    ├── term.rs   # PTY bridge handler (azula/term/0)
-    └── mcp.rs    # LLM relay handler: rmcp MCP client + result streaming + canned fallback
+    ├── main.rs      # clap CLI (serve / serve-mcp / pair / devices), serve loop
+    ├── proto.rs     # Frame enum + read_frame / write_frame helpers
+    ├── term.rs      # PTY bridge handler (azula/term/0)
+    ├── mcp.rs       # LLM relay handler: rmcp MCP client + result streaming + canned fallback
+    ├── bridge.rs    # serve-mcp: multi-device AzulaBridge MCP server
+    ├── link.rs      # parse_ticket: URL / bare-token → token string
+    └── registry.rs  # Device registry: load / add / project_path / global_path
 ```
