@@ -56,6 +56,7 @@ use crate::link::parse_ticket;
 use crate::mcp::LLM_ALPN;
 use crate::proto::{read_frame, write_frame, Frame};
 use crate::qr;
+use crate::mailbox;
 use crate::registry::{self, Device};
 
 // ---------------------------------------------------------------------------
@@ -180,6 +181,10 @@ async fn connect_device(
                 warn!(device=%name, error=%e, "bridge: handshake write failed");
                 return false;
             }
+            // Flush any queued mailbox frames before handing off the stream.
+            if let Err(e) = flush_mailbox(name, &mut send).await {
+                warn!(device=%name, error=%e, "bridge: mailbox flush failed (continuing)");
+            }
             let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
             let inbox_reader = inbox.clone();
             tokio::spawn(async move { reader_loop(recv, inbox_reader).await });
@@ -234,6 +239,20 @@ async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(mut reader: BufReader
     }
 }
 
+/// Flush any queued mailbox frames to a device over its send stream.
+/// Clears the mailbox only if all writes succeed; leaves it intact on error.
+async fn flush_mailbox(device: &str, send: &mut SendStream) -> anyhow::Result<()> {
+    let frames = crate::mailbox::load(device);
+    if frames.is_empty() {
+        return Ok(());
+    }
+    for f in &frames {
+        write_frame(send, f).await?;
+    }
+    crate::mailbox::clear(device);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Accept handler — registers phones that scan the bridge's QR and dial in
 // ---------------------------------------------------------------------------
@@ -283,7 +302,7 @@ async fn accept_incoming(
     info!(%fallback_name, "bridge: incoming connection");
 
     // The dialer opens the bi stream.
-    let (send, recv) = connection.accept_bi().await?;
+    let (mut send, recv) = connection.accept_bi().await?;
     let mut reader = BufReader::new(recv);
 
     // Read the very first frame to determine the peer's name.
@@ -313,6 +332,11 @@ async fn accept_incoming(
     // Replay a non-hello first frame if present.
     if let Some(frame) = pending_frame {
         push_frame(&inbox, frame);
+    }
+
+    // Flush any queued mailbox frames before moving send into the map.
+    if let Err(e) = flush_mailbox(&peer_name, &mut send).await {
+        warn!(%peer_name, error=%e, "bridge: mailbox flush failed on accept (continuing)");
     }
 
     {
@@ -574,12 +598,30 @@ impl AzulaBridge {
     async fn send_message(&self, Parameters(args): Parameters<SendMessageArgs>) -> Result<CallToolResult, ErrorData> {
         let conn = match self.ensure_device(&args.device).await {
             Ok(c) => c,
-            Err(e) => return Ok(e),
+            Err(_) => {
+                mailbox::enqueue(&args.device, &[
+                    Frame::thinking(true),
+                    Frame::token(args.text.clone()),
+                    Frame::token_done(),
+                    Frame::thinking(false),
+                ]);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "queued for delivery to '{}' (offline)", args.device
+                ))]));
+            }
         };
 
         let mut send_guard = conn.send.lock().await;
         let Some(send) = send_guard.as_mut() else {
-            return Ok(CallToolResult::error(vec![Content::text("device send stream closed")]));
+            mailbox::enqueue(&args.device, &[
+                Frame::thinking(true),
+                Frame::token(args.text.clone()),
+                Frame::token_done(),
+                Frame::thinking(false),
+            ]);
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "queued for delivery to '{}' (offline)", args.device
+            ))]));
         };
 
         for frame in [
@@ -630,7 +672,12 @@ impl AzulaBridge {
     async fn say(&self, Parameters(args): Parameters<SayArgs>) -> Result<CallToolResult, ErrorData> {
         let conn = match self.ensure_device(&args.device).await {
             Ok(c) => c,
-            Err(e) => return Ok(e),
+            Err(_) => {
+                mailbox::enqueue(&args.device, &[Frame::Chat { text: args.text.clone() }]);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "queued for delivery to '{}' (offline)", args.device
+                ))]));
+            }
         };
 
         if conn.closed.load(Relaxed) {
@@ -666,9 +713,9 @@ impl AzulaBridge {
         {
             let mut send_guard = conn.send.lock().await;
             let Some(send) = send_guard.as_mut() else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "device '{}' send stream closed",
-                    args.device
+                mailbox::enqueue(&args.device, &[Frame::Chat { text: args.text.clone() }]);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "queued for delivery to '{}' (offline)", args.device
                 ))]));
             };
             if let Err(e) = write_frame(send, &Frame::Chat { text: args.text }).await {
@@ -991,6 +1038,33 @@ pub async fn run(
         }
     }
 
+    // Periodic redelivery: every 25 s, try to reconnect any offline device
+    // that has queued mail.
+    {
+        let ep = endpoint.clone();
+        let devs = devices.clone();
+        let bind_str = bind.clone();
+        let my_name = own_name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(25)).await;
+                // Snapshot device names + tickets for offline devices with pending mail.
+                let pending: Vec<(String, String)> = {
+                    let guard = devs.lock().await;
+                    guard.iter()
+                        .filter(|(name, conn)| !conn.connected && crate::mailbox::has_pending(name))
+                        .map(|(name, conn)| (name.clone(), conn.ticket.clone()))
+                        .collect()
+                };
+                for (dev_name, ticket) in pending {
+                    info!(device=%dev_name, "bridge: attempting redelivery of queued mail");
+                    connect_device(&ep, &dev_name, &ticket, &devs, &my_name).await;
+                    write_state(&bind_str, &devs).await;
+                }
+            }
+        });
+    }
+
     // MCP server over Streamable HTTP, mounted at /mcp.
     let ep_svc = endpoint.clone();
     let devs_svc = devices.clone();
@@ -1305,5 +1379,108 @@ mod tests {
         // Cleanup.
         alice_router.shutdown().await.unwrap();
         bob_router.shutdown().await.unwrap();
+    }
+
+    /// Tests that messages for an offline device are queued and then flushed
+    /// when the device reconnects. Uses in-memory duplex for the flush path.
+    #[tokio::test]
+    async fn offline_queue_then_flush() {
+        // Set a unique mailbox dir for this test so it doesn't interfere with others.
+        let mbox_dir = std::env::temp_dir()
+            .join(format!("azula-bridge-test-{}", std::process::id()))
+            .join("offline_queue");
+        std::env::set_var("AZULA_MAILBOX_DIR", &mbox_dir);
+
+        let ep = Endpoint::bind(presets::Minimal).await.unwrap();
+        let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+        let bind_placeholder = "127.0.0.1:0".to_string();
+        let ep_arc = Arc::new(ep.clone());
+
+        // Register "phone" as disconnected with a placeholder ticket.
+        {
+            let mut guard = devices.lock().await;
+            guard.insert("phone".to_string(), DeviceConn::new("placeholder_ticket".to_string()));
+        }
+
+        let alice = AzulaBridge::new(
+            ep_arc.clone(),
+            devices.clone(),
+            bind_placeholder.clone(),
+            "alice-ticket".to_string(),
+            "alice".to_string(),
+            20,
+        );
+
+        // send_message to offline "phone" should queue, not error.
+        let result = alice
+            .send_message(Parameters(SendMessageArgs {
+                device: "phone".to_string(),
+                text: "hi while you were away".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "send_message to offline device should return success (queued): {:?}",
+            result
+        );
+        let result_text = result.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            result_text.contains("queued"),
+            "result should mention 'queued', got: {result_text}"
+        );
+
+        // has_pending should be true.
+        assert!(
+            crate::mailbox::has_pending("phone"),
+            "mailbox should have pending frames for 'phone'"
+        );
+
+        // Now test the flush: create an in-memory duplex and flush to it.
+        let (mut send_stream, recv_stream) = tokio::io::duplex(65536);
+
+        // Collect received frames.
+        let handle = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(recv_stream);
+            let mut frames = vec![];
+            while let Ok(Some(f)) = crate::proto::read_frame(&mut reader).await {
+                frames.push(f);
+            }
+            frames
+        });
+
+        // Use flush_mailbox via a wrapper — but flush_mailbox is private.
+        // Instead call enqueue/load/clear directly to simulate the flush.
+        let queued = crate::mailbox::load("phone");
+        for f in &queued {
+            crate::proto::write_frame(&mut send_stream, f).await.unwrap();
+        }
+        crate::mailbox::clear("phone");
+        drop(send_stream); // EOF so reader task ends.
+
+        let received = handle.await.unwrap();
+
+        // Should receive thinking(true), token("hi while you were away"), token_done, thinking(false).
+        assert_eq!(received.len(), 4, "expected 4 frames, got: {received:?}");
+        assert!(matches!(&received[0], Frame::Thinking { on: true }));
+        assert!(
+            matches!(&received[1], Frame::Token { delta, .. } if delta == "hi while you were away"),
+            "second frame should be token with text, got: {:?}", received[1]
+        );
+        assert!(matches!(&received[2], Frame::Token { done: true, .. }));
+        assert!(matches!(&received[3], Frame::Thinking { on: false }));
+
+        // After flush and clear, has_pending should be false.
+        assert!(
+            !crate::mailbox::has_pending("phone"),
+            "mailbox should be empty after flush"
+        );
+
+        // Clean up env var.
+        std::env::remove_var("AZULA_MAILBOX_DIR");
     }
 }

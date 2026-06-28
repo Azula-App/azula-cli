@@ -12,6 +12,7 @@
 mod bridge;
 mod demo;
 mod link;
+mod mailbox;
 mod mcp;
 mod proto;
 mod qr;
