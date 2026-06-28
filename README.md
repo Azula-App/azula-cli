@@ -287,6 +287,23 @@ azula serve-mcp --bind 127.0.0.1:8765 &
 #   disconnect device=phone forget=true
 ```
 
+## `azula demo-ui` — push a sample A2UI surface
+
+A quick manual tester for the A2UI render → event → update loop, with no MCP
+client required. It dials a device (by registered name or ticket/URL) on the LLM
+channel, renders a dice surface in the app's azula conversation, and — unless
+`--once` — listens for the user's taps and re-rolls in response.
+
+```sh
+azula demo-ui phone          # render + react to ROLL taps until Ctrl-C
+azula demo-ui phone --once   # render once and exit
+azula demo-ui "https://azula.app/s/<token>"   # dial a ticket directly
+```
+
+Tapping **ROLL** in the app prints the event and pushes an `updateDataModel`
+back, so the dice faces and result update live — exercising the same path the
+LLM uses via `render_ui` / `get_messages` / `update_ui`.
+
 ## ALPNs
 
 | ALPN bytes        | Protocol     |
@@ -309,7 +326,9 @@ trailing `'\n'`; read with a buffered `read_line`.
 | `token`    | server → client  | `delta`, `done` (default false) | LLM token stream                    |
 | `thinking` | server → client  | `on`                         | thinking indicator                     |
 | `term`     | server → client  | `line`                       | shell output chunk                     |
-| `widget`   | (passthrough)    | `widget` (arbitrary JSON)    | server may ignore                      |
+| `a2ui`     | server → client  | `message` (A2UI message JSON) | create/update/delete a UI surface     |
+| `a2ui_action` | client → server | `action` (A2UI action JSON) | user interaction with a surface        |
+| `file_begin` / `file_chunk` / `file_end` | both | (see `proto.rs`)  | chunked file transfer                  |
 
 ### LLM relay flow
 
@@ -340,11 +359,12 @@ azula-cli/
 ├── README.md
 ├── .gitignore
 └── src/
-    ├── main.rs      # clap CLI (serve / serve-mcp / pair / devices / qr), serve loop
+    ├── main.rs      # clap CLI (serve / serve-mcp / pair / devices / qr / demo-ui), serve loop
     ├── proto.rs     # Frame enum + read_frame / write_frame helpers
     ├── term.rs      # PTY bridge handler (azula/term/0)
     ├── mcp.rs       # LLM relay handler: rmcp MCP client + result streaming + canned fallback
     ├── bridge.rs    # serve-mcp: multi-device AzulaBridge MCP server + accept-side handler
+    ├── demo.rs      # demo-ui: dial a device and push a sample A2UI dice surface
     ├── link.rs      # parse_ticket: URL / bare-token → token string
     ├── qr.rs        # pairing_url / render_qr / print_pairing helpers
     └── registry.rs  # Device registry: load / add / project_path / global_path

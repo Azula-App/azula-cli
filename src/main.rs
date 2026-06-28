@@ -10,6 +10,7 @@
 //! * `azula/term/0` — a remote shell ("SSH"-like) bridge over a PTY
 
 mod bridge;
+mod demo;
 mod link;
 mod mcp;
 mod proto;
@@ -52,6 +53,8 @@ enum Command {
     Devices,
     /// Print a QR code for a ticket, URL, or bare token.
     Qr(QrArgs),
+    /// Push a sample A2UI surface to a connected device for manual testing.
+    DemoUi(DemoUiArgs),
 }
 
 /// Options for the `serve-mcp` command (the MCP↔iroh bridge).
@@ -87,6 +90,17 @@ struct PairArgs {
 struct QrArgs {
     /// A ticket, `https://azula.app/s/<token>`, or `azula://connect?code=<token>` URL.
     code: String,
+}
+
+/// Options for `azula demo-ui`.
+#[derive(Debug, Clone, clap::Args)]
+struct DemoUiArgs {
+    /// A registered device name, or a ticket / pairing URL to dial directly.
+    device: String,
+
+    /// Render the sample surface and exit without listening for events.
+    #[arg(long)]
+    once: bool,
 }
 
 /// Options for the `serve` command (also used when run with no subcommand).
@@ -132,6 +146,7 @@ async fn main() -> Result<()> {
         Some(Command::Pair(args)) => cmd_pair(args),
         Some(Command::Devices) => cmd_devices(),
         Some(Command::Qr(args)) => cmd_qr(args),
+        Some(Command::DemoUi(args)) => demo::run(args.device, args.once).await,
         None => serve(cli.serve).await,
     }
 }
