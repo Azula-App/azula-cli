@@ -196,10 +196,11 @@ client.
 
 | Tool             | Description                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------ |
-| `connect`        | Pair a new device by URL/token; dials immediately                                    |
+| `connect`        | Pair a new device or peer bridge by URL/token; dials immediately                     |
 | `list_devices`   | Show all known devices and live connection status                                    |
-| `send_message`   | Send text to a device (lazy-reconnects if needed)                                    |
-| `get_messages`   | Drain the inbox of one device or all devices (chat text + `ui-event:` lines)         |
+| `send_message`   | Send text to an azula app device (lazy-reconnects if needed)                         |
+| `get_messages`   | Drain the inbox of one device or all devices (chat text + peer messages + `ui-event:` lines) |
+| `say`            | Send a peer-to-peer chat message to another bridge; replies arrive via `get_messages` |
 | `render_ui`      | Render an A2UI declarative surface on a device                                        |
 | `update_ui`      | Update a surface's data model at a JSON-pointer path (react to a `ui-event`)          |
 | `delete_ui`      | Remove a surface from a device                                                        |
@@ -254,12 +255,38 @@ React by mutating the data model:
 { "device": "phone", "surface_id": "ui-1", "path": "/you", "value": "⚄" }
 ```
 
+### Two LLMs talking
+
+Two `serve-mcp` instances can converse directly over iroh using the `say` tool.
+
+```sh
+# Start alice
+azula serve-mcp --name alice --bind 127.0.0.1:8765 &
+# Start bob (grab alice's ticket from her startup banner)
+azula serve-mcp --name bob --bind 127.0.0.1:8766 &
+
+# From alice's LLM session:
+#   connect url=<bob_ticket> name=bob
+#   say device=bob text="Hello, Bob!"
+#   get_messages device=bob   # → Bob's reply arrives here
+
+# From bob's LLM session:
+#   get_messages device=alice # → "Hello, Bob!"
+#   say device=alice text="Hi Alice, I'm here."
+```
+
+When Alice dials Bob, she sends a `hello` frame first so Bob registers her by
+name (rather than a `scan-` prefix). Replies flow symmetrically. The bridge
+enforces `--max-turns` hard cap per peer; `say done=true` closes early.
+
 ### Flags / environment
 
-| Flag        | Env var            | Default           | Meaning                                    |
-| ----------- | ------------------ | ----------------- | ------------------------------------------ |
-| `--bind`    | `AZULA_MCP_BIND`   | `127.0.0.1:8765`  | Address to serve MCP-over-HTTP on          |
-| `--device`  | —                  | _(none)_          | Extra device URL (repeatable)              |
+| Flag           | Env var            | Default                        | Meaning                                                   |
+| -------------- | ------------------ | ------------------------------ | --------------------------------------------------------- |
+| `--bind`       | `AZULA_MCP_BIND`   | `127.0.0.1:8765`               | Address to serve MCP-over-HTTP on                         |
+| `--device`     | —                  | _(none)_                       | Extra device URL (repeatable)                             |
+| `--name`       | —                  | `bridge-<first 8 of node id>`  | Display name sent in `hello` to peer bridges              |
+| `--max-turns`  | —                  | `20`                           | Hard per-peer turn cap for bridge-to-bridge conversations |
 
 ### Registry files
 
@@ -321,6 +348,7 @@ trailing `'\n'`; read with a buffered `read_line`.
 
 | `type`     | Direction        | Fields                       | Meaning                                |
 | ---------- | ---------------- | ---------------------------- | -------------------------------------- |
+| `hello`    | peer → peer      | `name`                       | sent as the first frame when a bridge dials another bridge; names the dialer |
 | `chat`     | client → server  | `text`                       | LLM prompt / peer chat                 |
 | `input`    | client → server  | `text`                       | terminal keystrokes / command          |
 | `token`    | server → client  | `delta`, `done` (default false) | LLM token stream                    |

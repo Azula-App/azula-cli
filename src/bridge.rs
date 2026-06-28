@@ -1,12 +1,14 @@
 //! `serve-mcp` — multi-device MCP↔iroh bridge.
 //!
 //! Runs an MCP server over Streamable HTTP.  An external LLM client connects
-//! and uses these tools to manage azula device sessions:
+//! and uses these tools to manage azula device sessions and peer-bridge
+//! conversations:
 //!
-//! - `connect`        — pair a new device by ticket/URL
+//! - `connect`        — pair a new device or peer bridge by ticket/URL
 //! - `list_devices`   — show known + live-connection status
-//! - `send_message`   — send text to a device (streamed assistant reply)
-//! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines
+//! - `send_message`   — send text to an azula app device (streamed assistant reply)
+//! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines + peer messages
+//! - `say`            — send a peer-to-peer chat message to another bridge
 //! - `render_ui`      — render an A2UI declarative surface on a device
 //! - `update_ui`      — update a surface's data model (react to a `ui-event`)
 //! - `delete_ui`      — remove a surface
@@ -18,12 +20,19 @@
 //! its azula conversation, and sends an `a2ui_action` frame back when the user
 //! interacts — which the reader surfaces through `get_messages`.
 //!
+//! Two bridges can talk to each other: when `connect` dials a remote bridge,
+//! a `hello` frame is sent first so the peer can name this bridge. Then
+//! `say` delivers chat frames peer-to-peer. `get_messages` returns both app
+//! chat and peer chat from the same inbox. The bridge enforces a hard
+//! per-peer `max_turns` cap; `say done=true` ends the conversation early.
+//!
 //! On startup the bridge loads the registry and dials every known device in the
 //! background (failures are non-fatal).
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 use anyhow::Result;
 use iroh::endpoint::presets;
@@ -63,6 +72,10 @@ struct DeviceConn {
     inbox: Inbox,
     ticket: String,
     connected: bool,
+    /// Turn counter for peer bridge conversations.
+    turns: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether this conversation has been closed (turn limit or explicit done).
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DeviceConn {
@@ -72,7 +85,15 @@ impl DeviceConn {
             inbox: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             ticket,
             connected: false,
+            turns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Reset conversation state (turns=0, closed=false) — call on (re)connect.
+    fn reset_conversation(&self) {
+        self.turns.store(0, Relaxed);
+        self.closed.store(false, Relaxed);
     }
 }
 
@@ -138,14 +159,23 @@ async fn dial_device(
 }
 
 /// Dial and register a device in the map.  Returns whether it connected.
+/// Sends `Frame::Hello { name: own_name }` as the very first frame, then the
+/// `thinking(false)` handshake.  Calls `reset_conversation()` on the DeviceConn.
 async fn connect_device(
     endpoint: &Endpoint,
     name: &str,
     ticket: &str,
     devices: &DeviceMap,
+    own_name: &str,
 ) -> bool {
     match dial_device(endpoint, ticket).await {
         Ok((mut send, recv)) => {
+            // Send hello so the peer can name us.
+            if let Err(e) = write_frame(&mut send, &Frame::Hello { name: own_name.into() }).await {
+                warn!(device=%name, error=%e, "bridge: hello write failed");
+                return false;
+            }
+            // Legacy handshake frame for azula app clients.
             if let Err(e) = write_frame(&mut send, &Frame::thinking(false)).await {
                 warn!(device=%name, error=%e, "bridge: handshake write failed");
                 return false;
@@ -160,6 +190,7 @@ async fn connect_device(
             conn.inbox = inbox;
             conn.connected = true;
             conn.ticket = ticket.to_string();
+            conn.reset_conversation();
             info!(device=%name, "bridge: connected");
             true
         }
@@ -174,19 +205,26 @@ async fn reader_loop(recv: RecvStream, inbox: Inbox) {
     read_frames_into(BufReader::new(recv), inbox).await
 }
 
+/// Push a single frame into an inbox (Chat → text, A2uiAction → `ui-event:` line).
+fn push_frame(inbox: &Inbox, frame: Frame) {
+    match frame {
+        Frame::Chat { text } => inbox.lock().unwrap().push_back(text),
+        Frame::A2uiAction { action } => {
+            let line = format!("ui-event: {}", serde_json::to_string(&action).unwrap_or_default());
+            inbox.lock().unwrap().push_back(line);
+        }
+        _ => {}
+    }
+}
+
 /// Drain frames from a buffered reader into a device inbox. Chat text passes
 /// through verbatim; an A2UI action becomes a parseable `ui-event:` line so the
-/// LLM can react (match on surfaceId/name). Generic over the reader so the
-/// behavior is unit-testable over an in-memory pipe.
+/// LLM can react (match on surfaceId and respond with `update_ui`). Generic
+/// over the reader so the behavior is unit-testable over an in-memory pipe.
 async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(mut reader: BufReader<R>, inbox: Inbox) {
     loop {
         match read_frame(&mut reader).await {
-            Ok(Some(Frame::Chat { text })) => inbox.lock().unwrap().push_back(text),
-            Ok(Some(Frame::A2uiAction { action })) => {
-                let line = format!("ui-event: {}", serde_json::to_string(&action).unwrap_or_default());
-                inbox.lock().unwrap().push_back(line);
-            }
-            Ok(Some(_)) => {}
+            Ok(Some(frame)) => push_frame(&inbox, frame),
             Ok(None) => break,
             Err(e) => {
                 warn!(error = %e, "bridge: app stream read error");
@@ -234,39 +272,74 @@ async fn accept_incoming(
     bind: String,
     counter: Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<()> {
-    // Derive a stable name from the remote node id (first 8 hex chars) or
-    // fall back to scan-<n> if the id string is somehow too short.
     let remote_id_str = connection.remote_id().to_string();
-    let name = if remote_id_str.len() >= 8 {
+    let fallback_name = if remote_id_str.len() >= 8 {
         format!("scan-{}", &remote_id_str[..8])
     } else {
         let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("scan-{n}")
     };
 
-    info!(%name, "bridge: incoming connection from scanned device");
+    info!(%fallback_name, "bridge: incoming connection");
 
-    // Accepted connections use accept_bi (the app opens the bi stream).
+    // The dialer opens the bi stream.
     let (send, recv) = connection.accept_bi().await?;
+    let mut reader = BufReader::new(recv);
+
+    // Read the very first frame to determine the peer's name.
+    // If it's a Hello, use the name field; otherwise fall back to scan-<id>.
+    let (peer_name, pending_frame) = match read_frame(&mut reader).await {
+        Ok(Some(Frame::Hello { name })) => {
+            let sanitized = if name.trim().is_empty() {
+                fallback_name.clone()
+            } else {
+                name
+            };
+            info!(peer=%sanitized, "bridge: hello from peer");
+            (sanitized, None)
+        }
+        Ok(Some(other)) => {
+            // Non-hello first frame — use fallback name, replay frame.
+            (fallback_name.clone(), Some(other))
+        }
+        Ok(None) | Err(_) => {
+            // Clean close or parse error — drop without registering.
+            return Ok(());
+        }
+    };
 
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    let inbox_reader = inbox.clone();
-    tokio::spawn(async move { reader_loop(recv, inbox_reader).await });
 
-    let conn = DeviceConn {
-        send: Arc::new(AsyncMutex::new(Some(send))),
-        inbox,
-        ticket: remote_id_str.clone(),
-        connected: true,
-    };
+    // Replay a non-hello first frame if present.
+    if let Some(frame) = pending_frame {
+        push_frame(&inbox, frame);
+    }
 
     {
         let mut guard = devices.lock().await;
-        guard.insert(name.clone(), conn);
+        let entry = guard.entry(peer_name.clone()).or_insert_with(|| DeviceConn {
+            send: Arc::new(AsyncMutex::new(None)),
+            inbox: inbox.clone(),
+            ticket: remote_id_str.clone(),
+            connected: false,
+            turns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        // Update the send stream and status; preserve turns/closed so an
+        // ongoing conversation is not interrupted by a re-dial from the peer.
+        *entry.send.lock().await = Some(send);
+        entry.connected = true;
+        entry.ticket = remote_id_str.clone();
+        // Update inbox to point at our newly created one so the reader below
+        // drains into the same Inbox the entry holds.
+        entry.inbox = inbox.clone();
     }
 
     write_state(&bind, &devices).await;
-    info!(%name, "bridge: scanned device registered");
+    info!(%peer_name, "bridge: peer registered");
+
+    // Continue draining frames; reader already consumed the hello.
+    read_frames_into(reader, inbox).await;
     Ok(())
 }
 
@@ -297,6 +370,17 @@ struct SendMessageArgs {
 struct GetMessagesArgs {
     /// If specified, drain only this device; otherwise drain all devices.
     device: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SayArgs {
+    /// The peer bridge name to send to (as registered in the device map).
+    device: String,
+    /// The message text to deliver to the peer.
+    text: String,
+    /// If true, mark this conversation as done after sending (sends a closing notice to the peer).
+    done: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -358,18 +442,37 @@ pub struct AzulaBridge {
     bind: String,
     /// The bridge's own iroh ticket (base32 string) used by `start_pairing`.
     pairing_ticket: String,
+    /// This bridge's display name (sent as `hello` to peer bridges).
+    own_name: String,
+    /// Hard turn cap per peer bridge conversation.
+    max_turns: u64,
     #[allow(dead_code)]
     tool_router: ToolRouter<AzulaBridge>,
 }
 
 #[tool_router]
 impl AzulaBridge {
-    fn new(endpoint: Arc<Endpoint>, devices: DeviceMap, bind: String, pairing_ticket: String) -> Self {
-        Self { endpoint, devices, bind, pairing_ticket, tool_router: Self::tool_router() }
+    fn new(
+        endpoint: Arc<Endpoint>,
+        devices: DeviceMap,
+        bind: String,
+        pairing_ticket: String,
+        own_name: String,
+        max_turns: u64,
+    ) -> Self {
+        Self {
+            endpoint,
+            devices,
+            bind,
+            pairing_ticket,
+            own_name,
+            max_turns,
+            tool_router: Self::tool_router(),
+        }
     }
 
-    /// Connect to a new azula device by ticket URL or bare token.
-    #[tool(description = "Connect to a new azula device by ticket URL (https://azula.app/s/<token>, azula://connect?code=<token>) or bare token. Optionally provide a display name.")]
+    /// Connect to a new azula device or peer bridge by ticket URL or bare token.
+    #[tool(description = "Connect to a new azula device or peer bridge by ticket URL (https://azula.app/s/<token>, azula://connect?code=<token>) or bare token. Optionally provide a display name. When connecting to another bridge, a hello frame is exchanged so the remote bridge can name this one.")]
     async fn connect(&self, Parameters(args): Parameters<ConnectArgs>) -> Result<CallToolResult, ErrorData> {
         let token = match parse_ticket(&args.url) {
             Some(t) => t,
@@ -379,7 +482,6 @@ impl AzulaBridge {
         // Derive name if absent.
         let name = args.name.unwrap_or_else(|| {
             let prefix: String = token.chars().take(8).collect();
-            // Make sure name is unique.
             prefix
         });
 
@@ -397,7 +499,15 @@ impl AzulaBridge {
         }
 
         // Dial the device.
-        let connected = connect_device(&self.endpoint, &name, &token, &self.devices).await;
+        let connected = connect_device(&self.endpoint, &name, &token, &self.devices, &self.own_name).await;
+
+        // If now connected, reset the conversation state.
+        if connected {
+            let guard = self.devices.lock().await;
+            if let Some(conn) = guard.get(&name) {
+                conn.reset_conversation();
+            }
+        }
 
         // If not yet in map, add a placeholder.
         {
@@ -486,7 +596,7 @@ impl AzulaBridge {
     }
 
     /// Drain new messages from one device or all devices.
-    #[tool(description = "Drain new inbound messages from a named device, or from all devices if no device name is given. Lines are either the user's chat text or `ui-event: {\"name\":...,\"surfaceId\":...,\"sourceComponentId\":...,\"context\":{...}}` JSON describing an interaction with an A2UI surface rendered via `render_ui` (match on surfaceId and respond with `update_ui`).")]
+    #[tool(description = "Drain new inbound messages from a named device or peer bridge, or from all devices if no device name is given. Lines are either the peer's chat text (from `say` calls by another bridge) or the user's chat text, or `ui-event: {\"name\":...,\"surfaceId\":...,\"sourceComponentId\":...,\"context\":{...}}` JSON describing an interaction with an A2UI surface rendered via `render_ui` (match on surfaceId and respond with `update_ui`).")]
     async fn get_messages(&self, Parameters(args): Parameters<GetMessagesArgs>) -> Result<CallToolResult, ErrorData> {
         let guard = self.devices.lock().await;
 
@@ -513,6 +623,79 @@ impl AzulaBridge {
             let text = if all.is_empty() { "(no new messages)".to_string() } else { all.join("\n") };
             Ok(CallToolResult::success(vec![Content::text(text)]))
         }
+    }
+
+    /// Send a peer-to-peer chat message to another bridge.
+    #[tool(description = "Send a peer-to-peer chat message to another azula bridge (not an app device). The message appears in that bridge's `get_messages` inbox. Replies from the peer arrive via `get_messages` on this bridge. Set `done=true` to signal the end of the conversation (sends a closing notice to the peer). The bridge enforces a hard per-peer turn cap (`max_turns`); once reached the conversation is closed automatically. Use `connect` first to establish the iroh connection.")]
+    async fn say(&self, Parameters(args): Parameters<SayArgs>) -> Result<CallToolResult, ErrorData> {
+        let conn = match self.ensure_device(&args.device).await {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
+        };
+
+        if conn.closed.load(Relaxed) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "conversation with '{}' is closed",
+                args.device
+            ))]));
+        }
+
+        let n = conn.turns.fetch_add(1, Relaxed);
+        let max = self.max_turns;
+
+        if n >= max {
+            // Send a turn-limit notice to the peer, then close.
+            {
+                let mut send_guard = conn.send.lock().await;
+                if let Some(send) = send_guard.as_mut() {
+                    let _ = write_frame(
+                        send,
+                        &Frame::Chat { text: "[conversation ended: turn limit]".into() },
+                    )
+                    .await;
+                }
+            }
+            conn.closed.store(true, Relaxed);
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "turn limit ({max}) reached for '{}'",
+                args.device
+            ))]));
+        }
+
+        // Send the chat frame.
+        {
+            let mut send_guard = conn.send.lock().await;
+            let Some(send) = send_guard.as_mut() else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "device '{}' send stream closed",
+                    args.device
+                ))]));
+            };
+            if let Err(e) = write_frame(send, &Frame::Chat { text: args.text }).await {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "failed to send to '{}': {e}",
+                    args.device
+                ))]));
+            }
+
+            if args.done == Some(true) {
+                let closing = Frame::Chat {
+                    text: format!("[conversation ended by {}]", self.own_name),
+                };
+                let _ = write_frame(send, &closing).await;
+            }
+        }
+
+        if args.done == Some(true) {
+            conn.closed.store(true, Relaxed);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "delivered to '{}' (turn {}/{})",
+            args.device,
+            n + 1,
+            max
+        ))]))
     }
 
     /// Render an A2UI declarative UI surface on a device.
@@ -661,7 +844,7 @@ impl AzulaBridge {
             }
             .or_else(|| registry::load().into_iter().find(|d| d.name == device).map(|d| d.ticket));
             if let Some(t) = ticket {
-                connect_device(&self.endpoint, device, &t, &self.devices).await;
+                connect_device(&self.endpoint, device, &t, &self.devices, &self.own_name).await;
             }
         }
 
@@ -712,10 +895,13 @@ impl ServerHandler for AzulaBridge {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
-            "Multi-device azula bridge. Use `connect` to pair a device, `list_devices` to see \
-             status, `send_message` / `get_messages` to communicate, `disconnect` to close. \
-             To show a rich UI, call `render_ui` with A2UI components; user interactions come \
-             back through `get_messages` as `ui-event:` lines — react with `update_ui`."
+            "Multi-device azula bridge. Use `connect` to pair a device or peer bridge, \
+             `list_devices` to see status, `send_message` / `get_messages` to communicate \
+             with azula app devices, `say` to exchange peer-to-peer messages with another \
+             bridge (replies arrive via `get_messages`), `disconnect` to close a connection. \
+             To show a rich UI on an app device, call `render_ui` with A2UI components; \
+             user interactions come back through `get_messages` as `ui-event:` lines — \
+             react with `update_ui`."
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -727,15 +913,21 @@ impl ServerHandler for AzulaBridge {
 // Entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run(bind: String, device_urls: Vec<String>) -> Result<()> {
+pub async fn run(
+    bind: String,
+    device_urls: Vec<String>,
+    name: Option<String>,
+    max_turns: u64,
+) -> Result<()> {
     let raw_endpoint = Endpoint::bind(presets::N0).await?;
     info!("bridge endpoint coming online…");
     raw_endpoint.online().await;
 
     let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
 
-    // Build an iroh Router that accepts incoming azula app connections (from
-    // devices that scanned the bridge's QR code) and registers them.
+    // Build an iroh Router that accepts incoming azula app / peer bridge
+    // connections (from devices that scanned the bridge's QR code) and
+    // registers them.
     let accept_handler = BridgeAcceptHandler::new(devices.clone(), bind.clone());
     let iroh_router = Router::builder(raw_endpoint)
         .accept(LLM_ALPN, accept_handler)
@@ -747,6 +939,14 @@ pub async fn run(bind: String, device_urls: Vec<String>) -> Result<()> {
 
     // Compute the bridge's own pairing ticket for QR / start_pairing tool.
     let bridge_ticket = EndpointTicket::new(endpoint.addr()).to_string();
+
+    // Compute own_name: use --name if given, else derive from the endpoint id.
+    let endpoint_id_str = endpoint.id().to_string();
+    let own_name = name.unwrap_or_else(|| {
+        let len = endpoint_id_str.len();
+        format!("bridge-{}", &endpoint_id_str[..8_usize.min(len)])
+    });
+    info!(own_name=%own_name, "bridge: own name");
 
     // Load registry and pre-populate the device map.
     let known = registry::load();
@@ -778,12 +978,14 @@ pub async fn run(bind: String, device_urls: Vec<String>) -> Result<()> {
             .collect();
         drop(guard);
 
-        for (name, ticket) in entries {
+        let own_name_clone = own_name.clone();
+        for (dev_name, ticket) in entries {
             let ep = endpoint.clone();
             let devs = devices.clone();
             let bind_str = bind.clone();
+            let my_name = own_name_clone.clone();
             tokio::spawn(async move {
-                connect_device(&ep, &name, &ticket, &devs).await;
+                connect_device(&ep, &dev_name, &ticket, &devs, &my_name).await;
                 write_state(&bind_str, &devs).await;
             });
         }
@@ -794,8 +996,16 @@ pub async fn run(bind: String, device_urls: Vec<String>) -> Result<()> {
     let devs_svc = devices.clone();
     let bind_svc = bind.clone();
     let ticket_svc = bridge_ticket.clone();
+    let own_name_svc = own_name.clone();
     let service = StreamableHttpService::new(
-        move || Ok(AzulaBridge::new(ep_svc.clone(), devs_svc.clone(), bind_svc.clone(), ticket_svc.clone())),
+        move || Ok(AzulaBridge::new(
+            ep_svc.clone(),
+            devs_svc.clone(),
+            bind_svc.clone(),
+            ticket_svc.clone(),
+            own_name_svc.clone(),
+            max_turns,
+        )),
         Arc::new(LocalSessionManager::default()),
         Default::default(),
     );
@@ -848,5 +1058,252 @@ mod tests {
         assert!(got[1].starts_with("ui-event: "), "not a ui-event line: {}", got[1]);
         assert!(got[1].contains(r#""name":"roll""#), "missing action name: {}", got[1]);
         assert!(got[1].contains(r#""surfaceId":"dice-1""#), "missing surfaceId: {}", got[1]);
+    }
+
+    /// Two bridges connect to each other over iroh. Alice dials Bob, says "ping",
+    /// Bob says "pong" back. The turn limit is enforced at 3 turns.
+    #[tokio::test]
+    async fn bridge_to_bridge_relay() {
+        // Bind two separate iroh endpoints.  We use Minimal (no relay) so the
+        // test works offline; we skip `online()` since that waits for a relay.
+        let alice_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+        let bob_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+
+        let alice_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+        let bob_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        let bind_placeholder = "127.0.0.1:0".to_string();
+
+        // Build iroh routers with accept handlers.
+        let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone());
+        let alice_router = Router::builder(alice_raw_ep)
+            .accept(LLM_ALPN, alice_accept)
+            .spawn();
+
+        let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone());
+        let bob_router = Router::builder(bob_raw_ep)
+            .accept(LLM_ALPN, bob_accept)
+            .spawn();
+
+        let alice_ep = Arc::new(alice_router.endpoint().clone());
+        let bob_ep = Arc::new(bob_router.endpoint().clone());
+
+        let alice_ticket = EndpointTicket::new(alice_ep.addr()).to_string();
+        let bob_ticket = EndpointTicket::new(bob_ep.addr()).to_string();
+
+        // Create the AzulaBridge handles.
+        let alice = AzulaBridge::new(
+            alice_ep.clone(),
+            alice_devices.clone(),
+            bind_placeholder.clone(),
+            alice_ticket.clone(),
+            "alice".to_string(),
+            3,
+        );
+        let bob = AzulaBridge::new(
+            bob_ep.clone(),
+            bob_devices.clone(),
+            bind_placeholder.clone(),
+            bob_ticket.clone(),
+            "bob".to_string(),
+            3,
+        );
+
+        // Alice connects to Bob.
+        let connect_result = alice
+            .connect(Parameters(ConnectArgs {
+                url: bob_ticket.clone(),
+                name: Some("bob".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !connect_result.is_error.unwrap_or(false),
+            "connect should succeed: {:?}",
+            connect_result
+        );
+
+        // Wait for Bob's accept handler to register "alice".
+        let mut registered = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let guard = bob_devices.lock().await;
+            if guard.contains_key("alice") {
+                registered = true;
+                break;
+            }
+        }
+        assert!(registered, "bob should have 'alice' in his device map after hello");
+
+        // Alice says "ping" to Bob.
+        let say_result = alice
+            .say(Parameters(SayArgs {
+                device: "bob".to_string(),
+                text: "ping".to_string(),
+                done: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !say_result.is_error.unwrap_or(false),
+            "alice say ping should succeed: {:?}",
+            say_result
+        );
+
+        // Give Bob's reader a moment to drain the frame into his inbox.
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let guard = bob_devices.lock().await;
+            if let Some(conn) = guard.get("alice") {
+                if !conn.inbox.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // Drain Bob's inbox via get_messages and assert it contains "ping".
+        let bob_msgs = bob
+            .get_messages(Parameters(GetMessagesArgs { device: Some("alice".to_string()) }))
+            .await
+            .unwrap();
+        assert!(
+            !bob_msgs.is_error.unwrap_or(false),
+            "get_messages should succeed: {:?}",
+            bob_msgs
+        );
+        let bob_text = bob_msgs.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bob_text.contains("ping"), "bob inbox should contain 'ping', got: {bob_text}");
+
+        // Bob needs to connect back to Alice to reply.
+        let bob_connect = bob
+            .connect(Parameters(ConnectArgs {
+                url: alice_ticket.clone(),
+                name: Some("alice".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !bob_connect.is_error.unwrap_or(false),
+            "bob connect to alice should succeed: {:?}",
+            bob_connect
+        );
+
+        // Wait for Alice's accept handler to see bob.
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let guard = alice_devices.lock().await;
+            if guard.contains_key("bob") {
+                break;
+            }
+        }
+
+        // Bob says "pong" to Alice.
+        let pong_result = bob
+            .say(Parameters(SayArgs {
+                device: "alice".to_string(),
+                text: "pong".to_string(),
+                done: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !pong_result.is_error.unwrap_or(false),
+            "bob say pong should succeed: {:?}",
+            pong_result
+        );
+
+        // Wait for Alice's inbox to receive "pong".
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let guard = alice_devices.lock().await;
+            if let Some(conn) = guard.get("bob") {
+                if !conn.inbox.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // Drain Alice's inbox and assert it contains "pong".
+        let alice_msgs = alice
+            .get_messages(Parameters(GetMessagesArgs { device: Some("bob".to_string()) }))
+            .await
+            .unwrap();
+        assert!(
+            !alice_msgs.is_error.unwrap_or(false),
+            "get_messages should succeed: {:?}",
+            alice_msgs
+        );
+        let alice_text = alice_msgs.content.iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(alice_text.contains("pong"), "alice inbox should contain 'pong', got: {alice_text}");
+
+        // Drive Alice past max_turns=3: she's used 1 turn (ping). Say 2 more to hit the limit.
+        // Turn 2
+        let t2 = alice
+            .say(Parameters(SayArgs {
+                device: "bob".to_string(),
+                text: "turn2".to_string(),
+                done: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!t2.is_error.unwrap_or(false), "turn 2 should succeed: {:?}", t2);
+
+        // Turn 3
+        let t3 = alice
+            .say(Parameters(SayArgs {
+                device: "bob".to_string(),
+                text: "turn3".to_string(),
+                done: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!t3.is_error.unwrap_or(false), "turn 3 should succeed: {:?}", t3);
+
+        // Turn 4 — over the limit (max=3).
+        let t4 = alice
+            .say(Parameters(SayArgs {
+                device: "bob".to_string(),
+                text: "turn4".to_string(),
+                done: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            t4.is_error.unwrap_or(false),
+            "turn 4 should fail (over limit): {:?}",
+            t4
+        );
+        assert!(
+            alice_devices.lock().await
+                .get("bob")
+                .map(|c| c.closed.load(Relaxed))
+                .unwrap_or(false),
+            "bob conn should be closed after turn limit"
+        );
+
+        // Subsequent say should immediately return closed error.
+        let t5 = alice
+            .say(Parameters(SayArgs {
+                device: "bob".to_string(),
+                text: "turn5".to_string(),
+                done: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            t5.is_error.unwrap_or(false),
+            "turn 5 should fail (conversation closed): {:?}",
+            t5
+        );
+
+        // Cleanup.
+        alice_router.shutdown().await.unwrap();
+        bob_router.shutdown().await.unwrap();
     }
 }

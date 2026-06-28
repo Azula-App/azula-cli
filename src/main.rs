@@ -68,6 +68,16 @@ struct ServeMcpArgs {
     /// bare ticket in any form accepted by `azula pair`.
     #[arg(long = "device", value_name = "URL", action = clap::ArgAction::Append)]
     device: Option<Vec<String>>,
+
+    /// Display name for this bridge (sent as `hello` to peer bridges so they
+    /// can identify it by name). Defaults to `bridge-<first 8 chars of node id>`.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Hard per-peer turn cap for bridge-to-bridge `say` conversations. Once
+    /// either side reaches this many turns the conversation is closed.
+    #[arg(long = "max-turns", value_name = "N", default_value_t = 20)]
+    max_turns: u64,
 }
 
 /// Options for `azula pair`.
@@ -140,7 +150,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::ServeMcp(args)) => {
-            bridge::run(args.bind, args.device.unwrap_or_default()).await
+            bridge::run(args.bind, args.device.unwrap_or_default(), args.name, args.max_turns).await
         }
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Pair(args)) => cmd_pair(args),
