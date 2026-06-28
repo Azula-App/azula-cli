@@ -19,6 +19,11 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Frame {
+    /// peer -> peer: the sender's display name, sent as the very first frame on
+    /// a new outbound connection so the remote bridge can label the device.
+    #[serde(rename = "hello")]
+    Hello { name: String },
+
     /// client -> server (LLM prompt) and peer chat
     #[serde(rename = "chat")]
     Chat { text: String },
@@ -137,6 +142,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_frame_roundtrips_with_type_tag() {
+        let f = Frame::Hello { name: "alice".into() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"hello","name":"alice"}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::Hello { name } if name == "alice"));
+    }
 
     #[test]
     fn chat_frame_roundtrips_with_type_tag() {
