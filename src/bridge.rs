@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -38,7 +39,7 @@ use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::Endpoint;
+use iroh::{Endpoint, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -254,6 +255,49 @@ async fn flush_mailbox(device: &str, send: &mut SendStream) -> anyhow::Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Node-id matching — reconnect recognition
+// ---------------------------------------------------------------------------
+
+/// Given the node id of an inbound connection, look it up against all known
+/// devices (from the in-memory map and the registry) and return the existing
+/// device name if a ticket matches.
+///
+/// This is a pure function (no I/O) so it is easily unit-tested.
+fn match_known_device(
+    remote_node_id: &EndpointId,
+    map_devices: &HashMap<String, DeviceConn>,
+    registry_devices: &[crate::registry::Device],
+) -> Option<String> {
+    let remote_str = remote_node_id.to_string();
+
+    // Chain in-memory map entries and registry entries together, preferring
+    // in-memory (project wins, same as registry::load()).
+    let ticket_iter = {
+        // Collect (name, ticket) pairs: in-memory map first, then registry
+        // for names not already in the map.
+        let mut pairs: Vec<(String, String)> = map_devices
+            .iter()
+            .map(|(n, c)| (n.clone(), c.ticket.clone()))
+            .collect();
+        for d in registry_devices {
+            if !pairs.iter().any(|(n, _)| n == &d.name) {
+                pairs.push((d.name.clone(), d.ticket.clone()));
+            }
+        }
+        pairs
+    };
+
+    for (name, ticket) in ticket_iter {
+        if let Ok(et) = EndpointTicket::from_str(&ticket) {
+            if et.endpoint_addr().id.to_string() == remote_str {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Accept handler — registers phones that scan the bridge's QR and dial in
 // ---------------------------------------------------------------------------
 
@@ -291,7 +335,8 @@ async fn accept_incoming(
     bind: String,
     counter: Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<()> {
-    let remote_id_str = connection.remote_id().to_string();
+    let remote_id = connection.remote_id();
+    let remote_id_str = remote_id.to_string();
     let fallback_name = if remote_id_str.len() >= 8 {
         format!("scan-{}", &remote_id_str[..8])
     } else {
@@ -301,25 +346,38 @@ async fn accept_incoming(
 
     info!(%fallback_name, "bridge: incoming connection");
 
+    // --- Node-id match: check if this is a known registered device ---
+    // Snapshot current map entries and registry to avoid holding the lock
+    // across async I/O (the bi-stream accept and frame read below).
+    let node_id_match: Option<String> = {
+        let guard = devices.lock().await;
+        let reg = registry::load();
+        match_known_device(&remote_id, &guard, &reg)
+    };
+    if let Some(ref matched) = node_id_match {
+        info!(peer=%matched, "bridge: recognised reconnecting device by node id");
+    }
+
     // The dialer opens the bi stream.
     let (mut send, recv) = connection.accept_bi().await?;
     let mut reader = BufReader::new(recv);
 
     // Read the very first frame to determine the peer's name.
-    // If it's a Hello, use the name field; otherwise fall back to scan-<id>.
+    // Priority: (1) node-id matched known device, (2) Hello frame, (3) scan-<id>.
     let (peer_name, pending_frame) = match read_frame(&mut reader).await {
         Ok(Some(Frame::Hello { name })) => {
-            let sanitized = if name.trim().is_empty() {
-                fallback_name.clone()
-            } else {
-                name
-            };
-            info!(peer=%sanitized, "bridge: hello from peer");
-            (sanitized, None)
+            // Node-id match takes priority over hello name (a registered device
+            // dialling in IS that device, regardless of what name it advertises).
+            let resolved = node_id_match.unwrap_or_else(|| {
+                if name.trim().is_empty() { fallback_name.clone() } else { name }
+            });
+            info!(peer=%resolved, "bridge: hello from peer");
+            (resolved, None)
         }
         Ok(Some(other)) => {
-            // Non-hello first frame — use fallback name, replay frame.
-            (fallback_name.clone(), Some(other))
+            // Non-hello first frame — use node-id match or fallback name, replay frame.
+            let resolved = node_id_match.unwrap_or(fallback_name.clone());
+            (resolved, Some(other))
         }
         Ok(None) | Err(_) => {
             // Clean close or parse error — drop without registering.
@@ -1481,6 +1539,217 @@ mod tests {
         );
 
         // Clean up env var.
+        std::env::remove_var("AZULA_MAILBOX_DIR");
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit test: match_known_device pure helper
+    // -----------------------------------------------------------------------
+
+    /// Verifies that `match_known_device` finds a device whose ticket encodes
+    /// the given remote node id and returns its name, and returns None when
+    /// no ticket matches.
+    #[tokio::test]
+    async fn match_known_device_by_node_id() {
+        // Build two iroh endpoints to get real, distinct node ids.
+        let ep_phone = Endpoint::bind(presets::Minimal).await.unwrap();
+        let ep_other = Endpoint::bind(presets::Minimal).await.unwrap();
+
+        let phone_id = ep_phone.id();
+        let other_id = ep_other.id();
+        let stranger_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+        let stranger_id = stranger_ep.id();
+
+        // Build tickets from the endpoints.
+        let phone_ticket = EndpointTicket::new(ep_phone.addr()).to_string();
+        let other_ticket = EndpointTicket::new(ep_other.addr()).to_string();
+
+        // Device map: "phone" with phone's ticket, "other" with other's ticket.
+        let mut map: HashMap<String, DeviceConn> = HashMap::new();
+        map.insert("phone".to_string(), DeviceConn::new(phone_ticket.clone()));
+        map.insert("other".to_string(), DeviceConn::new(other_ticket.clone()));
+
+        // Empty registry (no on-disk devices in this test).
+        let reg: Vec<crate::registry::Device> = vec![];
+
+        // phone_id → "phone"
+        assert_eq!(
+            match_known_device(&phone_id, &map, &reg),
+            Some("phone".to_string()),
+            "phone's node id should match 'phone'"
+        );
+
+        // other_id → "other"
+        assert_eq!(
+            match_known_device(&other_id, &map, &reg),
+            Some("other".to_string()),
+            "other's node id should match 'other'"
+        );
+
+        // stranger_id → None (not in map or registry)
+        assert_eq!(
+            match_known_device(&stranger_id, &map, &reg),
+            None,
+            "unknown node id should return None"
+        );
+
+        // Now test registry path: device only in registry, not in map.
+        let map_empty: HashMap<String, DeviceConn> = HashMap::new();
+        let reg_with_phone = vec![crate::registry::Device {
+            name: "phone-reg".to_string(),
+            ticket: phone_ticket.clone(),
+            added_at: None,
+        }];
+        assert_eq!(
+            match_known_device(&phone_id, &map_empty, &reg_with_phone),
+            Some("phone-reg".to_string()),
+            "should find device registered only in registry"
+        );
+
+        // Map wins over registry on name collision for same ticket.
+        let reg_conflict = vec![crate::registry::Device {
+            name: "phone-reg".to_string(),
+            ticket: phone_ticket.clone(),
+            added_at: None,
+        }];
+        assert_eq!(
+            match_known_device(&phone_id, &map, &reg_conflict),
+            Some("phone".to_string()),
+            "in-memory map should win over registry for same node id"
+        );
+
+        ep_phone.close().await;
+        ep_other.close().await;
+        stranger_ep.close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration test: reconnecting device is matched by node id, mail flushed
+    // -----------------------------------------------------------------------
+
+    /// A registered device "phone" reconnects by dialling the bridge.
+    /// `accept_incoming` should recognise it by node id (not assign scan-<id>)
+    /// and flush the offline mailbox.
+    #[tokio::test]
+    async fn reconnect_by_node_id_flushes_mailbox() {
+        // Unique mailbox dir for this test.
+        let mbox_dir = std::env::temp_dir()
+            .join(format!("azula-bridge-test-{}-reconnect", std::process::id()));
+        std::env::set_var("AZULA_MAILBOX_DIR", &mbox_dir);
+        // Clean slate.
+        let _ = std::fs::remove_dir_all(&mbox_dir);
+
+        // Two endpoints: bridge and phone.
+        let bridge_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+        let phone_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+
+        // Build the bridge's device map with "phone" pre-registered using
+        // the phone endpoint's real ticket, but disconnected.
+        let phone_ticket = EndpointTicket::new(phone_ep.addr()).to_string();
+        let bridge_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+        {
+            let mut guard = bridge_devices.lock().await;
+            guard.insert("phone".to_string(), DeviceConn::new(phone_ticket.clone()));
+        }
+
+        let bind_placeholder = "127.0.0.1:0".to_string();
+
+        // Enqueue a message for "phone" in the mailbox.
+        crate::mailbox::enqueue("phone", &[
+            Frame::thinking(true),
+            Frame::token("hi reconnected phone".to_string()),
+            Frame::token_done(),
+            Frame::thinking(false),
+        ]);
+        assert!(
+            crate::mailbox::has_pending("phone"),
+            "mailbox should have pending frames before reconnect"
+        );
+
+        // Stand up a bridge accept handler.
+        let bridge_accept = BridgeAcceptHandler::new(bridge_devices.clone(), bind_placeholder.clone());
+        let bridge_router = Router::builder(bridge_raw_ep)
+            .accept(LLM_ALPN, bridge_accept)
+            .spawn();
+        let bridge_ep = Arc::new(bridge_router.endpoint().clone());
+
+        // The phone dials the bridge.
+        let bridge_ticket = EndpointTicket::new(bridge_ep.addr()).to_string();
+        let (mut phone_send, phone_recv) = dial_device(&phone_ep, &bridge_ticket).await
+            .expect("phone should be able to dial bridge");
+
+        // Phone sends a non-hello first frame (simulates an azula app client).
+        let first_frame = Frame::thinking(false);
+        write_frame(&mut phone_send, &first_frame).await
+            .expect("phone should send first frame");
+
+        // Collect frames received by the phone (the flushed mailbox).
+        let recv_handle = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(phone_recv);
+            let mut frames = vec![];
+            // Read up to 4 frames with a timeout so the test doesn't hang.
+            for _ in 0..4 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::proto::read_frame(&mut reader),
+                ).await {
+                    Ok(Ok(Some(f))) => frames.push(f),
+                    _ => break,
+                }
+            }
+            frames
+        });
+
+        // Wait for the bridge's accept handler to finish registering the device.
+        let mut registered_as_phone = false;
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let guard = bridge_devices.lock().await;
+            if let Some(conn) = guard.get("phone") {
+                if conn.connected {
+                    registered_as_phone = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            registered_as_phone,
+            "bridge should register the inbound connection under 'phone' (node-id match)"
+        );
+
+        // Confirm no scan- entry was created.
+        {
+            let guard = bridge_devices.lock().await;
+            let scan_keys: Vec<&String> = guard.keys().filter(|k| k.starts_with("scan-")).collect();
+            assert!(
+                scan_keys.is_empty(),
+                "no scan- entry should exist, but found: {scan_keys:?}"
+            );
+        }
+
+        // Mailbox should be cleared after flush.
+        assert!(
+            !crate::mailbox::has_pending("phone"),
+            "mailbox should be empty after reconnect flush"
+        );
+
+        // The phone should have received the queued frames.
+        let received = recv_handle.await.unwrap();
+        assert_eq!(
+            received.len(), 4,
+            "phone should receive 4 flushed frames, got: {received:?}"
+        );
+        assert!(matches!(&received[0], Frame::Thinking { on: true }));
+        assert!(
+            matches!(&received[1], Frame::Token { delta, .. } if delta == "hi reconnected phone"),
+            "second frame should be token with text, got: {:?}", received[1]
+        );
+        assert!(matches!(&received[2], Frame::Token { done: true, .. }));
+        assert!(matches!(&received[3], Frame::Thinking { on: false }));
+
+        // Cleanup.
+        bridge_router.shutdown().await.unwrap();
+        phone_ep.close().await;
         std::env::remove_var("AZULA_MAILBOX_DIR");
     }
 }
