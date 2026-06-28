@@ -37,7 +37,7 @@ cargo run                 # equivalent to `cargo run -- serve`
 cargo run -- serve
 ```
 
-On startup the server prints a banner like:
+On startup the server prints a banner and a **pairing URL + QR code**:
 
 ```
   Paste this code into the azula app to connect:
@@ -45,10 +45,18 @@ On startup the server prints a banner like:
     <a long ticket string>
 
   Short node id: <node id>
+
+  Pair by scanning:
+
+  https://azula.app/s/<ticket>
+
+  ██▀▀▀██ …
+  …QR…
+  Scan with your phone's camera, or open the URL.
 ```
 
-Copy the ticket string and paste it into the azula app to connect. The server
-runs until you press **Ctrl-C**.
+Point your phone camera at the QR — iOS and Android will offer to open the
+azula app and dial in automatically. The server runs until you press **Ctrl-C**.
 
 ### Flags / environment
 
@@ -89,6 +97,29 @@ Pick a specific tool and message argument:
 cargo run -- serve \
   --mcp-stdio "npx -y @modelcontextprotocol/server-everything" \
   --mcp-tool echo --mcp-message-arg message
+```
+
+## `azula qr` — print a QR code for any ticket
+
+Display a pairing URL and scannable QR code for any ticket, URL, or bare token:
+
+```sh
+azula qr <CODE>
+```
+
+`<CODE>` accepts the same forms as `azula pair`:
+- `https://azula.app/s/<token>`
+- `https://azula.app/connect/<token>`
+- `azula://connect?code=<token>`
+- a bare token string
+
+Handy for regenerating a QR when the terminal has scrolled past the startup
+banner, or for sharing a pairing link in a reproducible way.
+
+```sh
+azula qr "https://azula.app/s/abc123"
+# or
+azula qr abc123
 ```
 
 ## `azula pair` — register a device
@@ -146,9 +177,15 @@ running Azula app devices over iroh.
 azula serve-mcp [--bind 127.0.0.1:8765] [--device <URL>]...
 ```
 
-On startup the bridge loads the device registry (global + project) and
-best-effort dials every known device in the background. Dial failures are
-non-fatal — the HTTP server still starts and `list_devices` shows their status.
+On startup the bridge loads the device registry (global + project) and:
+
+1. **Dials** every known registered device in the background (non-fatal on
+   failure — `list_devices` will show them as offline).
+2. **Accepts** incoming connections from devices that scanned the bridge's own
+   QR code (printed at startup, also available via the `start_pairing` MCP
+   tool). Each scanned-in device is registered automatically under a name
+   derived from its remote node-id (e.g. `scan-f1aef7d5`), and behaves
+   identically to a registered dialled device for all tools.
 
 `--device` is repeatable and accepts the same URL / token forms as `azula pair`.
 
@@ -157,13 +194,19 @@ client.
 
 ### MCP tools
 
-| Tool             | Description                                              |
-| ---------------- | -------------------------------------------------------- |
-| `connect`        | Pair a new device by URL/token; dials immediately        |
-| `list_devices`   | Show all known devices and live connection status        |
-| `send_message`   | Send text to a device (lazy-reconnects if needed)        |
-| `get_messages`   | Drain the inbox of one device or all devices             |
-| `disconnect`     | Drop a live connection; optionally remove from registry  |
+| Tool             | Description                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------ |
+| `connect`        | Pair a new device by URL/token; dials immediately                                    |
+| `list_devices`   | Show all known devices and live connection status                                    |
+| `send_message`   | Send text to a device (lazy-reconnects if needed)                                    |
+| `get_messages`   | Drain the inbox of one device or all devices                                         |
+| `disconnect`     | Drop a live connection; optionally remove from registry                              |
+| `start_pairing`  | Return the bridge's pairing URL + a Unicode QR the user can scan to connect         |
+
+The `start_pairing` tool returns a text block containing the URL on the first
+line, the QR code inside a fenced code block, and a one-line hint. The accept
+loop is already running at startup, so scanning the QR and dialling in works
+immediately without any additional setup.
 
 ### Flags / environment
 
@@ -251,11 +294,12 @@ azula-cli/
 ├── README.md
 ├── .gitignore
 └── src/
-    ├── main.rs      # clap CLI (serve / serve-mcp / pair / devices), serve loop
+    ├── main.rs      # clap CLI (serve / serve-mcp / pair / devices / qr), serve loop
     ├── proto.rs     # Frame enum + read_frame / write_frame helpers
     ├── term.rs      # PTY bridge handler (azula/term/0)
     ├── mcp.rs       # LLM relay handler: rmcp MCP client + result streaming + canned fallback
-    ├── bridge.rs    # serve-mcp: multi-device AzulaBridge MCP server
+    ├── bridge.rs    # serve-mcp: multi-device AzulaBridge MCP server + accept-side handler
     ├── link.rs      # parse_ticket: URL / bare-token → token string
+    ├── qr.rs        # pairing_url / render_qr / print_pairing helpers
     └── registry.rs  # Device registry: load / add / project_path / global_path
 ```

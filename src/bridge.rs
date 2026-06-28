@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::endpoint::presets;
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::Endpoint;
 use iroh_tickets::endpoint::EndpointTicket;
 use rmcp::handler::server::tool::ToolRouter;
@@ -36,6 +37,7 @@ use tracing::{info, warn};
 use crate::link::parse_ticket;
 use crate::mcp::LLM_ALPN;
 use crate::proto::{read_frame, write_frame, Frame};
+use crate::qr;
 use crate::registry::{self, Device};
 
 // ---------------------------------------------------------------------------
@@ -46,7 +48,7 @@ type Inbox = Arc<std::sync::Mutex<VecDeque<String>>>;
 type AppSend = Arc<AsyncMutex<Option<SendStream>>>;
 
 /// Per-device live state.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DeviceConn {
     send: AppSend,
     inbox: Inbox,
@@ -169,6 +171,80 @@ async fn reader_loop(recv: RecvStream, inbox: Inbox) {
 }
 
 // ---------------------------------------------------------------------------
+// Accept handler — registers phones that scan the bridge's QR and dial in
+// ---------------------------------------------------------------------------
+
+/// iroh `ProtocolHandler` that accepts incoming azula app connections on
+/// `LLM_ALPN` and registers each as a device in the shared map.
+#[derive(Clone, Debug)]
+struct BridgeAcceptHandler {
+    devices: DeviceMap,
+    bind: String,
+    /// Counter to assign monotonically-increasing names to scanned devices.
+    scan_counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl BridgeAcceptHandler {
+    fn new(devices: DeviceMap, bind: String) -> Self {
+        Self {
+            devices,
+            bind,
+            scan_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+}
+
+impl ProtocolHandler for BridgeAcceptHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        accept_incoming(connection, self.devices.clone(), self.bind.clone(), self.scan_counter.clone())
+            .await
+            .map_err(|e| AcceptError::from_boxed(e.into()))
+    }
+}
+
+async fn accept_incoming(
+    connection: Connection,
+    devices: DeviceMap,
+    bind: String,
+    counter: Arc<std::sync::atomic::AtomicU32>,
+) -> Result<()> {
+    // Derive a stable name from the remote node id (first 8 hex chars) or
+    // fall back to scan-<n> if the id string is somehow too short.
+    let remote_id_str = connection.remote_id().to_string();
+    let name = if remote_id_str.len() >= 8 {
+        format!("scan-{}", &remote_id_str[..8])
+    } else {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("scan-{n}")
+    };
+
+    info!(%name, "bridge: incoming connection from scanned device");
+
+    // Accepted connections use accept_bi (the app opens the bi stream).
+    let (send, recv) = connection.accept_bi().await?;
+
+    let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let inbox_reader = inbox.clone();
+    tokio::spawn(async move { reader_loop(recv, inbox_reader).await });
+
+    let conn = DeviceConn {
+        send: Arc::new(AsyncMutex::new(Some(send))),
+        inbox,
+        ticket: remote_id_str.clone(),
+        connected: true,
+    };
+
+    {
+        let mut guard = devices.lock().await;
+        guard.insert(name.clone(), conn);
+    }
+
+    write_state(&bind, &devices).await;
+    info!(%name, "bridge: scanned device registered");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // MCP tool argument types
 // ---------------------------------------------------------------------------
 
@@ -215,14 +291,16 @@ pub struct AzulaBridge {
     endpoint: Arc<Endpoint>,
     devices: DeviceMap,
     bind: String,
+    /// The bridge's own iroh ticket (base32 string) used by `start_pairing`.
+    pairing_ticket: String,
     #[allow(dead_code)]
     tool_router: ToolRouter<AzulaBridge>,
 }
 
 #[tool_router]
 impl AzulaBridge {
-    fn new(endpoint: Arc<Endpoint>, devices: DeviceMap, bind: String) -> Self {
-        Self { endpoint, devices, bind, tool_router: Self::tool_router() }
+    fn new(endpoint: Arc<Endpoint>, devices: DeviceMap, bind: String, pairing_ticket: String) -> Self {
+        Self { endpoint, devices, bind, pairing_ticket, tool_router: Self::tool_router() }
     }
 
     /// Connect to a new azula device by ticket URL or bare token.
@@ -406,6 +484,17 @@ impl AzulaBridge {
         }
     }
 
+    /// Show the bridge's pairing URL and QR code so a user can scan and connect.
+    #[tool(description = "Return the bridge's pairing URL and a Unicode QR code. The user scans the QR with their phone camera to open the azula app and connect to this bridge automatically. No arguments needed.")]
+    async fn start_pairing(&self) -> Result<CallToolResult, ErrorData> {
+        let url = qr::pairing_url(&self.pairing_ticket);
+        let qr_block = qr::render_qr(&url);
+        let text = format!(
+            "{url}\n\n```\n{qr_block}\n```\n\nScan with your phone's camera or open the URL to pair this device.",
+        );
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
     /// Disconnect from a device, optionally removing it from the registry.
     #[tool(description = "Disconnect from a named device. Set forget=true to also remove it from the device registry.")]
     async fn disconnect(&self, Parameters(args): Parameters<DisconnectArgs>) -> Result<CallToolResult, ErrorData> {
@@ -479,11 +568,25 @@ impl ServerHandler for AzulaBridge {
 // ---------------------------------------------------------------------------
 
 pub async fn run(bind: String, device_urls: Vec<String>) -> Result<()> {
-    let endpoint = Arc::new(Endpoint::bind(presets::N0).await?);
+    let raw_endpoint = Endpoint::bind(presets::N0).await?;
     info!("bridge endpoint coming online…");
-    endpoint.online().await;
+    raw_endpoint.online().await;
 
     let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+
+    // Build an iroh Router that accepts incoming azula app connections (from
+    // devices that scanned the bridge's QR code) and registers them.
+    let accept_handler = BridgeAcceptHandler::new(devices.clone(), bind.clone());
+    let iroh_router = Router::builder(raw_endpoint)
+        .accept(LLM_ALPN, accept_handler)
+        .spawn();
+
+    // Retrieve the endpoint from the router so we use a single endpoint for
+    // both accepting inbound connections and dialing outbound ones.
+    let endpoint = Arc::new(iroh_router.endpoint().clone());
+
+    // Compute the bridge's own pairing ticket for QR / start_pairing tool.
+    let bridge_ticket = EndpointTicket::new(endpoint.addr()).to_string();
 
     // Load registry and pre-populate the device map.
     let known = registry::load();
@@ -530,16 +633,18 @@ pub async fn run(bind: String, device_urls: Vec<String>) -> Result<()> {
     let ep_svc = endpoint.clone();
     let devs_svc = devices.clone();
     let bind_svc = bind.clone();
+    let ticket_svc = bridge_ticket.clone();
     let service = StreamableHttpService::new(
-        move || Ok(AzulaBridge::new(ep_svc.clone(), devs_svc.clone(), bind_svc.clone())),
+        move || Ok(AzulaBridge::new(ep_svc.clone(), devs_svc.clone(), bind_svc.clone(), ticket_svc.clone())),
         Arc::new(LocalSessionManager::default()),
         Default::default(),
     );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let http_router = axum::Router::new().nest_service("/mcp", service);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     print_banner(&bind);
-    axum::serve(listener, router).await?;
+    qr::print_pairing("Pair a device by scanning:", &bridge_ticket);
+    axum::serve(listener, http_router).await?;
     Ok(())
 }
 
