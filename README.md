@@ -199,7 +199,10 @@ client.
 | `connect`        | Pair a new device by URL/token; dials immediately                                    |
 | `list_devices`   | Show all known devices and live connection status                                    |
 | `send_message`   | Send text to a device (lazy-reconnects if needed)                                    |
-| `get_messages`   | Drain the inbox of one device or all devices                                         |
+| `get_messages`   | Drain the inbox of one device or all devices (chat text + `ui-event:` lines)         |
+| `render_ui`      | Render an A2UI declarative surface on a device                                        |
+| `update_ui`      | Update a surface's data model at a JSON-pointer path (react to a `ui-event`)          |
+| `delete_ui`      | Remove a surface from a device                                                        |
 | `disconnect`     | Drop a live connection; optionally remove from registry                              |
 | `start_pairing`  | Return the bridge's pairing URL + a Unicode QR the user can scan to connect         |
 
@@ -207,6 +210,49 @@ The `start_pairing` tool returns a text block containing the URL on the first
 line, the QR code inside a fenced code block, and a one-line hint. The accept
 loop is already running at startup, so scanning the QR and dialling in works
 immediately without any additional setup.
+
+### A2UI — drive native UIs from the LLM
+
+The bridge can render [A2UI](https://github.com/a2ui-project/a2ui) v0.9.1
+declarative surfaces (basic catalog) in the app's azula conversation, and report
+the user's interactions back. The full loop is **`render_ui` → the user taps →
+`get_messages` returns a `ui-event:` line → `update_ui`**.
+
+`render_ui` takes a flat `components` array (exactly one component must have
+`"id":"root"`), an optional initial `data_model` (backing `{"path":"/ptr"}`
+bindings), and an optional `surface_id` (auto-generated as `ui-<n>` otherwise). It
+sends `createSurface` → `updateComponents` → `updateDataModel` and returns the
+surface id.
+
+```jsonc
+// render_ui — a dice surface
+{
+  "device": "phone",
+  "components": [
+    { "id": "root",  "component": "Column", "children": ["title", "faces", "roll"] },
+    { "id": "title", "component": "Text",   "text": "AZULA · DICE", "variant": "caption" },
+    { "id": "faces", "component": "Text",   "text": { "path": "/you" }, "variant": "h1" },
+    { "id": "rollL", "component": "Text",   "text": "ROLL" },
+    { "id": "roll",  "component": "Button", "child": "rollL", "variant": "primary",
+      "action": { "event": { "name": "roll" } } }
+  ],
+  "data_model": { "you": "?" }
+}
+// → "rendered surface 'ui-1' on 'phone'"
+```
+
+When the user taps the button, `get_messages` yields:
+
+```
+ui-event: {"name":"roll","surfaceId":"ui-1","sourceComponentId":"roll","context":{}}
+```
+
+React by mutating the data model:
+
+```jsonc
+// update_ui
+{ "device": "phone", "surface_id": "ui-1", "path": "/you", "value": "⚄" }
+```
 
 ### Flags / environment
 

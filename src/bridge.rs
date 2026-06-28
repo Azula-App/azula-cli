@@ -1,13 +1,22 @@
 //! `serve-mcp` — multi-device MCP↔iroh bridge.
 //!
 //! Runs an MCP server over Streamable HTTP.  An external LLM client connects
-//! and uses five tools to manage azula device sessions:
+//! and uses these tools to manage azula device sessions:
 //!
 //! - `connect`        — pair a new device by ticket/URL
 //! - `list_devices`   — show known + live-connection status
-//! - `send_message`   — send text to a device
-//! - `get_messages`   — drain the inbox (one device or all)
+//! - `send_message`   — send text to a device (streamed assistant reply)
+//! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines
+//! - `render_ui`      — render an A2UI declarative surface on a device
+//! - `update_ui`      — update a surface's data model (react to a `ui-event`)
+//! - `delete_ui`      — remove a surface
 //! - `disconnect`     — drop a live connection, optionally forget the device
+//! - `start_pairing`  — show the bridge's pairing URL + QR code
+//!
+//! The app renders an `a2ui` frame's message (A2UI v0.9.1: createSurface /
+//! updateComponents / updateDataModel / deleteSurface) as a native surface in
+//! its azula conversation, and sends an `a2ui_action` frame back when the user
+//! interacts — which the reader surfaces through `get_messages`.
 //!
 //! On startup the bridge loads the registry and dials every known device in the
 //! background (failures are non-fatal).
@@ -68,6 +77,12 @@ impl DeviceConn {
 }
 
 type DeviceMap = Arc<AsyncMutex<HashMap<String, DeviceConn>>>;
+
+/// Monotonic counter for auto-generated A2UI surface ids (`ui-<n>`).
+static SURFACE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The A2UI basic catalog this bridge targets.
+const A2UI_CATALOG: &str = "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json";
 
 // ---------------------------------------------------------------------------
 // Runtime state file
@@ -156,10 +171,21 @@ async fn connect_device(
 }
 
 async fn reader_loop(recv: RecvStream, inbox: Inbox) {
-    let mut reader = BufReader::new(recv);
+    read_frames_into(BufReader::new(recv), inbox).await
+}
+
+/// Drain frames from a buffered reader into a device inbox. Chat text passes
+/// through verbatim; an A2UI action becomes a parseable `ui-event:` line so the
+/// LLM can react (match on surfaceId/name). Generic over the reader so the
+/// behavior is unit-testable over an in-memory pipe.
+async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(mut reader: BufReader<R>, inbox: Inbox) {
     loop {
         match read_frame(&mut reader).await {
             Ok(Some(Frame::Chat { text })) => inbox.lock().unwrap().push_back(text),
+            Ok(Some(Frame::A2uiAction { action })) => {
+                let line = format!("ui-event: {}", serde_json::to_string(&action).unwrap_or_default());
+                inbox.lock().unwrap().push_back(line);
+            }
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(e) => {
@@ -282,6 +308,45 @@ struct DisconnectArgs {
     forget: Option<bool>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RenderUiArgs {
+    /// The device name to render the UI on.
+    device: String,
+    /// A2UI basic-catalog components as a flat JSON array. Each element is an
+    /// object with an `id` and a `component` type; exactly one must have
+    /// `"id":"root"`. Components reference children by id (`child` / `children`),
+    /// and props may be literals or `{"path":"/ptr"}` bindings into the data
+    /// model. Buttons carry `{"action":{"event":{"name":...,"context":{...}}}}`.
+    components: serde_json::Value,
+    /// Optional initial data model (a JSON object) backing the `{"path":...}` bindings.
+    data_model: Option<serde_json::Value>,
+    /// Optional surface id. One (`ui-<n>`) is generated if omitted.
+    surface_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct UpdateUiArgs {
+    /// The device name the surface lives on.
+    device: String,
+    /// The surface id returned by `render_ui`.
+    surface_id: String,
+    /// RFC 6901 JSON pointer into the data model (e.g. `/dice/you`). `""` targets the whole model.
+    path: String,
+    /// The new JSON value to set at `path`.
+    value: serde_json::Value,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct DeleteUiArgs {
+    /// The device name the surface lives on.
+    device: String,
+    /// The surface id to remove.
+    surface_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // MCP server handler
 // ---------------------------------------------------------------------------
@@ -397,44 +462,10 @@ impl AzulaBridge {
     /// Send a text message to a device.
     #[tool(description = "Send a text message to a named azula device. The text appears as a streamed azula-assistant reply in the app.")]
     async fn send_message(&self, Parameters(args): Parameters<SendMessageArgs>) -> Result<CallToolResult, ErrorData> {
-        // Lazy-connect if known but not live.
-        let needs_dial = {
-            let guard = self.devices.lock().await;
-            match guard.get(&args.device) {
-                Some(c) if c.connected => false,
-                Some(_) => true,
-                None => {
-                    // Check registry.
-                    let known = registry::load();
-                    known.iter().any(|d| d.name == args.device)
-                }
-            }
+        let conn = match self.ensure_device(&args.device).await {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
         };
-
-        if needs_dial {
-            let ticket = {
-                let guard = self.devices.lock().await;
-                guard.get(&args.device).map(|c| c.ticket.clone())
-            }.or_else(|| {
-                registry::load().into_iter().find(|d| d.name == args.device).map(|d| d.ticket)
-            });
-
-            if let Some(t) = ticket {
-                connect_device(&self.endpoint, &args.device, &t, &self.devices).await;
-            }
-        }
-
-        let guard = self.devices.lock().await;
-        let conn = match guard.get(&args.device) {
-            Some(c) if c.connected => c.clone(),
-            Some(_) => return Ok(CallToolResult::error(vec![Content::text(format!(
-                "device '{}' is not reachable", args.device
-            ))])),
-            None => return Ok(CallToolResult::error(vec![Content::text(format!(
-                "unknown device '{}'; use `connect` first", args.device
-            ))])),
-        };
-        drop(guard);
 
         let mut send_guard = conn.send.lock().await;
         let Some(send) = send_guard.as_mut() else {
@@ -455,7 +486,7 @@ impl AzulaBridge {
     }
 
     /// Drain new messages from one device or all devices.
-    #[tool(description = "Drain new messages from a named device, or from all devices if no device name is given.")]
+    #[tool(description = "Drain new inbound messages from a named device, or from all devices if no device name is given. Lines are either the user's chat text or `ui-event: {\"name\":...,\"surfaceId\":...,\"sourceComponentId\":...,\"context\":{...}}` JSON describing an interaction with an A2UI surface rendered via `render_ui` (match on surfaceId and respond with `update_ui`).")]
     async fn get_messages(&self, Parameters(args): Parameters<GetMessagesArgs>) -> Result<CallToolResult, ErrorData> {
         let guard = self.devices.lock().await;
 
@@ -482,6 +513,84 @@ impl AzulaBridge {
             let text = if all.is_empty() { "(no new messages)".to_string() } else { all.join("\n") };
             Ok(CallToolResult::success(vec![Content::text(text)]))
         }
+    }
+
+    /// Render an A2UI declarative UI surface on a device.
+    #[tool(description = "Render an A2UI declarative UI surface in the azula app on a named device. Pass `components` as a flat JSON array of A2UI basic-catalog components (v0.9.1); exactly one must have \"id\":\"root\". Available components: Text, Image, Icon, Video, AudioPlayer, Row, Column, List, Card, Tabs, Modal, Divider, Button, TextField, CheckBox, ChoicePicker, Slider, DateTimeInput. Components reference children by id (child/children); props are literals or {\"path\":\"/ptr\"} bindings into the optional `data_model`. A Button carries {\"action\":{\"event\":{\"name\":\"...\",\"context\":{...}}}}; when the user interacts, an event arrives via `get_messages` as a `ui-event: {...}` JSON line carrying name/surfaceId/sourceComponentId/context. Returns the surfaceId — pass it to `update_ui` to change the data model in response.")]
+    async fn render_ui(&self, Parameters(args): Parameters<RenderUiArgs>) -> Result<CallToolResult, ErrorData> {
+        // Validate: components must be an array containing a "root" component.
+        let comps = match &args.components {
+            serde_json::Value::Array(a) => a,
+            _ => return Ok(CallToolResult::error(vec![Content::text(
+                "`components` must be a JSON array of A2UI components",
+            )])),
+        };
+        if !comps.iter().any(|c| c.get("id").and_then(|v| v.as_str()) == Some("root")) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "the component list needs one component with \"id\":\"root\" (the surface root)",
+            )]));
+        }
+
+        let surface_id = args.surface_id.unwrap_or_else(|| {
+            format!("ui-{}", SURFACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        });
+
+        let conn = match self.ensure_device(&args.device).await {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
+        };
+
+        // createSurface → updateComponents → (optional) updateDataModel.
+        self.send_a2ui(&conn, serde_json::json!({
+            "version": "v0.9.1",
+            "createSurface": { "surfaceId": surface_id, "catalogId": A2UI_CATALOG }
+        })).await?;
+        self.send_a2ui(&conn, serde_json::json!({
+            "version": "v0.9.1",
+            "updateComponents": { "surfaceId": surface_id, "components": args.components }
+        })).await?;
+        if let Some(dm) = args.data_model {
+            self.send_a2ui(&conn, serde_json::json!({
+                "version": "v0.9.1",
+                "updateDataModel": { "surfaceId": surface_id, "path": "", "value": dm }
+            })).await?;
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "rendered surface '{surface_id}' on '{}'", args.device
+        ))]))
+    }
+
+    /// Update the data model of a rendered A2UI surface.
+    #[tool(description = "Update the data model of an A2UI surface previously created with `render_ui`, at a JSON-pointer `path` (RFC 6901; \"\" replaces the whole model). Use this to react to a `ui-event` — e.g. set /dice/result after a roll, or push fresh data into a bound Text.")]
+    async fn update_ui(&self, Parameters(args): Parameters<UpdateUiArgs>) -> Result<CallToolResult, ErrorData> {
+        let conn = match self.ensure_device(&args.device).await {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
+        };
+        self.send_a2ui(&conn, serde_json::json!({
+            "version": "v0.9.1",
+            "updateDataModel": { "surfaceId": args.surface_id, "path": args.path, "value": args.value }
+        })).await?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "updated surface '{}' at '{}'", args.surface_id, args.path
+        ))]))
+    }
+
+    /// Remove an A2UI surface from a device.
+    #[tool(description = "Remove an A2UI surface from a device (it stops rendering/updating). Pass the surfaceId returned by `render_ui`.")]
+    async fn delete_ui(&self, Parameters(args): Parameters<DeleteUiArgs>) -> Result<CallToolResult, ErrorData> {
+        let conn = match self.ensure_device(&args.device).await {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
+        };
+        self.send_a2ui(&conn, serde_json::json!({
+            "version": "v0.9.1",
+            "deleteSurface": { "surfaceId": args.surface_id }
+        })).await?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "deleted surface '{}'", args.surface_id
+        ))]))
     }
 
     /// Show the bridge's pairing URL and QR code so a user can scan and connect.
@@ -531,6 +640,55 @@ impl AzulaBridge {
     }
 }
 
+impl AzulaBridge {
+    /// Ensure the named device has a live connection (lazy-dialing a known
+    /// device if needed), returning a clone of its [`DeviceConn`] or an error
+    /// [`CallToolResult`] for the caller to return.
+    async fn ensure_device(&self, device: &str) -> Result<DeviceConn, CallToolResult> {
+        let needs_dial = {
+            let guard = self.devices.lock().await;
+            match guard.get(device) {
+                Some(c) if c.connected => false,
+                Some(_) => true,
+                None => registry::load().iter().any(|d| d.name == device),
+            }
+        };
+
+        if needs_dial {
+            let ticket = {
+                let guard = self.devices.lock().await;
+                guard.get(device).map(|c| c.ticket.clone())
+            }
+            .or_else(|| registry::load().into_iter().find(|d| d.name == device).map(|d| d.ticket));
+            if let Some(t) = ticket {
+                connect_device(&self.endpoint, device, &t, &self.devices).await;
+            }
+        }
+
+        let guard = self.devices.lock().await;
+        match guard.get(device) {
+            Some(c) if c.connected => Ok(c.clone()),
+            Some(_) => Err(CallToolResult::error(vec![Content::text(format!(
+                "device '{device}' is not reachable"
+            ))])),
+            None => Err(CallToolResult::error(vec![Content::text(format!(
+                "unknown device '{device}'; use `connect` first"
+            ))])),
+        }
+    }
+
+    /// Write a single A2UI message to a connected device as an `a2ui` frame.
+    async fn send_a2ui(&self, conn: &DeviceConn, message: serde_json::Value) -> Result<(), ErrorData> {
+        let mut send_guard = conn.send.lock().await;
+        let Some(send) = send_guard.as_mut() else {
+            return Err(ErrorData::internal_error("device send stream closed".to_string(), None));
+        };
+        write_frame(send, &Frame::A2ui { message })
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+}
+
 fn remove_from_registry_file(path: &std::path::Path, name: &str) {
     #[derive(Serialize, Deserialize, Default)]
     struct Reg { devices: Vec<Device> }
@@ -555,7 +713,9 @@ impl ServerHandler for AzulaBridge {
         let mut info = ServerInfo::default();
         info.instructions = Some(
             "Multi-device azula bridge. Use `connect` to pair a device, `list_devices` to see \
-             status, `send_message` / `get_messages` to communicate, `disconnect` to close."
+             status, `send_message` / `get_messages` to communicate, `disconnect` to close. \
+             To show a rich UI, call `render_ui` with A2UI components; user interactions come \
+             back through `get_messages` as `ui-event:` lines — react with `update_ui`."
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -654,4 +814,39 @@ fn print_banner(bind: &str) {
     println!("  MCP endpoint:  http://{bind}/mcp");
     println!("  Add this URL to an MCP-capable LLM client.");
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// The reader surfaces user chat text verbatim and turns an A2UI action
+    /// (sent by the app when a user taps a surface) into a `ui-event:` line the
+    /// LLM can parse from `get_messages`.
+    #[tokio::test]
+    async fn reader_surfaces_chat_and_ui_events() {
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let inbox_reader = inbox.clone();
+        let handle = tokio::spawn(async move {
+            read_frames_into(BufReader::new(reader), inbox_reader).await;
+        });
+
+        let chat = serde_json::to_string(&Frame::Chat { text: "hello".into() }).unwrap();
+        let action = serde_json::json!({
+            "name": "roll", "surfaceId": "dice-1", "sourceComponentId": "rollBtn", "context": {}
+        });
+        let act = serde_json::to_string(&Frame::A2uiAction { action }).unwrap();
+        writer.write_all(format!("{chat}\n{act}\n").as_bytes()).await.unwrap();
+        writer.shutdown().await.unwrap(); // EOF → reader_loop returns
+        handle.await.unwrap();
+
+        let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+        assert_eq!(got.len(), 2, "expected 2 inbox lines, got {got:?}");
+        assert_eq!(got[0], "hello");
+        assert!(got[1].starts_with("ui-event: "), "not a ui-event line: {}", got[1]);
+        assert!(got[1].contains(r#""name":"roll""#), "missing action name: {}", got[1]);
+        assert!(got[1].contains(r#""surfaceId":"dice-1""#), "missing surfaceId: {}", got[1]);
+    }
 }
