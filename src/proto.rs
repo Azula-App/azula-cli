@@ -43,9 +43,13 @@ pub enum Frame {
     #[serde(rename = "term")]
     Term { line: String },
 
-    /// passthrough; server may ignore
-    #[serde(rename = "widget")]
-    Widget { widget: serde_json::Value },
+    /// server -> client: an A2UI message (create/update/delete surface)
+    #[serde(rename = "a2ui")]
+    A2ui { message: serde_json::Value },
+
+    /// client -> server: a user action on an A2UI surface
+    #[serde(rename = "a2ui_action")]
+    A2uiAction { action: serde_json::Value },
 
     /// file transfer: begins a multipart transfer (encoding: "base64" | "binary")
     #[serde(rename = "file_begin")]
@@ -213,5 +217,33 @@ mod tests {
         assert_eq!(json, r#"{"type":"file_end","id":"abc-123"}"#);
         let back: Frame = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Frame::FileEnd { id } if id == "abc-123"));
+    }
+
+    #[test]
+    fn a2ui_frame_roundtrips_with_type_tag() {
+        let msg = serde_json::json!({
+            "version": "v0.9.1",
+            "createSurface": { "surfaceId": "dice-1" }
+        });
+        let f = Frame::A2ui { message: msg.clone() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"a2ui""#), "wrong type tag: {json}");
+        assert!(json.contains("createSurface"), "missing payload: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::A2ui { .. }));
+    }
+
+    #[test]
+    fn a2ui_action_frame_roundtrips_with_type_tag() {
+        let action = serde_json::json!({
+            "version": "v0.9.1",
+            "action": { "name": "roll", "surfaceId": "dice-1", "sourceComponentId": "rollBtn", "context": {} }
+        });
+        let f = Frame::A2uiAction { action: action.clone() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"a2ui_action""#), "wrong type tag: {json}");
+        assert!(json.contains("roll"), "missing action name: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::A2uiAction { .. }));
     }
 }
