@@ -180,3 +180,122 @@ async fn handle(connection: Connection) -> Result<()> {
     info!(%remote, "term: session ended");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use iroh::endpoint::presets;
+    use iroh::protocol::Router;
+    use iroh::Endpoint;
+    use tokio::io::BufReader;
+    use tokio::time::timeout;
+
+    use super::{TermHandler, TERM_ALPN};
+    use crate::proto::{read_frame, write_frame, Frame};
+
+    /// End-to-end test for the remote-shell-over-iroh path.
+    ///
+    /// Two real iroh endpoints are created in-process:
+    ///   - a **server** that accepts connections with `TermHandler` on `TERM_ALPN`
+    ///   - a **client** that connects to the server's direct address, opens a
+    ///     bi-directional stream, and sends a shell command
+    ///
+    /// The test asserts that the unique marker string appears in the PTY output
+    /// that comes back as `Frame::Term` frames, proving the full
+    /// PTY-spawn → bridge → iroh-stream → frame path.
+    #[tokio::test]
+    async fn term_handler_end_to_end() {
+        // A unique marker that every POSIX shell can echo and that is very
+        // unlikely to appear in shell startup noise.
+        const MARKER: &str = "AZULA_LIVE_OK_7F3A";
+
+        // ── Server ─────────────────────────────────────────────────────────
+        // Use `presets::Minimal` (no public relays / STUN needed) for a
+        // purely local, loopback test.
+        let server_ep = Endpoint::bind(presets::Minimal)
+            .await
+            .expect("server endpoint bind");
+
+        let server_addr = server_ep.addr();
+
+        let router = Router::builder(server_ep)
+            .accept(TERM_ALPN, TermHandler::new())
+            .spawn();
+
+        // ── Client ─────────────────────────────────────────────────────────
+        let client_ep = Endpoint::bind(presets::Minimal)
+            .await
+            .expect("client endpoint bind");
+
+        // Connect directly to the server's local address — no relay/ticket needed.
+        let conn = client_ep
+            .connect(server_addr, TERM_ALPN)
+            .await
+            .expect("client connect");
+
+        // The protocol requires the dialer to write first (server does
+        // `accept_bi`, which blocks until the client sends data).
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+
+        // Write the echo command.  The PTY will echo the typed text and then
+        // print the command's output, both as `Frame::Term` chunks.
+        write_frame(
+            &mut send,
+            &Frame::Input {
+                text: format!("echo {MARKER}\n"),
+            },
+        )
+        .await
+        .expect("write frame");
+
+        // ── Read frames until the marker appears (or timeout) ───────────────
+        let mut reader = BufReader::new(recv);
+        let mut accumulated = String::new();
+
+        let read_result = timeout(Duration::from_secs(20), async {
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(Some(Frame::Term { line })) => {
+                        accumulated.push_str(&line);
+                        if accumulated.contains(MARKER) {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                    Ok(Some(_)) => {} // ignore other frame types
+                    Ok(None) => {
+                        // Stream closed before we saw the marker.
+                        anyhow::bail!("stream closed before marker appeared; got: {accumulated:?}");
+                    }
+                    Err(e) => {
+                        anyhow::bail!("read_frame error: {e}; got so far: {accumulated:?}");
+                    }
+                }
+            }
+        })
+        .await;
+
+        // ── Cleanup ─────────────────────────────────────────────────────────
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        let _ = router.shutdown().await;
+        client_ep.close().await;
+
+        // ── Assert ───────────────────────────────────────────────────────────
+        match read_result {
+            Err(_elapsed) => panic!(
+                "timed out waiting for marker '{MARKER}'; output so far: {accumulated:?}"
+            ),
+            Ok(Err(e)) => panic!("{e}"),
+            Ok(Ok(())) => {
+                // Success: the marker was found in the PTY output.
+                println!("Captured PTY output (first 512 chars): {:?}",
+                    &accumulated[..accumulated.len().min(512)]);
+            }
+        }
+    }
+}
