@@ -15,7 +15,7 @@
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use tokio::io::BufReader;
@@ -49,8 +49,27 @@ async fn handle(connection: Connection) -> Result<()> {
     let remote = connection.remote_id().to_string();
     info!(%remote, "term: client connected");
 
-    // The client opens the bi stream and writes first.
-    let (send, recv) = connection.accept_bi().await?;
+    // Each bi stream the client opens is an independent terminal session, so a
+    // single connection can drive many terminals. Loop accepting new streams.
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                debug!(%remote, error = %e, "term: connection closed");
+                return Ok(());
+            }
+        };
+        let remote = remote.clone();
+        tokio::spawn(async move {
+            if let Err(e) = term_session(send, recv, remote.clone()).await {
+                warn!(%remote, error = %e, "term: session error");
+            }
+        });
+    }
+}
+
+/// Bridge one bi stream to its own dedicated PTY shell.
+async fn term_session(send: SendStream, recv: RecvStream, remote: String) -> Result<()> {
     let mut send = send;
     let mut reader = BufReader::new(recv);
 
@@ -297,5 +316,55 @@ mod tests {
                     &accumulated[..accumulated.len().min(512)]);
             }
         }
+    }
+
+    /// Two bi streams over ONE connection each get their own PTY — proving the
+    /// remote shell multiplexes many terminals over a single connection.
+    #[tokio::test]
+    async fn term_two_sessions_over_one_connection() {
+        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        let server_addr = server_ep.addr();
+        let router = Router::builder(server_ep).accept(TERM_ALPN, TermHandler::new()).spawn();
+
+        let client_ep = Endpoint::bind(presets::Minimal).await.expect("client bind");
+        let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
+
+        async fn run_echo(conn: &iroh::endpoint::Connection, marker: &str) -> bool {
+            let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+            write_frame(&mut send, &Frame::Input { text: format!("echo {marker}\n") })
+                .await
+                .expect("write");
+            let mut reader = BufReader::new(recv);
+            let got = timeout(Duration::from_secs(20), async {
+                let mut acc = String::new();
+                loop {
+                    match read_frame(&mut reader).await {
+                        Ok(Some(Frame::Term { line })) => {
+                            acc.push_str(&line);
+                            if acc.contains(marker) {
+                                return true;
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+            let _ = send.finish();
+            got
+        }
+
+        // Two independent sessions multiplexed on the SAME connection.
+        let a = run_echo(&conn, "AZULA_SESS_A_11AA").await;
+        let b = run_echo(&conn, "AZULA_SESS_B_22BB").await;
+
+        conn.close(0u32.into(), b"done");
+        let _ = router.shutdown().await;
+        client_ep.close().await;
+
+        assert!(a, "session A did not receive its marker over its own stream");
+        assert!(b, "session B (2nd stream on the same connection) did not receive its marker");
     }
 }

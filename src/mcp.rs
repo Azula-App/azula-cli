@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use rmcp::model::{CallToolRequestParams, CallToolResult, RawContent};
 use rmcp::service::{RoleClient, RunningService};
@@ -232,8 +232,28 @@ impl LlmHandler {
         let remote = connection.remote_id().to_string();
         info!(%remote, "llm: client connected");
 
-        // The client opens the bi stream and writes first.
-        let (send, recv) = connection.accept_bi().await?;
+        // Each bi stream is an independent LLM session, so one connection can
+        // host many sessions. Loop accepting new streams.
+        loop {
+            let (send, recv) = match connection.accept_bi().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    debug!(%remote, error = %e, "llm: connection closed");
+                    return Ok(());
+                }
+            };
+            let this = self.clone();
+            let remote = remote.clone();
+            tokio::spawn(async move {
+                if let Err(e) = this.session(send, recv, remote.clone()).await {
+                    warn!(%remote, error = %e, "llm: session error");
+                }
+            });
+        }
+    }
+
+    /// Handle one LLM session bi stream: read prompts, stream answers.
+    async fn session(self, send: SendStream, recv: RecvStream, remote: String) -> Result<()> {
         let mut send = send;
         let mut reader = BufReader::new(recv);
 
