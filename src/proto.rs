@@ -46,6 +46,26 @@ pub enum Frame {
     /// passthrough; server may ignore
     #[serde(rename = "widget")]
     Widget { widget: serde_json::Value },
+
+    /// file transfer: begins a multipart transfer (encoding: "base64" | "binary")
+    #[serde(rename = "file_begin")]
+    FileBegin {
+        id: String,
+        name: String,
+        mime: String,
+        size: u64,
+        encoding: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+
+    /// file transfer: one base64-encoded chunk (used when encoding == "base64")
+    #[serde(rename = "file_chunk")]
+    FileChunk { id: String, seq: u32, data: String },
+
+    /// file transfer: signals that all body bytes / chunks have been sent
+    #[serde(rename = "file_end")]
+    FileEnd { id: String },
 }
 
 impl Frame {
@@ -130,5 +150,68 @@ mod tests {
         let json = r#"{"type":"token","delta":"hi"}"#;
         let f: Frame = serde_json::from_str(json).unwrap();
         assert!(matches!(f, Frame::Token { done: false, .. }));
+    }
+
+    #[test]
+    fn file_begin_roundtrips_with_type_tag() {
+        let f = Frame::FileBegin {
+            id: "abc-123".into(),
+            name: "photo.png".into(),
+            mime: "image/png".into(),
+            size: 51200,
+            encoding: "base64".into(),
+            caption: None,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        // Must have the correct "type" tag to interop with Kotlin's @SerialName("file_begin").
+        assert!(json.contains(r#""type":"file_begin""#), "wrong type tag: {json}");
+        assert!(json.contains(r#""name":"photo.png""#), "missing name: {json}");
+        assert!(json.contains(r#""size":51200"#), "missing size: {json}");
+        assert!(json.contains(r#""encoding":"base64""#), "missing encoding: {json}");
+        // caption is None — should be absent (skip_serializing_if).
+        assert!(!json.contains("caption"), "caption should be absent: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::FileBegin { size: 51200, .. }));
+    }
+
+    #[test]
+    fn file_begin_with_caption_roundtrips() {
+        let f = Frame::FileBegin {
+            id: "x1".into(),
+            name: "img.jpg".into(),
+            mime: "image/jpeg".into(),
+            size: 1024,
+            encoding: "binary".into(),
+            caption: Some("look at this".into()),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""caption":"look at this""#), "missing caption: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(&back, Frame::FileBegin { caption: Some(c), .. } if c == "look at this")
+        );
+    }
+
+    #[test]
+    fn file_chunk_roundtrips_with_type_tag() {
+        let f = Frame::FileChunk {
+            id: "abc-123".into(),
+            seq: 0,
+            data: "SGVsbG8=".into(), // base64("Hello")
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"file_chunk""#), "wrong type tag: {json}");
+        assert!(json.contains(r#""seq":0"#), "missing seq: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::FileChunk { seq: 0, .. }));
+    }
+
+    #[test]
+    fn file_end_roundtrips_with_type_tag() {
+        let f = Frame::FileEnd { id: "abc-123".into() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"file_end","id":"abc-123"}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::FileEnd { id } if id == "abc-123"));
     }
 }
