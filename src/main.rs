@@ -13,6 +13,7 @@ mod bridge;
 mod link;
 mod mcp;
 mod proto;
+mod qr;
 mod registry;
 mod term;
 
@@ -49,6 +50,8 @@ enum Command {
     Pair(PairArgs),
     /// List all registered devices and their registry source.
     Devices,
+    /// Print a QR code for a ticket, URL, or bare token.
+    Qr(QrArgs),
 }
 
 /// Options for the `serve-mcp` command (the MCP↔iroh bridge).
@@ -77,6 +80,13 @@ struct PairArgs {
     /// Save to the global (~/.azula) registry instead of the project registry.
     #[arg(long)]
     global: bool,
+}
+
+/// Options for `azula qr`.
+#[derive(Debug, Clone, clap::Args)]
+struct QrArgs {
+    /// A ticket, `https://azula.app/s/<token>`, or `azula://connect?code=<token>` URL.
+    code: String,
 }
 
 /// Options for the `serve` command (also used when run with no subcommand).
@@ -121,6 +131,7 @@ async fn main() -> Result<()> {
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Pair(args)) => cmd_pair(args),
         Some(Command::Devices) => cmd_devices(),
+        Some(Command::Qr(args)) => cmd_qr(args),
         None => serve(cli.serve).await,
     }
 }
@@ -201,6 +212,18 @@ fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
+fn cmd_qr(args: QrArgs) -> Result<()> {
+    let token = match link::parse_ticket(&args.code) {
+        Some(t) => t,
+        None => {
+            eprintln!("error: could not extract a token from {:?}", args.code);
+            std::process::exit(1);
+        }
+    };
+    qr::print_pairing("Pairing code:", &token);
+    Ok(())
+}
+
 fn load_names_from_file(path: &std::path::Path) -> Vec<String> {
     #[derive(serde::Deserialize)]
     struct Reg { devices: Vec<registry::Device> }
@@ -242,6 +265,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         None => "none (canned fallback)".to_string(),
     };
     print_banner(&node_id.to_string(), &ticket.to_string(), &mcp_target);
+    qr::print_pairing("Pair by scanning:", &ticket.to_string());
 
     // Establish the shared upstream MCP session eagerly (when a transport flag
     // is set). A connect failure is non-fatal: log it and fall back to the
