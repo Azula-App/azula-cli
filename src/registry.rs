@@ -31,9 +31,30 @@ struct RegistryFile {
 // Path resolution
 // ---------------------------------------------------------------------------
 
+/// When `AZULA_REGISTRY_DIR` is set, both the project and global registries
+/// resolve under it (an override for tests / sandboxes, mirroring
+/// `AZULA_MAILBOX_DIR`). Under `cfg(test)` we also default to an isolated temp
+/// dir so the suite never writes the developer's real registry — the `connect`
+/// tool persists every paired device via [`add`], so test fixtures like
+/// `alice`/`bob` would otherwise pollute `<git-root>/.azula/devices.json`.
+fn override_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("AZULA_REGISTRY_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    #[cfg(test)]
+    {
+        return Some(std::env::temp_dir().join("azula-test").join("registry"));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Walk up from cwd to find the first ancestor that contains a `.git` entry
 /// (file or directory).  Returns `<root>/.azula/devices.json` or `None`.
 pub fn project_path() -> Option<PathBuf> {
+    if let Some(dir) = override_dir() {
+        return Some(dir.join("devices.json"));
+    }
     let mut dir = std::env::current_dir().ok()?;
     loop {
         if dir.join(".git").exists() {
@@ -46,6 +67,9 @@ pub fn project_path() -> Option<PathBuf> {
 
 /// Returns `~/.azula/devices.json`, or `None` if `$HOME` is unset.
 pub fn global_path() -> Option<PathBuf> {
+    if let Some(dir) = override_dir() {
+        return Some(dir.join("global-devices.json"));
+    }
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".azula").join("devices.json"))
 }
