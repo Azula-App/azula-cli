@@ -9,6 +9,7 @@
 //!   server is configured.
 //! * `azula/term/0` — a remote shell ("SSH"-like) bridge over a PTY
 
+mod blackjack;
 mod bridge;
 mod demo;
 mod link;
@@ -56,6 +57,9 @@ enum Command {
     Qr(QrArgs),
     /// Push a sample A2UI surface to a connected device for manual testing.
     DemoUi(DemoUiArgs),
+    /// Spin up an A2UI Blackjack table; print a connect code and deal a hand to
+    /// each app that connects.
+    Blackjack,
 }
 
 /// Options for the `serve-mcp` command (the MCP↔iroh bridge).
@@ -158,6 +162,7 @@ async fn main() -> Result<()> {
         Some(Command::Devices) => cmd_devices(),
         Some(Command::Qr(args)) => cmd_qr(args),
         Some(Command::DemoUi(args)) => demo::run(args.device, args.once).await,
+        Some(Command::Blackjack) => blackjack::run().await,
         None => serve(cli.serve).await,
     }
 }
