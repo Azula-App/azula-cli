@@ -13,6 +13,7 @@
 //! surface data model — the whole model is replaced on every update (path ""),
 //! which keeps the game→UI mapping trivial.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,7 +21,7 @@ use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::Endpoint;
+use iroh::{Endpoint, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde_json::{json, Value};
 use tokio::io::BufReader;
@@ -37,9 +38,50 @@ const CATALOG: &str = "https://a2ui.org/specification/v0_9_1/catalogs/basic/cata
 /// than colliding on a shared surface.
 static GAME_CTR: AtomicU64 = AtomicU64::new(0);
 
+/// Persist the node's secret key so restarts keep the same node id (and thus a
+/// stable connect code): `~/.azula/blackjack.key`, or `None` if `$HOME` is unset.
+fn key_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".azula").join("blackjack.key"))
+}
+
+/// Reuse the saved secret key if one exists, otherwise mint one and save it so
+/// the next launch resumes with the same identity. Falls back to an ephemeral
+/// key (and logs why) if the filesystem isn't usable.
+fn load_or_create_secret() -> SecretKey {
+    let path = match key_path() {
+        Some(p) => p,
+        None => {
+            warn!("$HOME unset — using an ephemeral key (connect code changes each run)");
+            return SecretKey::generate();
+        }
+    };
+    // The key is stored as its raw 32 secret bytes (SecretKey has no Display).
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            info!(path = %path.display(), "blackjack: resuming saved identity");
+            return SecretKey::from_bytes(&arr);
+        }
+        warn!(path = %path.display(), "blackjack: saved key unreadable — minting a new one");
+    }
+    let key = SecretKey::generate();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::write(&path, key.to_bytes()) {
+        Ok(()) => info!(path = %path.display(), "blackjack: saved new identity"),
+        Err(e) => warn!(path = %path.display(), error = %e, "blackjack: could not save key"),
+    }
+    key
+}
+
 /// Bind, print connect info, and serve Blackjack games until Ctrl-C.
 pub async fn run() -> Result<()> {
-    let endpoint = Endpoint::bind(presets::N0).await?;
+    let secret_key = load_or_create_secret();
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .bind()
+        .await?;
     info!("bringing endpoint online…");
     endpoint.online().await;
 
