@@ -364,26 +364,36 @@ async fn accept_incoming(
 
     // Read the very first frame to determine the peer's name.
     // Priority: (1) node-id matched known device, (2) Hello frame, (3) scan-<id>.
-    let (peer_name, pending_frame) = match read_frame(&mut reader).await {
+    let recognised = node_id_match.is_some();
+    let (peer_name, pending_frame, from_app) = match read_frame(&mut reader).await {
         Ok(Some(Frame::Hello { name })) => {
+            // An azula app announces its 64-hex node id as the Hello name; a peer
+            // bridge announces a "bridge-…" name. Only app clients get our reply.
+            let looks_like_node_id = name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit());
             // Node-id match takes priority over hello name (a registered device
             // dialling in IS that device, regardless of what name it advertises).
             let resolved = node_id_match.unwrap_or_else(|| {
                 if name.trim().is_empty() { fallback_name.clone() } else { name }
             });
             info!(peer=%resolved, "bridge: hello from peer");
-            (resolved, None)
+            (resolved, None, recognised || looks_like_node_id)
         }
         Ok(Some(other)) => {
             // Non-hello first frame — use node-id match or fallback name, replay frame.
             let resolved = node_id_match.unwrap_or(fallback_name.clone());
-            (resolved, Some(other))
+            (resolved, Some(other), recognised)
         }
         Ok(None) | Err(_) => {
             // Clean close or parse error — drop without registering.
             return Ok(());
         }
     };
+
+    // Announce ourselves to an azula app so it titles the conversation "azula"
+    // (the app keeps the bridge's peer code as the subtitle). Never to peer bridges.
+    if from_app {
+        let _ = write_frame(&mut send, &Frame::Hello { name: "azula".into() }).await;
+    }
 
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
 
