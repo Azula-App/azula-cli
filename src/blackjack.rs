@@ -13,7 +13,9 @@
 //! surface data model — the whole model is replaced on every update (path ""),
 //! which keeps the game→UI mapping trivial.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -24,6 +26,7 @@ use iroh::Endpoint;
 use iroh_tickets::endpoint::EndpointTicket;
 use serde_json::{json, Value};
 use tokio::io::BufReader;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use crate::mcp::LLM_ALPN;
@@ -32,10 +35,32 @@ use crate::qr;
 
 const CATALOG: &str = "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json";
 
-/// Each game gets a unique surface id, so a device that connects more than once
-/// (e.g. an app auto-reconnect) gets independent, correctly-routed tables rather
-/// than colliding on a shared surface.
+/// Monotonic id for freshly-dealt games (see [`new_surface_id`]).
 static GAME_CTR: AtomicU64 = AtomicU64::new(0);
+
+/// A per-process tag mixed into surface ids so a *new* server run never reuses a
+/// surface id from a previous run (which would make the app resume a stale card
+/// after the table lost its state). Within a run, a player's id is stable so the
+/// app can resume the same surface on reconnect.
+static RUN_TAG: OnceLock<u64> = OnceLock::new();
+
+fn new_surface_id() -> String {
+    let run = *RUN_TAG.get_or_init(|| {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    });
+    format!("blackjack-{}-{}", run, GAME_CTR.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A player's live table, kept in memory and keyed by their node id so a
+/// reconnect resumes the same hand (and same A2UI surface) instead of dealing
+/// a fresh one. In-memory only — a server restart starts everyone fresh.
+#[derive(Clone, Debug)]
+struct Table {
+    surface_id: String,
+    game: Game,
+}
+
+type Tables = Arc<AsyncMutex<HashMap<String, Table>>>;
 
 /// Bind, print connect info, and serve Blackjack games until Ctrl-C.
 pub async fn run() -> Result<()> {
@@ -59,10 +84,12 @@ pub async fn run() -> Result<()> {
     println!("  Then open the 'azula' conversation in the app. Ctrl-C to close the table.");
     println!();
 
-    // A Router dispatches each inbound app connection to the Blackjack handler,
-    // which deals a fresh hand per bi-stream — so several apps can play at once.
+    // A Router dispatches each inbound app connection to the Blackjack handler.
+    // Games are kept per player (by node id) so several apps can play at once and
+    // a reconnecting player resumes their hand rather than getting a fresh deal.
+    let tables: Tables = Arc::new(AsyncMutex::new(HashMap::new()));
     let router = Router::builder(endpoint)
-        .accept(LLM_ALPN, BlackjackHandler)
+        .accept(LLM_ALPN, BlackjackHandler { tables })
         .spawn();
 
     info!("blackjack table open — press Ctrl-C to close");
@@ -73,18 +100,20 @@ pub async fn run() -> Result<()> {
 }
 
 #[derive(Clone, Debug)]
-struct BlackjackHandler;
+struct BlackjackHandler {
+    tables: Tables,
+}
 
 impl ProtocolHandler for BlackjackHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        handle_conn(connection)
+        handle_conn(connection, self.tables.clone())
             .await
             .map_err(|e| AcceptError::from_boxed(e.into()))
     }
 }
 
-/// One connection can host many bi-streams; deal an independent game on each.
-async fn handle_conn(connection: Connection) -> Result<()> {
+/// One connection can host many bi-streams; wire each to the player's table.
+async fn handle_conn(connection: Connection, tables: Tables) -> Result<()> {
     let remote = connection.remote_id().to_string();
     info!(%remote, "blackjack: player connected");
     loop {
@@ -96,8 +125,9 @@ async fn handle_conn(connection: Connection) -> Result<()> {
             }
         };
         let remote = remote.clone();
+        let tables = tables.clone();
         tokio::spawn(async move {
-            if let Err(e) = play_game(send, recv, remote.clone()).await {
+            if let Err(e) = play_game(send, recv, remote.clone(), tables).await {
                 warn!(%remote, error = %e, "blackjack: game error");
             }
         });
@@ -105,7 +135,9 @@ async fn handle_conn(connection: Connection) -> Result<()> {
 }
 
 /// Render the Blackjack surface and run the deal → hit/stand → update loop.
-async fn play_game(send: SendStream, recv: RecvStream, remote: String) -> Result<()> {
+/// Resumes the player's existing hand (same surface id) on reconnect; only deals
+/// a fresh one if they've never played this run.
+async fn play_game(send: SendStream, recv: RecvStream, remote: String, tables: Tables) -> Result<()> {
     let mut send = send;
     let mut reader = BufReader::new(recv);
 
@@ -115,12 +147,29 @@ async fn play_game(send: SendStream, recv: RecvStream, remote: String) -> Result
     write_frame(&mut send, &Frame::Hello { name: "Blackjack".into() }).await?;
     write_frame(&mut send, &Frame::thinking(false)).await?;
 
-    let sid = format!("blackjack-{}", GAME_CTR.fetch_add(1, Ordering::Relaxed));
-    let mut game = Game::new();
+    // Resume this player's table if we have one, otherwise deal a new hand.
+    let (sid, mut game) = {
+        let mut map = tables.lock().await;
+        match map.get(&remote) {
+            Some(t) => {
+                info!(%remote, sid = %t.surface_id, "blackjack: resuming hand");
+                (t.surface_id.clone(), t.game.clone())
+            }
+            None => {
+                let sid = new_surface_id();
+                let game = Game::new();
+                map.insert(remote.clone(), Table { surface_id: sid.clone(), game: game.clone() });
+                info!(%remote, %sid, "blackjack: dealt a new hand");
+                (sid, game)
+            }
+        }
+    };
+
+    // Re-create the surface (the app treats a repeated surface id as "resume this
+    // card") and paint the current state — a fresh deal or the hand in progress.
     write_frame(&mut send, &Frame::A2ui { message: create_surface_msg(&sid) }).await?;
     write_frame(&mut send, &Frame::A2ui { message: components_msg(&sid) }).await?;
     write_frame(&mut send, &Frame::A2ui { message: data_model_msg(&sid, &game) }).await?;
-    info!(%remote, %sid, "blackjack: dealt a new hand");
 
     loop {
         match read_frame(&mut reader).await {
@@ -133,6 +182,8 @@ async fn play_game(send: SendStream, recv: RecvStream, remote: String) -> Result
                     "deal" => game = Game::new(),
                     _ => {}
                 }
+                // Persist the move so a reconnect resumes from here.
+                tables.lock().await.insert(remote.clone(), Table { surface_id: sid.clone(), game: game.clone() });
                 // The whole data model is replaced (path ""); the bound Text
                 // components re-resolve hands / totals / status.
                 write_frame(&mut send, &Frame::A2ui { message: data_model_msg(&sid, &game) }).await?;
@@ -220,7 +271,7 @@ const RANKS: [&str; 13] = [
 ];
 const SUITS: [&str; 4] = ["♠", "♥", "♦", "♣"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Card {
     rank: usize,
     suit: usize,
@@ -261,6 +312,7 @@ fn hand_string(cards: &[Card]) -> String {
         .join("  ")
 }
 
+#[derive(Clone, Debug)]
 struct Game {
     deck: Vec<Card>,
     player: Vec<Card>,
