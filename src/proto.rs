@@ -75,6 +75,22 @@ pub enum Frame {
     /// file transfer: signals that all body bytes / chunks have been sent
     #[serde(rename = "file_end")]
     FileEnd { id: String },
+
+    /// peer -> peer: the sender's chosen profile (a "persona"). Sent over the
+    /// CHAT ALPN only; the app uses it to name the conversation and show an
+    /// avatar. Servers ignore it. All fields but `name` are optional so the
+    /// sender can share a subset; an empty `name` means "name not shared".
+    #[serde(rename = "profile")]
+    Profile {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// base64-encoded, downscaled avatar image bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        avatar: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+    },
 }
 
 impl Frame {
