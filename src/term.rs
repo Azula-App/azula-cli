@@ -68,6 +68,38 @@ async fn handle(connection: Connection) -> Result<()> {
     }
 }
 
+/// Pull the longest valid-UTF-8 prefix out of `buf`, leaving any incomplete
+/// trailing multibyte sequence for the next read (so we never split a char or an
+/// escape sequence). Genuinely invalid bytes are replaced with U+FFFD once, so a
+/// bad byte can't wedge the stream.
+fn drain_valid_utf8(buf: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(buf) {
+            Ok(s) => {
+                out.push_str(s);
+                buf.clear();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&buf[..valid]).unwrap());
+                match e.error_len() {
+                    Some(len) => {
+                        out.push('\u{FFFD}');
+                        buf.drain(..valid + len);
+                    }
+                    None => {
+                        buf.drain(..valid);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Bridge one bi stream to its own dedicated PTY shell.
 async fn term_session(send: SendStream, recv: RecvStream, remote: String) -> Result<()> {
     let mut send = send;
@@ -94,25 +126,22 @@ async fn term_session(send: SendStream, recv: RecvStream, remote: String) -> Res
         .slave
         .spawn_command(cmd)
         .context("spawning shell in PTY")?;
-    // Drop the slave; the master keeps the PTY alive.
+    // Drop the slave; the master keeps the PTY alive. Keep the master itself so we
+    // can resize it when the client reports its viewport size.
     drop(pair.slave);
+    let master = pair.master;
 
     // Blocking reader + writer handles for the PTY master.
-    let mut pty_reader = pair
-        .master
+    let mut pty_reader = master
         .try_clone_reader()
         .context("cloning PTY reader")?;
-    let mut pty_writer = pair
-        .master
+    let mut pty_writer = master
         .take_writer()
         .context("taking PTY writer")?;
 
-    // Initial banner so the client sees something on connect.
-    write_frame(
-        &mut send,
-        &Frame::term(format!("azula shell ({shell}) — connected\r\n")),
-    )
-    .await?;
+    // No injected banner — the terminal shows only the shell's own output (its
+    // PS1 prompt appears as soon as the login shell starts), so we honor whatever
+    // prompt the environment defines instead of branding it "azula".
 
     // PTY output -> async channel, fed by a blocking thread.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -143,6 +172,11 @@ async fn term_session(send: SendStream, recv: RecvStream, remote: String) -> Res
         }
     });
 
+    // Carry buffer for PTY output: a 4096-byte read can split a multibyte UTF-8
+    // char (or an escape sequence) at the boundary, so hold the incomplete tail
+    // and decode only the valid prefix each time — no U+FFFD artifacts.
+    let mut pending: Vec<u8> = Vec::new();
+
     // Main bridge loop: forward PTY output to the client and client input to
     // the PTY until either side closes.
     loop {
@@ -151,8 +185,11 @@ async fn term_session(send: SendStream, recv: RecvStream, remote: String) -> Res
             chunk = out_rx.recv() => {
                 match chunk {
                     Some(bytes) => {
-                        let line = String::from_utf8_lossy(&bytes).into_owned();
-                        if write_frame(&mut send, &Frame::term(line)).await.is_err() {
+                        pending.extend_from_slice(&bytes);
+                        let text = drain_valid_utf8(&mut pending);
+                        if !text.is_empty()
+                            && write_frame(&mut send, &Frame::term(text)).await.is_err()
+                        {
                             debug!(%remote, "term: client send failed; closing");
                             break;
                         }
@@ -172,6 +209,9 @@ async fn term_session(send: SendStream, recv: RecvStream, remote: String) -> Res
                         if in_tx.send(text.into_bytes()).await.is_err() {
                             break;
                         }
+                    }
+                    Ok(Some(Frame::Resize { cols, rows })) => {
+                        let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
                     }
                     Ok(Some(other)) => {
                         debug!(%remote, ?other, "term: ignoring non-input frame");

@@ -32,6 +32,11 @@ pub enum Frame {
     #[serde(rename = "input")]
     Input { text: String },
 
+    /// client -> server: the terminal's size in character cells, so the PTY
+    /// wraps output to match the app's viewport.
+    #[serde(rename = "resize")]
+    Resize { cols: u16, rows: u16 },
+
     /// server -> client (LLM token stream)
     #[serde(rename = "token")]
     Token {
