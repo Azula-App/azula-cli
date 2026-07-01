@@ -306,7 +306,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         Some(McpTransport::Url(url)) => format!("http: {url}"),
         None => "none (canned fallback)".to_string(),
     };
-    print_banner(&node_id.to_string(), &ticket.to_string(), &mcp_target);
+    print_banner(&node_id.to_string(), &ticket.to_string(), &mcp_target, args.term_only);
     qr::print_pairing("Pair by scanning:", &ticket.to_string());
 
     // Establish the shared upstream MCP session eagerly (when a transport flag
@@ -342,7 +342,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-fn print_banner(node_id: &str, ticket: &str, mcp_target: &str) {
+fn print_banner(node_id: &str, ticket: &str, mcp_target: &str, term_only: bool) {
     println!();
     println!("  ╔══════════════════════════════════════════════════════════╗");
     println!("  ║                     azula server                          ║");
@@ -355,7 +355,9 @@ fn print_banner(node_id: &str, ticket: &str, mcp_target: &str) {
     println!("  Short node id: {node_id}");
     println!();
     println!("  Serving ALPNs:");
-    println!("    azula/llm/0   MCP relay  -> {mcp_target}");
+    if !term_only {
+        println!("    azula/llm/0   MCP relay  -> {mcp_target}");
+    }
     println!("    azula/term/0  remote shell");
     println!();
 }

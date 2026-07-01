@@ -1,1 +1,4 @@
 /target
+
+# local cross-built binary for the hot-swap dev loop (docker cp into azula-shell)
+.azula-linux
