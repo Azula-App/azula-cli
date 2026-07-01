@@ -1034,7 +1034,12 @@ pub async fn run(
     name: Option<String>,
     max_turns: u64,
 ) -> Result<()> {
-    let raw_endpoint = Endpoint::bind(presets::N0).await?;
+    // Reuse a persisted key so the bridge keeps a stable node id (and connect
+    // code) across restarts; the one endpoint serves both accept and dial.
+    let raw_endpoint = Endpoint::builder(presets::N0)
+        .secret_key(crate::identity::load_or_create_secret("bridge"))
+        .bind()
+        .await?;
     info!("bridge endpoint coming online…");
     raw_endpoint.online().await;
 

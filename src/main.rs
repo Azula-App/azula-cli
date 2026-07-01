@@ -12,6 +12,7 @@
 mod blackjack;
 mod bridge;
 mod demo;
+mod identity;
 mod link;
 mod mailbox;
 mod mcp;
@@ -269,8 +270,12 @@ fn load_names_from_file(path: &std::path::Path) -> Vec<String> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    // Bind with the n0 defaults (public discovery + relays).
-    let endpoint = Endpoint::bind(presets::N0).await?;
+    // Bind with the n0 defaults (public discovery + relays), reusing a persisted
+    // key so the node id (and connect code) stays stable across restarts.
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(identity::load_or_create_secret("serve"))
+        .bind()
+        .await?;
     info!("waiting for the endpoint to come online…");
     endpoint.online().await;
 
