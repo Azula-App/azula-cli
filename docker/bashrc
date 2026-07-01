@@ -1,0 +1,25 @@
+# azula shell container — a friendly, colorful bash for the terminal demo.
+
+# Colorful ls/grep.
+export CLICOLOR=1
+alias ls='ls --color=auto'
+alias ll='ls -alhF --color=auto'
+alias la='ls -A --color=auto'
+alias grep='grep --color=auto'
+export LS_COLORS='di=1;35:ln=36:ex=1;32:*.md=33'
+
+# A two-line prompt: green azula mark + magenta cwd, then a › caret.
+#   ›azula  ~/playground
+#   ›
+PS1='\[\e[38;5;42m\]›\[\e[38;5;205m\]azula\[\e[0m\]  \[\e[38;5;205m\]\w\[\e[0m\]\n\[\e[38;5;42m\]›\[\e[0m\] '
+
+# History niceties for arrow-key recall.
+export HISTSIZE=2000 HISTCONTROL=ignoreboth
+shopt -s histappend checkwinsize 2>/dev/null
+
+# Welcome banner (interactive shells only).
+if [[ $- == *i* ]]; then
+  printf '\n'
+  printf '  \e[38;5;42m\xe2\x80\xba\e[38;5;205ma\e[0m  \e[1mazula shell\e[0m \e[2m\xc2\xb7 a real bash, over iroh\e[0m\n'
+  printf '  \e[2mtry:\e[0m \e[38;5;205mls\e[0m  \e[2m\xc2\xb7\e[0m \e[38;5;205mcd playground\e[0m  \e[2m\xc2\xb7\e[0m \e[38;5;205mtree\e[0m  \e[2m\xc2\xb7\e[0m arrows recall history, Tab completes\n\n'
+fi

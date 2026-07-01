@@ -1,0 +1,18 @@
+# azula shell container.
+#
+#   docker compose up --build -d
+#   docker compose logs | sed -n '/Paste this code/,/^$/p'   # the connect code
+#
+# Paste that endpoint… code into the app (＋ connect a peer) and open the
+# terminal. No ports are published — iroh holepunches over the default egress.
+services:
+  azula:
+    build: .
+    image: azula-shell
+    container_name: azula-shell
+    restart: unless-stopped
+    volumes:
+      # Persist the node key so the connect code is stable across restarts.
+      - azula-identity:/root/.azula
+volumes:
+  azula-identity:

@@ -1,0 +1,6 @@
+azula — peer-to-peer over iroh.
+
+You're typing directly in a terminal on a remote container. Keystrokes travel
+as raw bytes to a real PTY; the shell echoes back over the same encrypted stream.
+
+Arrow keys recall history. Tab completes. Ctrl-C interrupts.

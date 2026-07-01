@@ -141,6 +141,12 @@ struct ServeArgs {
     /// JSON argument name that carries the message text in the tool call.
     #[arg(long, env = "AZULA_MCP_MESSAGE_ARG", default_value = "message")]
     mcp_message_arg: String,
+
+    /// Serve only the remote-terminal ALPN (no LLM). A client that connects then
+    /// opens a terminal session directly instead of an LLM chat — handy for the
+    /// Docker shell container.
+    #[arg(long, env = "AZULA_TERM_ONLY")]
+    term_only: bool,
 }
 
 #[tokio::main]
@@ -314,11 +320,20 @@ async fn serve(args: ServeArgs) -> Result<()> {
         }
     };
 
-    // A Router dispatches incoming connections by ALPN to the handlers.
-    let router = Router::builder(endpoint)
-        .accept(LLM_ALPN, LlmHandler::new(mcp))
-        .accept(TERM_ALPN, TermHandler::new())
-        .spawn();
+    // A Router dispatches incoming connections by ALPN to the handlers. In
+    // term-only mode we skip the LLM ALPN so a connecting client lands directly
+    // in a terminal (the client keeps the highest-priority ALPN a peer accepts).
+    let router = if args.term_only {
+        info!("term-only mode: serving the remote shell, no LLM");
+        Router::builder(endpoint)
+            .accept(TERM_ALPN, TermHandler::new())
+            .spawn()
+    } else {
+        Router::builder(endpoint)
+            .accept(LLM_ALPN, LlmHandler::new(mcp))
+            .accept(TERM_ALPN, TermHandler::new())
+            .spawn()
+    };
 
     info!("serving — press Ctrl-C to stop");
     tokio::signal::ctrl_c().await?;

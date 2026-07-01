@@ -1,0 +1,3 @@
+# azula shell container — the PTY runs `bash -l` (login), which does not source
+# ~/.bashrc by default. Do it here so the prompt, aliases, and welcome show.
+[ -f ~/.bashrc ] && . ~/.bashrc
