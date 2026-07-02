@@ -101,7 +101,7 @@ impl DeviceConn {
 
 type DeviceMap = Arc<AsyncMutex<HashMap<String, DeviceConn>>>;
 
-/// Monotonic counter for auto-generated A2UI surface ids (`ui-<n>`).
+/// Monotonic counter for auto-generated A2UI surface ids (`ui-<time>-<n>`).
 static SURFACE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The A2UI basic catalog this bridge targets.
@@ -503,7 +503,8 @@ struct RenderUiArgs {
     components: serde_json::Value,
     /// Optional initial data model (a JSON object) backing the `{"path":...}` bindings.
     data_model: Option<serde_json::Value>,
-    /// Optional surface id. One (`ui-<n>`) is generated if omitted.
+    /// Optional surface id. A unique one (`ui-<time>-<n>`) is generated if omitted;
+    /// omit it to add a NEW card, or pass an existing id to replace that card.
     surface_id: Option<String>,
 }
 
@@ -950,7 +951,15 @@ data_model: {"name":""}"##)]
         }
 
         let surface_id = args.surface_id.unwrap_or_else(|| {
-            format!("ui-{}", SURFACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            // Include a per-process time base so auto-generated ids don't collide
+            // with surfaces from an earlier bridge run (which would replace an
+            // existing card instead of adding a new one).
+            let n = SURFACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("ui-{t}-{n}")
         });
 
         let conn = match self.ensure_device(&args.device).await {
