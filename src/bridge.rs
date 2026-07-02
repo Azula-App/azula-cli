@@ -541,9 +541,13 @@ struct WaitForReplyArgs {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct SetNameArgs {
-    /// The new conversation title, e.g. "Claude / azula / terminal refactor".
-    name: String,
-    /// The device to rename on. Omit to rename on every connected device.
+    /// The project + session topic, shown as the conversation's description under
+    /// the name in the app — e.g. "azula / terminal refactor".
+    description: Option<String>,
+    /// Override the sender name shown in the app. Defaults to the bridge's name
+    /// (usually "Claude"); normally leave this unset.
+    name: Option<String>,
+    /// The device to update. Omit to update every connected device.
     device: Option<String>,
 }
 
@@ -789,8 +793,8 @@ impl AzulaBridge {
         }
     }
 
-    /// Rename the conversation shown in the app.
-    #[tool(description = "Set the conversation's title in the azula app (shown at the top of the chat and as the notification title). Use the convention \"Claude / <project> / <topic>\" — the assistant name, the project if there is one, then the session's topic — e.g. \"Claude / azula / terminal refactor\". Renames the live conversation on the given device, or on every connected device if omitted. Keep the same title for the whole session; choose a fresh one for a new session.")]
+    /// Set the conversation's name and/or description in the app.
+    #[tool(description = "Set how this conversation is labelled in the azula app. Leave `name` unset so it stays the assistant name (\"Claude\"); put the project + session topic in `description` (e.g. \"azula / terminal refactor\"), which the app shows under the name in the conversation list and the chat header. Keep the same description for a session; set a fresh one for a new session. Applies to the given device, or every connected device if omitted.")]
     async fn set_name(&self, Parameters(args): Parameters<SetNameArgs>) -> Result<CallToolResult, ErrorData> {
         let targets: Vec<DeviceConn> = {
             let guard = self.devices.lock().await;
@@ -802,7 +806,8 @@ impl AzulaBridge {
                 None => guard.values().cloned().collect(),
             }
         };
-        let frame = Frame::Hello { name: args.name.clone() };
+        let name = args.name.clone().unwrap_or_else(|| self.own_name.clone());
+        let frame = Frame::Profile { name: name.clone(), description: args.description.clone(), avatar: None, mime: None };
         let mut sent = 0;
         for conn in &targets {
             let mut g = conn.send.lock().await;
@@ -813,7 +818,7 @@ impl AzulaBridge {
             }
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "renamed conversation to \"{}\" on {sent} device(s)", args.name
+            "set name=\"{name}\" description={:?} on {sent} device(s)", args.description
         ))]))
     }
 
@@ -896,7 +901,40 @@ impl AzulaBridge {
     }
 
     /// Render an A2UI declarative UI surface on a device.
-    #[tool(description = "Render an A2UI declarative UI surface in the azula app on a named device. Pass `components` as a flat JSON array of A2UI basic-catalog components (v0.9.1); exactly one must have \"id\":\"root\". Available components: Text, Image, Icon, Video, AudioPlayer, Row, Column, List, Card, Tabs, Modal, Divider, Button, TextField, CheckBox, ChoicePicker, Slider, DateTimeInput. Components reference children by id (child/children); props are literals or {\"path\":\"/ptr\"} bindings into the optional `data_model`. A Button carries {\"action\":{\"event\":{\"name\":\"...\",\"context\":{...}}}}; when the user interacts, an event arrives via `get_messages` as a `ui-event: {...}` JSON line carrying name/surfaceId/sourceComponentId/context. Returns the surfaceId — pass it to `update_ui` to change the data model in response.")]
+    #[tool(description = r##"Render an interactive A2UI surface in the azula app on a device. Returns the surfaceId (pass it to update_ui / delete_ui).
+
+STRUCTURE: `components` is a flat JSON array; each element is {"id":"...","component":"<Type>", ...props}. Exactly one must have "id":"root". Containers reference children by id — `child` (single id) or `children` (array of ids); never nest component objects. Optional `data_model` is a JSON object; any prop value may be a literal OR a binding {"path":"/rfc6901/pointer"} into the data model.
+
+COMPONENTS (props):
+- Text: text (string|binding); variant: h1|h2|body(default)|caption.
+- Row: children[]; justify: start|center|end|spaceBetween|spaceAround|spaceEvenly; align: start|center|end.
+- Column: children[]; justify (vertical), align (horizontal).
+- List: children[]; direction: vertical(default)|horizontal; align.
+- Card: child; align.
+- Divider: (none).
+- Tabs: tabs: [{"title":"...","child":"<id>"}].
+- Modal: trigger:<id>, child:<id> (tapping the trigger opens the child).
+- Button: child:<id> (its label, usually a Text); variant: default|primary; action:{"event":{"name":"<event>","context":{...}}}.
+- TextField: label; value:{"path":"/f"} (two-way — edits write to the data model); variant: shortText(default)|longText|number|password.
+- CheckBox: label; value:{"path":"/flag"} (boolean, two-way).
+- ChoicePicker: label; value:{"path":"/sel"}; options:[{"value":"...","label":"..."}]; variant: mutuallyExclusive(default,single)|multiSelect; displayStyle: chips(default).
+- Slider: label; value:{"path":"/n"}; min(default 0); max(default 100).
+- DateTimeInput: label; value:{"path":"/dt"}.
+- Image: url — MUST be a data URI ("data:image/png;base64,...."); http URLs render only as a placeholder. fit: contain(default)|cover|stretch.
+- Icon: name. Video/AudioPlayer: url (placeholder only).
+
+INTERACTION: A Button tap emits a `ui-event: {"name","surfaceId","sourceComponentId","context"}` line you receive via wait_for_reply / get_messages (context bindings are resolved against the current data model). Input components (TextField/CheckBox/ChoicePicker/Slider) write into the data model at their bound path; to READ those values, reference them in a Button's action `context` (e.g. "context":{"note":{"path":"/note"}}) — the tap's ui-event then carries the resolved values. Respond by calling update_ui (change the data model at a JSON-pointer) or render_ui (a new surface).
+
+EXAMPLE (a name form):
+components: [
+  {"id":"root","component":"Card","child":"col"},
+  {"id":"col","component":"Column","children":["t","f","btn"],"align":"center"},
+  {"id":"t","component":"Text","text":"What's your name?","variant":"h2"},
+  {"id":"f","component":"TextField","label":"name","value":{"path":"/name"}},
+  {"id":"lbl","component":"Text","text":"Submit"},
+  {"id":"btn","component":"Button","child":"lbl","variant":"primary","action":{"event":{"name":"submit","context":{"name":{"path":"/name"}}}}}
+]
+data_model: {"name":""}"##)]
     async fn render_ui(&self, Parameters(args): Parameters<RenderUiArgs>) -> Result<CallToolResult, ErrorData> {
         // Validate: components must be an array containing a "root" component.
         let comps = match &args.components {
@@ -1100,11 +1138,12 @@ impl ServerHandler for AzulaBridge {
              A2UI card (both raise a phone notification when the app is backgrounded). \
              To receive the user's reply or a card tap, call `wait_for_reply` (blocks until \
              they respond) or `get_messages` (drain now); A2UI taps arrive as `ui-event:` \
-             lines — react with `update_ui`. Once connected, call `set_name` to title the \
-             conversation \"Claude / <project> / <topic>\" (e.g. \"Claude / azula / terminal \
-             refactor\") — keep it for the session, use a fresh title for a new session. \
-             `list_devices` shows connection status; `disconnect` closes a connection. \
-             (`say` is for bridge-to-bridge chat, not apps.)"
+             lines — react with `update_ui`. Once connected, call `set_name` with \
+             description=\"<project> / <topic>\" (e.g. \"azula / terminal refactor\") to \
+             label the conversation — the name stays \"Claude\"; keep the description for \
+             the session, set a fresh one for a new session. `render_ui`'s description \
+             documents the full A2UI catalog. `list_devices` shows connection status; \
+             `disconnect` closes a connection. (`say` is for bridge-to-bridge chat, not apps.)"
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
