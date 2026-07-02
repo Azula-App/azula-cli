@@ -50,6 +50,10 @@ enum Command {
     /// Run the MCP↔iroh bridge: an MCP server (Streamable HTTP) that manages
     /// connections to one or more Azula app devices over iroh.
     ServeMcp(ServeMcpArgs),
+    /// Run the MCP↔iroh bridge over **stdio** — for `claude mcp add azula -- azula mcp`.
+    /// Same tools as `serve-mcp` (pair, send, render A2UI, receive) but spoken over
+    /// stdin/stdout so Claude Code launches it directly; no HTTP port.
+    Mcp(McpArgs),
     /// Pair a new device: save its ticket to the registry.
     Pair(PairArgs),
     /// List all registered devices and their registry source.
@@ -82,6 +86,24 @@ struct ServeMcpArgs {
 
     /// Hard per-peer turn cap for bridge-to-bridge `say` conversations. Once
     /// either side reaches this many turns the conversation is closed.
+    #[arg(long = "max-turns", value_name = "N", default_value_t = 20)]
+    max_turns: u64,
+}
+
+/// Options for the `mcp` command (the stdio MCP↔iroh bridge).
+#[derive(Debug, Clone, clap::Args)]
+struct McpArgs {
+    /// A device ticket URL to connect to (repeatable). Each value is a URL or bare
+    /// ticket in any form accepted by `azula pair`.
+    #[arg(long = "device", value_name = "URL", action = clap::ArgAction::Append)]
+    device: Option<Vec<String>>,
+
+    /// Display name this bridge announces to the app (shown as the conversation name
+    /// and the notification title). Defaults to "Claude".
+    #[arg(long, value_name = "NAME", default_value = "Claude")]
+    name: String,
+
+    /// Hard per-peer turn cap for bridge-to-bridge `say` conversations.
     #[arg(long = "max-turns", value_name = "N", default_value_t = 20)]
     max_turns: u64,
 }
@@ -151,7 +173,10 @@ struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs go to stderr, never stdout — the `mcp` subcommand speaks JSON-RPC over
+    // stdout, so any stray stdout write would corrupt the protocol stream.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -163,6 +188,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::ServeMcp(args)) => {
             bridge::run(args.bind, args.device.unwrap_or_default(), args.name, args.max_turns).await
+        }
+        Some(Command::Mcp(args)) => {
+            bridge::run_stdio(args.device.unwrap_or_default(), Some(args.name), args.max_turns).await
         }
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Pair(args)) => cmd_pair(args),

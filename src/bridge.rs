@@ -47,7 +47,7 @@ use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::StreamableHttpService;
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::BufReader;
 use tokio::sync::Mutex as AsyncMutex;
@@ -307,15 +307,19 @@ fn match_known_device(
 struct BridgeAcceptHandler {
     devices: DeviceMap,
     bind: String,
+    /// The name this bridge announces to apps that connect in (the conversation
+    /// title on the phone), e.g. "Claude".
+    own_name: String,
     /// Counter to assign monotonically-increasing names to scanned devices.
     scan_counter: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl BridgeAcceptHandler {
-    fn new(devices: DeviceMap, bind: String) -> Self {
+    fn new(devices: DeviceMap, bind: String, own_name: String) -> Self {
         Self {
             devices,
             bind,
+            own_name,
             scan_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
@@ -323,7 +327,7 @@ impl BridgeAcceptHandler {
 
 impl ProtocolHandler for BridgeAcceptHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        accept_incoming(connection, self.devices.clone(), self.bind.clone(), self.scan_counter.clone())
+        accept_incoming(connection, self.devices.clone(), self.bind.clone(), self.own_name.clone(), self.scan_counter.clone())
             .await
             .map_err(|e| AcceptError::from_boxed(e.into()))
     }
@@ -333,6 +337,7 @@ async fn accept_incoming(
     connection: Connection,
     devices: DeviceMap,
     bind: String,
+    own_name: String,
     counter: Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
@@ -389,10 +394,11 @@ async fn accept_incoming(
         }
     };
 
-    // Announce ourselves to an azula app so it titles the conversation "azula"
-    // (the app keeps the bridge's peer code as the subtitle). Never to peer bridges.
+    // Announce ourselves to an azula app so it titles the conversation with our
+    // name (e.g. "Claude"); the app keeps the bridge's peer code as the subtitle.
+    // Never to peer bridges. The LLM can refine the title later via `set_name`.
     if from_app {
-        let _ = write_frame(&mut send, &Frame::Hello { name: "azula".into() }).await;
+        let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone() }).await;
     }
 
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
@@ -521,6 +527,24 @@ struct DeleteUiArgs {
     device: String,
     /// The surface id to remove.
     surface_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct WaitForReplyArgs {
+    /// The device name to wait on.
+    device: String,
+    /// How long to wait, in seconds, before giving up. Defaults to 120.
+    timeout_s: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SetNameArgs {
+    /// The new conversation title, e.g. "Claude / azula / terminal refactor".
+    name: String,
+    /// The device to rename on. Omit to rename on every connected device.
+    device: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +757,64 @@ impl AzulaBridge {
             let text = if all.is_empty() { "(no new messages)".to_string() } else { all.join("\n") };
             Ok(CallToolResult::success(vec![Content::text(text)]))
         }
+    }
+
+    /// Long-poll: block until the device has new inbound activity, then drain it.
+    #[tool(description = "Wait (long-poll) until a named device has new inbound activity — the user's chat reply, or an A2UI `ui-event:` interaction with a surface from `render_ui` — then return it and drain the inbox. Blocks up to `timeout_s` seconds (default 120), returning \"(no reply within Ns)\" on timeout. Use this after `send_message` or `render_ui` to pause for the user's response; `get_messages` is the non-blocking drain.")]
+    async fn wait_for_reply(&self, Parameters(args): Parameters<WaitForReplyArgs>) -> Result<CallToolResult, ErrorData> {
+        let timeout_s = args.timeout_s.unwrap_or(120);
+        // The DeviceConn's inbox is an Arc shared with the reader loop, so cloning
+        // the conn once and polling its inbox sees frames as they arrive.
+        let conn = {
+            let guard = self.devices.lock().await;
+            match guard.get(&args.device) {
+                Some(c) => c.clone(),
+                None => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "unknown device '{}'", args.device
+                ))])),
+            }
+        };
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_s);
+        loop {
+            let msgs: Vec<String> = conn.inbox.lock().unwrap().drain(..).collect();
+            if !msgs.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(msgs.join("\n"))]));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "(no reply within {timeout_s}s)"
+                ))]));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Rename the conversation shown in the app.
+    #[tool(description = "Set the conversation's title in the azula app (shown at the top of the chat and as the notification title). Use the convention \"Claude / <project> / <topic>\" — the assistant name, the project if there is one, then the session's topic — e.g. \"Claude / azula / terminal refactor\". Renames the live conversation on the given device, or on every connected device if omitted. Keep the same title for the whole session; choose a fresh one for a new session.")]
+    async fn set_name(&self, Parameters(args): Parameters<SetNameArgs>) -> Result<CallToolResult, ErrorData> {
+        let targets: Vec<DeviceConn> = {
+            let guard = self.devices.lock().await;
+            match &args.device {
+                Some(name) => match guard.get(name) {
+                    Some(c) => vec![c.clone()],
+                    None => return Ok(CallToolResult::error(vec![Content::text(format!("unknown device '{name}'"))])),
+                },
+                None => guard.values().cloned().collect(),
+            }
+        };
+        let frame = Frame::Hello { name: args.name.clone() };
+        let mut sent = 0;
+        for conn in &targets {
+            let mut g = conn.send.lock().await;
+            if let Some(send) = g.as_mut() {
+                if write_frame(send, &frame).await.is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "renamed conversation to \"{}\" on {sent} device(s)", args.name
+        ))]))
     }
 
     /// Send a peer-to-peer chat message to another bridge.
@@ -1010,13 +1092,19 @@ impl ServerHandler for AzulaBridge {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
-            "Multi-device azula bridge. Use `connect` to pair a device or peer bridge, \
-             `list_devices` to see status, `send_message` / `get_messages` to communicate \
-             with azula app devices, `say` to exchange peer-to-peer messages with another \
-             bridge (replies arrive via `get_messages`), `disconnect` to close a connection. \
-             To show a rich UI on an app device, call `render_ui` with A2UI components; \
-             user interactions come back through `get_messages` as `ui-event:` lines — \
-             react with `update_ui`."
+            "azula bridge — a link to the user's azula phone app over iroh. \
+             To pair a phone: call `start_pairing` and show the user the returned URL + QR \
+             code (they scan it or paste the code into the app's \"＋ connect a peer\"), OR \
+             call `connect` with a share code the user copies from their app. Then use \
+             `send_message` to send a chat message and `render_ui` to show an interactive \
+             A2UI card (both raise a phone notification when the app is backgrounded). \
+             To receive the user's reply or a card tap, call `wait_for_reply` (blocks until \
+             they respond) or `get_messages` (drain now); A2UI taps arrive as `ui-event:` \
+             lines — react with `update_ui`. Once connected, call `set_name` to title the \
+             conversation \"Claude / <project> / <topic>\" (e.g. \"Claude / azula / terminal \
+             refactor\") — keep it for the session, use a fresh title for a new session. \
+             `list_devices` shows connection status; `disconnect` closes a connection. \
+             (`say` is for bridge-to-bridge chat, not apps.)"
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -1028,12 +1116,21 @@ impl ServerHandler for AzulaBridge {
 // Entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run(
-    bind: String,
-    device_urls: Vec<String>,
-    name: Option<String>,
-    max_turns: u64,
-) -> Result<()> {
+/// The iroh side of the bridge, shared by the HTTP (`run`) and stdio (`run_stdio`)
+/// MCP servers: a bound endpoint, the accept router, the device map, and the
+/// background dial + redelivery tasks. `_router` is held so accepts keep working.
+struct BridgeCore {
+    endpoint: Arc<Endpoint>,
+    devices: DeviceMap,
+    bridge_ticket: String,
+    own_name: String,
+    _router: Router,
+}
+
+/// Bind the endpoint, stand up the accept router, preload known devices (+ any
+/// `--device` flags), and start the background dial + redelivery loops. `label` is
+/// a human tag written into the runtime state file (the HTTP bind, or "stdio").
+async fn setup_bridge(label: &str, device_urls: Vec<String>, name: Option<String>) -> Result<BridgeCore> {
     // Reuse a persisted key so the bridge keeps a stable node id (and connect
     // code) across restarts; the one endpoint serves both accept and dial.
     let raw_endpoint = Endpoint::builder(presets::N0)
@@ -1045,27 +1142,26 @@ pub async fn run(
 
     let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
 
-    // Build an iroh Router that accepts incoming azula app / peer bridge
-    // connections (from devices that scanned the bridge's QR code) and
-    // registers them.
-    let accept_handler = BridgeAcceptHandler::new(devices.clone(), bind.clone());
-    let iroh_router = Router::builder(raw_endpoint)
-        .accept(LLM_ALPN, accept_handler)
-        .spawn();
-
-    // Retrieve the endpoint from the router so we use a single endpoint for
-    // both accepting inbound connections and dialing outbound ones.
-    let endpoint = Arc::new(iroh_router.endpoint().clone());
-
-    // Compute the bridge's own pairing ticket for QR / start_pairing tool.
-    let bridge_ticket = EndpointTicket::new(endpoint.addr()).to_string();
-
-    // Compute own_name: use --name if given, else derive from the endpoint id.
-    let endpoint_id_str = endpoint.id().to_string();
+    // Our display name (the conversation title the app shows), announced to apps in
+    // both the dial and accept directions. Computed before the accept handler so it
+    // can use it. Falls back to bridge-<id> only when no --name was given.
+    let endpoint_id_str = raw_endpoint.id().to_string();
     let own_name = name.unwrap_or_else(|| {
         let len = endpoint_id_str.len();
         format!("bridge-{}", &endpoint_id_str[..8_usize.min(len)])
     });
+
+    // Accept incoming azula app / peer-bridge connections (devices that scanned
+    // the bridge's QR) and register them.
+    let accept_handler = BridgeAcceptHandler::new(devices.clone(), label.to_string(), own_name.clone());
+    let iroh_router = Router::builder(raw_endpoint)
+        .accept(LLM_ALPN, accept_handler)
+        .spawn();
+
+    // One endpoint for both accepting inbound and dialing outbound.
+    let endpoint = Arc::new(iroh_router.endpoint().clone());
+
+    let bridge_ticket = EndpointTicket::new(endpoint.addr()).to_string();
     info!(own_name=%own_name, "bridge: own name");
 
     // Load registry and pre-populate the device map.
@@ -1077,17 +1173,16 @@ pub async fn run(
         }
     }
 
-    // Also add any --device flags from the command line.
+    // Also add any --device flags (not persisted).
     for url in &device_urls {
         if let Some(token) = parse_ticket(url) {
-            let name: String = token.chars().take(8).collect();
+            let dev_name: String = token.chars().take(8).collect();
             let mut guard = devices.lock().await;
-            guard.entry(name.clone()).or_insert_with(|| DeviceConn::new(token.clone()));
+            guard.entry(dev_name.clone()).or_insert_with(|| DeviceConn::new(token.clone()));
         }
     }
 
-    // Write initial state.
-    write_state(&bind, &devices).await;
+    write_state(label, &devices).await;
 
     // Best-effort dial all known devices in the background.
     {
@@ -1099,14 +1194,15 @@ pub async fn run(
         drop(guard);
 
         let own_name_clone = own_name.clone();
+        let label_owned = label.to_string();
         for (dev_name, ticket) in entries {
             let ep = endpoint.clone();
             let devs = devices.clone();
-            let bind_str = bind.clone();
+            let label_str = label_owned.clone();
             let my_name = own_name_clone.clone();
             tokio::spawn(async move {
                 connect_device(&ep, &dev_name, &ticket, &devs, &my_name).await;
-                write_state(&bind_str, &devs).await;
+                write_state(&label_str, &devs).await;
             });
         }
     }
@@ -1116,12 +1212,11 @@ pub async fn run(
     {
         let ep = endpoint.clone();
         let devs = devices.clone();
-        let bind_str = bind.clone();
+        let label_owned = label.to_string();
         let my_name = own_name.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(25)).await;
-                // Snapshot device names + tickets for offline devices with pending mail.
                 let pending: Vec<(String, String)> = {
                     let guard = devs.lock().await;
                     guard.iter()
@@ -1132,18 +1227,29 @@ pub async fn run(
                 for (dev_name, ticket) in pending {
                     info!(device=%dev_name, "bridge: attempting redelivery of queued mail");
                     connect_device(&ep, &dev_name, &ticket, &devs, &my_name).await;
-                    write_state(&bind_str, &devs).await;
+                    write_state(&label_owned, &devs).await;
                 }
             }
         });
     }
 
+    Ok(BridgeCore { endpoint, devices, bridge_ticket, own_name, _router: iroh_router })
+}
+
+pub async fn run(
+    bind: String,
+    device_urls: Vec<String>,
+    name: Option<String>,
+    max_turns: u64,
+) -> Result<()> {
+    let core = setup_bridge(&bind, device_urls, name).await?;
+
     // MCP server over Streamable HTTP, mounted at /mcp.
-    let ep_svc = endpoint.clone();
-    let devs_svc = devices.clone();
+    let ep_svc = core.endpoint.clone();
+    let devs_svc = core.devices.clone();
     let bind_svc = bind.clone();
-    let ticket_svc = bridge_ticket.clone();
-    let own_name_svc = own_name.clone();
+    let ticket_svc = core.bridge_ticket.clone();
+    let own_name_svc = core.own_name.clone();
     let service = StreamableHttpService::new(
         move || Ok(AzulaBridge::new(
             ep_svc.clone(),
@@ -1160,8 +1266,32 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     print_banner(&bind);
-    qr::print_pairing("Pair a device by scanning:", &bridge_ticket);
+    qr::print_pairing("Pair a device by scanning:", &core.bridge_ticket);
     axum::serve(listener, http_router).await?;
+    Ok(())
+}
+
+/// Run the bridge as a **stdio** MCP server — for `claude mcp add azula -- azula mcp`.
+/// Same `AzulaBridge` + iroh node as [`run`], but JSON-RPC is spoken over stdin/stdout,
+/// so all human output goes to **stderr** and never corrupts the protocol stream.
+pub async fn run_stdio(device_urls: Vec<String>, name: Option<String>, max_turns: u64) -> Result<()> {
+    let core = setup_bridge("stdio", device_urls, name).await?;
+
+    eprintln!("azula MCP bridge (stdio) online as \"{}\"", core.own_name);
+    eprintln!("pairing URL: {}", qr::pairing_url(&core.bridge_ticket));
+    eprintln!("(call the start_pairing tool to show a QR and pair a phone)");
+
+    let bridge = AzulaBridge::new(
+        core.endpoint.clone(),
+        core.devices.clone(),
+        "stdio".to_string(),
+        core.bridge_ticket.clone(),
+        core.own_name.clone(),
+        max_turns,
+    );
+    // Serve over stdio; core stays alive (holds the accept router) until we stop.
+    let running = bridge.serve(rmcp::transport::stdio()).await?;
+    running.waiting().await?;
     Ok(())
 }
 
