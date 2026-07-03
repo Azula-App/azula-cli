@@ -13,7 +13,6 @@
 //! blocking PTY side and the async iroh side.
 
 use std::io::{Read, Write};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -24,16 +23,12 @@ use tokio::io::BufReader;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::invite;
+use crate::accept_gate::{gate_stranger, GateOutcome};
 use crate::proto::{read_frame, write_frame, Frame};
-use crate::registry::{self, Device};
+use crate::registry;
 
 /// ALPN identifier for the remote-shell protocol.
 pub const TERM_ALPN: &[u8] = b"azula/term/0";
-
-/// 15 s cap on waiting for a stranger's first frame — mirrors the same gate
-/// in `bridge/device.rs`'s `accept_incoming`.
-const STRANGER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Protocol handler for the remote-shell ALPN.
 ///
@@ -41,7 +36,8 @@ const STRANGER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// multi-device map), `serve`'s term ALPN has no device-session concept — it
 /// just needs to know whether an inbound connection is from a device already
 /// in the registry, and gate strangers on a valid invite per
-/// `azula-docs/docs/invitations.md`.
+/// `azula-docs/docs/invitations.md` (see `accept_gate::gate_stranger`, shared
+/// with `mcp.rs`'s `LlmHandler`).
 #[derive(Debug, Clone)]
 pub struct TermHandler {
     /// Our own node id — the invite-verification audience and signature key.
@@ -92,7 +88,8 @@ async fn handle(connection: Connection, my_node_id: EndpointId, allow_legacy: bo
         let mut first_frame: Option<Frame> = None;
 
         if first_stream && !known {
-            match gate_stranger(&mut reader, my_node_id, allow_legacy, &remote).await {
+            let device_name = format!("term-{}", &remote[..8.min(remote.len())]);
+            match gate_stranger(&mut reader, my_node_id, allow_legacy, &remote, &device_name, "term").await {
                 GateOutcome::Admit { replay } => {
                     known = true; // don't re-gate later streams on this connection
                     first_frame = replay.map(|b| *b);
@@ -109,100 +106,6 @@ async fn handle(connection: Connection, my_node_id: EndpointId, allow_legacy: bo
             }
         });
     }
-}
-
-enum GateOutcome {
-    /// Admit the connection; `replay` is a frame already consumed off the
-    /// stream while gating that the session must still process (e.g. a
-    /// legacy client's `Input` sent with no preceding `Hello`). Boxed so this
-    /// variant doesn't force `Close` to pay for `Frame`'s size too.
-    Admit { replay: Option<Box<Frame>> },
-    Close,
-}
-
-/// Require the first frame of a stranger's first stream to be a `Hello`
-/// carrying a valid invite (verified against `my_node_id`'s issued-invite
-/// store). Registers the device (as `azula pair` would) and marks single-use
-/// invites consumed on success. Falls back to admitting unverified when
-/// `allow_legacy` is set (transition escape hatch); otherwise closes.
-async fn gate_stranger(
-    reader: &mut BufReader<RecvStream>,
-    my_node_id: EndpointId,
-    allow_legacy: bool,
-    remote: &str,
-) -> GateOutcome {
-    let first = match tokio::time::timeout(STRANGER_HELLO_TIMEOUT, read_frame(reader)).await {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            info!(%remote, "term: stranger's first frame timed out; closing");
-            return GateOutcome::Close;
-        }
-    };
-
-    let invite_token = match &first {
-        Ok(Some(Frame::Hello { invite: Some(tok), .. })) => Some(tok.clone()),
-        _ => None,
-    };
-
-    let verified = match invite_token {
-        Some(tok) => match invite::verify_inbound(&tok, my_node_id, &my_node_id) {
-            Ok(v) => {
-                info!(%remote, invite_id = %v.invite_id, "term: stranger presented a valid invite");
-                Some(v)
-            }
-            Err(e) if allow_legacy => {
-                warn!(%remote, error = %e, "term: invite verification failed; admitting as unverified (--allow-legacy)");
-                None
-            }
-            Err(e) => {
-                warn!(%remote, error = %e, "term: invite verification failed; closing (pass --allow-legacy to admit anyway)");
-                return GateOutcome::Close;
-            }
-        },
-        None if allow_legacy => {
-            info!(%remote, "term: stranger connected without an invite; admitting as unverified (--allow-legacy)");
-            None
-        }
-        None => {
-            warn!(%remote, "term: stranger connected without a valid invite; closing (pass --allow-legacy to admit anyway)");
-            return GateOutcome::Close;
-        }
-    };
-
-    if let Some(v) = verified {
-        let device = Device {
-            name: format!("term-{}", &remote[..8.min(remote.len())]),
-            ticket: remote.to_string(),
-            added_at: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            invite: None,
-        };
-        if let Err(e) = registry::add(device, false) {
-            warn!(%remote, error = %e, "term: failed to register invite-verified device");
-        }
-        if v.single_use {
-            if let Err(e) = invite::mark_consumed(&v.invite_id) {
-                warn!(%remote, error = %e, "term: failed to mark invite consumed");
-            }
-        }
-    }
-
-    // A non-Hello first frame (legacy client that sends Input immediately) must
-    // be replayed into the session so it isn't lost; a Hello frame is fully
-    // consumed by the gate and has nothing to replay.
-    let replay = match first {
-        Ok(Some(frame @ Frame::Hello { .. })) => {
-            let _ = frame; // consumed by the gate; nothing to replay
-            None
-        }
-        Ok(Some(other)) => Some(Box::new(other)),
-        Ok(None) | Err(_) => None,
-    };
-    GateOutcome::Admit { replay }
 }
 
 /// Pull the longest valid-UTF-8 prefix out of `buf`, leaving any incomplete

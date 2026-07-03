@@ -13,6 +13,7 @@
 //! `azula-demos` crate (in `demos/`) depends on it for the standalone demo
 //! binaries that used to live here.
 
+pub mod accept_gate;
 pub mod bridge;
 pub mod endpoint;
 pub mod filexfer;

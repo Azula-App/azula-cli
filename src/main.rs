@@ -174,6 +174,15 @@ struct InviteMintArgs {
     /// A note shown next to this invite in `azula invites` (e.g. a recipient's name).
     #[arg(long)]
     label: Option<String>,
+
+    /// Mint against the bridge identity (the one `azula serve-mcp`/`azula mcp`
+    /// use) instead of the default `serve` identity. Use this to hand out a
+    /// pairing invite for a running bridge from the CLI — a plain `azula
+    /// invite` mints for a different key and won't be accepted by
+    /// `serve-mcp`/`mcp` (only that bridge's own startup banner or
+    /// `start_pairing` tool output will be).
+    #[arg(long)]
+    bridge: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -371,10 +380,16 @@ fn parse_expiry(s: &str) -> Result<Expiry> {
 async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     let expiry = parse_expiry(&args.expires)?;
 
-    // Mint against the `serve` identity's ticket — the same identity `azula
-    // serve`'s own startup pairing invite uses — so a minted invite is
-    // dialable against a running (or about-to-run) `azula serve`.
-    let (endpoint, ticket) = endpoint::bind_server_endpoint("serve").await?;
+    // `serve` (default) and `serve-mcp`/`mcp` (`--bridge`) persist separate
+    // node keys, so which identity this mints against determines which
+    // running process can ever accept it — a `serve` invite is dialable
+    // against a running (or about-to-run) `azula serve`; a `--bridge` invite
+    // against `serve-mcp`/`mcp`. Getting this wrong is the #1 way a minted
+    // invite mysteriously fails verification, so the identity is always
+    // printed alongside the result.
+    let identity_name = if args.bridge { "bridge" } else { "serve" };
+    let (endpoint, ticket) = endpoint::bind_server_endpoint(identity_name).await?;
+    let node_id = endpoint.id();
 
     let (payload, record) = invite::mint(
         &ticket,
@@ -387,11 +402,22 @@ async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     let encoded = payload.encode();
     let url = qr::invite_url(&encoded);
 
-    println!("Minted invite {} (expires: {})", record.id, describe_expiry(record.expires_at));
+    let node_id_str = node_id.to_string();
+    println!(
+        "Minted invite {} for the {identity_name} identity (node {}…)",
+        record.id,
+        &node_id_str[..8.min(node_id_str.len())]
+    );
+    println!("  expires: {}", describe_expiry(record.expires_at));
     if let Some(label) = &record.label {
         println!("  label: {label}");
     }
     println!("  signed: {}, single-use: {}", record.is_signed(), record.is_single_use());
+    if args.bridge {
+        println!("  pairs with: azula serve-mcp / azula mcp (this same identity)");
+    } else {
+        println!("  pairs with: azula serve (this same identity); NOT serve-mcp/mcp — mint with --bridge for that");
+    }
     println!();
     qr::print_invite_pairing("Share this invite:", &encoded);
     println!("  {url}");
@@ -531,7 +557,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .spawn()
     } else {
         Router::builder(endpoint)
-            .accept(LLM_ALPN, LlmHandler::new(mcp))
+            .accept(LLM_ALPN, LlmHandler::new(mcp, node_id, args.allow_legacy))
             .accept(TERM_ALPN, TermHandler::new(node_id, args.allow_legacy))
             .spawn()
     };

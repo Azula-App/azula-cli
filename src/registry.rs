@@ -16,6 +16,16 @@ use iroh::EndpointId;
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
 
+/// Serializes tests (in this file, `bridge/tests.rs`, and `accept_gate.rs`)
+/// that mutate the process-global `AZULA_REGISTRY_DIR`/`AZULA_INVITES_DIR`
+/// env vars, so two tests touching them concurrently — which `cargo test`'s
+/// default parallelism otherwise allows — don't race and read back a value
+/// neither of them set. Acquire for the full duration of env mutation plus
+/// any calls whose behavior depends on it. A `tokio::sync::Mutex`, not
+/// `std::sync::Mutex`: guards here are held across `.await` points.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A single registered device.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Device {
@@ -169,15 +179,19 @@ pub fn add(device: Device, global: bool) -> Result<PathBuf> {
 }
 
 /// Find a registered device whose ticket's embedded node id matches
-/// `node_id`. Used by accept-side gates (`term.rs`, `bridge/device.rs`) to
-/// recognize a reconnecting known peer regardless of what name it announces.
-/// A device whose `ticket` doesn't parse as a dialable `EndpointTicket` (e.g.
-/// one registered from a bare inbound node-id string) never matches.
+/// `node_id`. Used by accept-side gates (`term.rs`, `mcp.rs`,
+/// `accept_gate.rs`) to recognize a reconnecting known peer regardless of
+/// what name it announces. Matches two `ticket` shapes: a dialable
+/// `EndpointTicket` string (from `azula pair` / outbound dial), or a bare
+/// node-id hex string (from accept-side registration, which has no
+/// dialable address to store — see `accept_gate::gate_stranger`).
 pub fn find_by_node_id(node_id: &EndpointId) -> Option<Device> {
+    let node_id_str = node_id.to_string();
     load().into_iter().find(|d| {
-        EndpointTicket::from_str(&d.ticket)
-            .map(|t| &t.endpoint_addr().id == node_id)
-            .unwrap_or(false)
+        d.ticket == node_id_str
+            || EndpointTicket::from_str(&d.ticket)
+                .map(|t| &t.endpoint_addr().id == node_id)
+                .unwrap_or(false)
     })
 }
 

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::EndpointId;
 use rmcp::model::{CallToolRequestParams, CallToolResult, RawContent};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::ServiceExt;
@@ -26,7 +27,9 @@ use serde_json::{Map, Value};
 use tokio::io::BufReader;
 use tracing::{debug, info, warn};
 
+use crate::accept_gate::{gate_stranger, GateOutcome};
 use crate::proto::{read_frame, write_frame, Frame};
+use crate::registry;
 
 /// ALPN identifier for the LLM relay protocol.
 pub const LLM_ALPN: &[u8] = b"azula/llm/0";
@@ -192,21 +195,31 @@ fn extract_text(result: &CallToolResult) -> String {
 }
 
 /// Protocol handler for the LLM relay ALPN, backed by a shared MCP session.
+///
+/// Gated the same way `term.rs`'s `TermHandler` is (see
+/// `accept_gate::gate_stranger`): a known device (registry node-id match)
+/// connects unchanged; a stranger's first stream must open with a valid
+/// `Hello.invite`, or `allow_legacy` admits it unverified.
 #[derive(Clone)]
 pub struct LlmHandler {
     /// `None` => no/failed MCP session; use the canned fallback responder.
     mcp: Option<Arc<McpHandle>>,
+    /// Our own node id — the invite-verification audience and signature key.
+    my_node_id: EndpointId,
+    /// Admit invite-less strangers as unverified instead of closing the
+    /// connection (`--allow-legacy`, default on for one release).
+    allow_legacy: bool,
 }
 
 impl LlmHandler {
-    pub fn new(mcp: Option<Arc<McpHandle>>) -> Self {
+    pub fn new(mcp: Option<Arc<McpHandle>>, my_node_id: EndpointId, allow_legacy: bool) -> Self {
         if mcp.is_none() {
             warn!(
                 "no MCP server configured (or connect failed); the LLM relay will reply with a \
                  canned notice. Pass --mcp-stdio or --mcp-url to enable real responses."
             );
         }
-        LlmHandler { mcp }
+        LlmHandler { mcp, my_node_id, allow_legacy }
     }
 }
 
@@ -214,6 +227,7 @@ impl std::fmt::Debug for LlmHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmHandler")
             .field("mcp", &self.mcp.is_some())
+            .field("allow_legacy", &self.allow_legacy)
             .finish()
     }
 }
@@ -229,8 +243,16 @@ impl ProtocolHandler for LlmHandler {
 
 impl LlmHandler {
     async fn handle(self, connection: Connection) -> Result<()> {
-        let remote = connection.remote_id().to_string();
+        let remote_id = connection.remote_id();
+        let remote = remote_id.to_string();
         info!(%remote, "llm: client connected");
+
+        // Known devices connect exactly as before — no gate. Checked once per
+        // connection (not per stream): a stranger who verifies on the first
+        // stream is registered and every later stream on the same connection
+        // is then implicitly from a "known" peer for the rest of its lifetime.
+        let mut known = registry::find_by_node_id(&remote_id).is_some();
+        let mut first_stream = true;
 
         // Each bi stream is an independent LLM session, so one connection can
         // host many sessions. Loop accepting new streams.
@@ -242,10 +264,27 @@ impl LlmHandler {
                     return Ok(());
                 }
             };
+
+            let mut reader = BufReader::new(recv);
+            let mut first_frame: Option<Frame> = None;
+
+            if first_stream && !known {
+                let device_name = format!("llm-{}", &remote[..8.min(remote.len())]);
+                match gate_stranger(&mut reader, self.my_node_id, self.allow_legacy, &remote, &device_name, "llm").await
+                {
+                    GateOutcome::Admit { replay } => {
+                        known = true; // don't re-gate later streams on this connection
+                        first_frame = replay.map(|b| *b);
+                    }
+                    GateOutcome::Close => return Ok(()),
+                }
+            }
+            first_stream = false;
+
             let this = self.clone();
             let remote = remote.clone();
             tokio::spawn(async move {
-                if let Err(e) = this.session(send, recv, remote.clone()).await {
+                if let Err(e) = this.session(send, reader, first_frame, remote.clone()).await {
                     warn!(%remote, error = %e, "llm: session error");
                 }
             });
@@ -253,17 +292,30 @@ impl LlmHandler {
     }
 
     /// Handle one LLM session bi stream: read prompts, stream answers.
-    async fn session(self, send: SendStream, recv: RecvStream, remote: String) -> Result<()> {
+    /// `first_frame`, if present, is a frame the accept-gate already
+    /// consumed off `reader` (e.g. a legacy client's `Chat` sent with no
+    /// preceding `Hello`) and must be processed before the read loop starts,
+    /// so gating never silently drops a stranger's first message.
+    async fn session(
+        self,
+        send: SendStream,
+        mut reader: BufReader<RecvStream>,
+        first_frame: Option<Frame>,
+        remote: String,
+    ) -> Result<()> {
         let mut send = send;
-        let mut reader = BufReader::new(recv);
+        let mut pending = first_frame;
 
         loop {
-            let frame = match read_frame(&mut reader).await? {
+            let frame = match pending.take() {
                 Some(f) => f,
-                None => {
-                    debug!(%remote, "llm: stream closed by client");
-                    break;
-                }
+                None => match read_frame(&mut reader).await? {
+                    Some(f) => f,
+                    None => {
+                        debug!(%remote, "llm: stream closed by client");
+                        break;
+                    }
+                },
             };
 
             match frame {

@@ -817,6 +817,12 @@ async fn reconnect_by_node_id_flushes_mailbox() {
 /// escape hatch as the `serve`/`serve-mcp` startup banner).
 #[tokio::test]
 async fn start_pairing_mints_invite_unless_legacy_ticket() {
+    // Holds ENV_TEST_LOCK for the whole body — see its doc comment: this test
+    // mutates the process-global AZULA_INVITES_DIR, which other tests
+    // (e.g. accept_gate::tests::valid_invite_admits_and_registers_the_device)
+    // also mutate, and cargo test runs them concurrently by default.
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+
     let invites_dir = std::env::temp_dir()
         .join(format!("azula-bridge-test-{}", std::process::id()))
         .join("start_pairing_mints_invite");
