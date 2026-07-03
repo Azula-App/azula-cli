@@ -11,6 +11,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY demos ./demos
 RUN cargo build --release --bin azula
 
 # ---- runtime stage -------------------------------------------------------

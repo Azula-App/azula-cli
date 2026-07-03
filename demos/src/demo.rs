@@ -1,4 +1,4 @@
-//! `azula demo-ui` — push a sample A2UI surface to a connected device for quick
+//! `demo-ui` — push a sample A2UI surface to a connected device for quick
 //! manual testing of the render → event → update loop, without needing an MCP
 //! client. Dials the device on the LLM ALPN (the same channel `serve-mcp`
 //! uses), renders a dice surface, and — unless `--once` — listens for the
@@ -13,9 +13,9 @@ use iroh_tickets::endpoint::EndpointTicket;
 use serde_json::{json, Value};
 use tokio::io::BufReader;
 
-use crate::mcp::LLM_ALPN;
-use crate::proto::{read_frame, write_frame, Frame};
-use crate::{link, registry};
+use azula::mcp::LLM_ALPN;
+use azula::proto::{read_frame, write_frame, Frame};
+use azula::{link, registry};
 
 const DICE: [&str; 6] = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
 const SURFACE_ID: &str = "demo-dice";

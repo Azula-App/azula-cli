@@ -9,28 +9,14 @@
 //!   server is configured.
 //! * `azula/term/0` — a remote shell ("SSH"-like) bridge over a PTY
 
-mod blackjack;
-mod bridge;
-mod demo;
-mod identity;
-mod link;
-mod mailbox;
-mod mcp;
-mod proto;
-mod qr;
-mod registry;
-mod term;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::Endpoint;
-use iroh_tickets::endpoint::EndpointTicket;
 use tracing::{info, warn};
 
-use crate::mcp::{LlmHandler, McpConfig, McpTransport, LLM_ALPN};
-use crate::term::{TermHandler, TERM_ALPN};
+use azula::mcp::{self, LlmHandler, McpConfig, McpTransport, LLM_ALPN};
+use azula::term::{TermHandler, TERM_ALPN};
+use azula::{bridge, endpoint, link, qr, registry};
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -60,11 +46,6 @@ enum Command {
     Devices,
     /// Print a QR code for a ticket, URL, or bare token.
     Qr(QrArgs),
-    /// Push a sample A2UI surface to a connected device for manual testing.
-    DemoUi(DemoUiArgs),
-    /// Spin up an A2UI Blackjack table; print a connect code and deal a hand to
-    /// each app that connects.
-    Blackjack,
 }
 
 /// Options for the `serve-mcp` command (the MCP↔iroh bridge).
@@ -130,17 +111,6 @@ struct QrArgs {
     code: String,
 }
 
-/// Options for `azula demo-ui`.
-#[derive(Debug, Clone, clap::Args)]
-struct DemoUiArgs {
-    /// A registered device name, or a ticket / pairing URL to dial directly.
-    device: String,
-
-    /// Render the sample surface and exit without listening for events.
-    #[arg(long)]
-    once: bool,
-}
-
 /// Options for the `serve` command (also used when run with no subcommand).
 #[derive(Debug, Clone, clap::Args)]
 struct ServeArgs {
@@ -196,8 +166,6 @@ async fn main() -> Result<()> {
         Some(Command::Pair(args)) => cmd_pair(args),
         Some(Command::Devices) => cmd_devices(),
         Some(Command::Qr(args)) => cmd_qr(args),
-        Some(Command::DemoUi(args)) => demo::run(args.device, args.once).await,
-        Some(Command::Blackjack) => blackjack::run().await,
         None => serve(cli.serve).await,
     }
 }
@@ -242,27 +210,15 @@ fn cmd_devices() -> Result<()> {
     }
 
     // Determine which registry file each device came from for the "source" column.
-    let global_devices = registry::global_path()
-        .map(|p| {
-            if p.exists() {
-                load_names_from_file(&p)
-            } else {
-                vec![]
-            }
-        })
+    let global_devices: Vec<String> = registry::global_path()
+        .map(|p| registry::read_file(&p).into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
 
-    let project_devices = registry::project_path()
-        .map(|p| {
-            if p.exists() {
-                load_names_from_file(&p)
-            } else {
-                vec![]
-            }
-        })
+    let project_devices: Vec<String> = registry::project_path()
+        .map(|p| registry::read_file(&p).into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
 
-    println!("{:<20} {:<12} {}", "NAME", "FINGERPRINT", "SOURCE");
+    println!("{:<20} {:<12} SOURCE", "NAME", "FINGERPRINT");
     println!("{}", "-".repeat(48));
     for d in &known {
         let fingerprint: String = d.ticket.chars().take(8).collect();
@@ -290,31 +246,11 @@ fn cmd_qr(args: QrArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_names_from_file(path: &std::path::Path) -> Vec<String> {
-    #[derive(serde::Deserialize)]
-    struct Reg { devices: Vec<registry::Device> }
-    let data = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    match serde_json::from_str::<Reg>(&data) {
-        Ok(r) => r.devices.into_iter().map(|d| d.name).collect(),
-        Err(_) => vec![],
-    }
-}
-
 async fn serve(args: ServeArgs) -> Result<()> {
     // Bind with the n0 defaults (public discovery + relays), reusing a persisted
     // key so the node id (and connect code) stays stable across restarts.
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(identity::load_or_create_secret("serve"))
-        .bind()
-        .await?;
-    info!("waiting for the endpoint to come online…");
-    endpoint.online().await;
-
+    let (endpoint, ticket) = endpoint::bind_server_endpoint("serve").await?;
     let node_id = endpoint.id();
-    let ticket = EndpointTicket::new(endpoint.addr());
 
     // MCP backend config. Exactly one transport flag may be set (clap enforces
     // mutual exclusion); neither set is allowed and yields the canned fallback.
@@ -334,8 +270,21 @@ async fn serve(args: ServeArgs) -> Result<()> {
         Some(McpTransport::Url(url)) => format!("http: {url}"),
         None => "none (canned fallback)".to_string(),
     };
-    print_banner(&node_id.to_string(), &ticket.to_string(), &mcp_target, args.term_only);
-    qr::print_pairing("Pair by scanning:", &ticket.to_string());
+    let mut banner_lines = vec![
+        "  Paste this code into the azula app to connect:".to_string(),
+        String::new(),
+        format!("    {ticket}"),
+        String::new(),
+        format!("  Short node id: {node_id}"),
+        String::new(),
+        "  Serving ALPNs:".to_string(),
+    ];
+    if !args.term_only {
+        banner_lines.push(format!("    azula/llm/0   MCP relay  -> {mcp_target}"));
+    }
+    banner_lines.push("    azula/term/0  remote shell".to_string());
+    endpoint::print_banner("azula server", &banner_lines);
+    qr::print_pairing("Pair by scanning:", &ticket);
 
     // Establish the shared upstream MCP session eagerly (when a transport flag
     // is set). A connect failure is non-fatal: log it and fall back to the
@@ -368,24 +317,4 @@ async fn serve(args: ServeArgs) -> Result<()> {
     info!("shutting down…");
     router.shutdown().await?;
     Ok(())
-}
-
-fn print_banner(node_id: &str, ticket: &str, mcp_target: &str, term_only: bool) {
-    println!();
-    println!("  ╔══════════════════════════════════════════════════════════╗");
-    println!("  ║                     azula server                          ║");
-    println!("  ╚══════════════════════════════════════════════════════════╝");
-    println!();
-    println!("  Paste this code into the azula app to connect:");
-    println!();
-    println!("    {ticket}");
-    println!();
-    println!("  Short node id: {node_id}");
-    println!();
-    println!("  Serving ALPNs:");
-    if !term_only {
-        println!("    azula/llm/0   MCP relay  -> {mcp_target}");
-    }
-    println!("    azula/term/0  remote shell");
-    println!();
 }

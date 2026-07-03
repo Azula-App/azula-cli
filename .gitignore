@@ -1,4 +1,5 @@
-/target
+# any workspace member's build dir (root and demos/)
+target/
 
 # local cross-built binary for the hot-swap dev loop (docker cp into azula-shell)
 .azula-linux

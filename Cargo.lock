@@ -267,6 +267,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "azula-demos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "azula",
+ "clap",
+ "iroh",
+ "iroh-tickets",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3673,7 +3688,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

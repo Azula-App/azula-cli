@@ -1,0 +1,26 @@
+[package]
+name = "azula-demos"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone demo binaries for the azula p2p app (dice roll-off, Blackjack over A2UI)."
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "azula-demos"
+path = "src/main.rs"
+
+[dependencies]
+azula = { path = ".." }
+
+iroh = "1"
+iroh-tickets = "1"
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"

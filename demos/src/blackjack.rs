@@ -1,6 +1,6 @@
-//! `azula blackjack` — a self-contained A2UI demo: binds an iroh endpoint,
-//! prints a connect code (ticket + URL + QR) to paste/scan into the azula app,
-//! and — for each app that connects — deals a game of Blackjack rendered as an
+//! `blackjack` — a self-contained A2UI demo: binds an iroh endpoint, prints a
+//! connect code (ticket + URL + QR) to paste/scan into the azula app, and —
+//! for each app that connects — deals a game of Blackjack rendered as an
 //! interactive A2UI surface in the app's "azula" conversation.
 //!
 //! This demonstrates the same A2UI render → tap → update mechanism the bridge
@@ -19,19 +19,16 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::Endpoint;
-use iroh_tickets::endpoint::EndpointTicket;
 use serde_json::{json, Value};
 use tokio::io::BufReader;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
-use crate::mcp::LLM_ALPN;
-use crate::proto::{read_frame, write_frame, Frame};
-use crate::qr;
+use azula::mcp::LLM_ALPN;
+use azula::proto::{read_frame, write_frame, Frame};
+use azula::qr;
 
 const CATALOG: &str = "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json";
 
@@ -65,21 +62,14 @@ type Tables = Arc<AsyncMutex<HashMap<String, Table>>>;
 /// Bind, print connect info, and serve Blackjack games until Ctrl-C.
 pub async fn run() -> Result<()> {
     // Reuse a persisted key so restarts keep the same node id (stable connect code).
-    let secret_key = crate::identity::load_or_create_secret("blackjack");
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind()
-        .await?;
-    info!("bringing endpoint online…");
-    endpoint.online().await;
+    let (endpoint, ticket) = azula::endpoint::bind_server_endpoint("blackjack").await?;
 
-    let ticket = EndpointTicket::new(endpoint.addr()).to_string();
-    println!();
-    println!("  ♠ ♥ ♦ ♣   azula blackjack   ♣ ♦ ♥ ♠");
-    println!();
-    println!("  Paste this code into the azula app (＋ connect a peer):");
-    println!();
-    println!("    {ticket}");
+    let lines = vec![
+        "  Paste this code into the azula app (＋ connect a peer):".to_string(),
+        String::new(),
+        format!("    {ticket}"),
+    ];
+    azula::endpoint::print_banner("♠ ♥ ♦ ♣   azula blackjack   ♣ ♦ ♥ ♠", &lines);
     qr::print_pairing("Or scan to play:", &ticket);
     println!("  Then open the 'azula' conversation in the app. Ctrl-C to close the table.");
     println!();
@@ -285,7 +275,7 @@ impl Card {
     fn value(&self) -> u32 {
         match self.rank {
             0 => 11,                // Ace
-            9 | 10 | 11 | 12 => 10, // 10, J, Q, K
+            9..=12 => 10,        // 10, J, Q, K
             r => (r as u32) + 1,    // 2..9
         }
     }

@@ -200,6 +200,8 @@ client.
 | `list_devices`   | Show all known devices and live connection status                                    |
 | `send_message`   | Send text to an azula app device (lazy-reconnects if needed)                         |
 | `get_messages`   | Drain the inbox of one device or all devices (chat text + peer messages + `ui-event:` lines) |
+| `wait_for_reply` | Long-poll (default 120 s) until a device has new inbound activity, then drain it     |
+| `set_name`       | Set the conversation's name/description shown in the app (one device or all)         |
 | `say`            | Send a peer-to-peer chat message to another bridge; replies arrive via `get_messages` |
 | `render_ui`      | Render an A2UI declarative surface on a device                                        |
 | `update_ui`      | Update a surface's data model at a JSON-pointer path (react to a `ui-event`)          |
@@ -221,7 +223,7 @@ the user's interactions back. The full loop is **`render_ui` → the user taps �
 
 `render_ui` takes a flat `components` array (exactly one component must have
 `"id":"root"`), an optional initial `data_model` (backing `{"path":"/ptr"}`
-bindings), and an optional `surface_id` (auto-generated as `ui-<n>` otherwise). It
+bindings), and an optional `surface_id` (auto-generated as `ui-<t>-<n>` otherwise). It
 sends `createSurface` → `updateComponents` → `updateDataModel` and returns the
 surface id.
 
@@ -314,7 +316,19 @@ azula serve-mcp --bind 127.0.0.1:8765 &
 #   disconnect device=phone forget=true
 ```
 
-## `azula demo-ui` — push a sample A2UI surface
+## `azula-demos` — standalone demo binaries
+
+The `demo-ui` and `blackjack` commands live in a separate `azula-demos` crate
+(`demos/`) in this workspace, not in the `azula` binary — they're standalone
+manual-testing tools, not part of the production server. Build and run them
+with `-p azula-demos`:
+
+```sh
+cargo run -p azula-demos -- demo-ui phone
+cargo run -p azula-demos -- blackjack
+```
+
+### `demo-ui` — push a sample A2UI surface
 
 A quick manual tester for the A2UI render → event → update loop, with no MCP
 client required. It dials a device (by registered name or ticket/URL) on the LLM
@@ -322,14 +336,25 @@ channel, renders a dice surface in the app's azula conversation, and — unless
 `--once` — listens for the user's taps and re-rolls in response.
 
 ```sh
-azula demo-ui phone          # render + react to ROLL taps until Ctrl-C
-azula demo-ui phone --once   # render once and exit
-azula demo-ui "https://azula.app/s/<token>"   # dial a ticket directly
+cargo run -p azula-demos -- demo-ui phone          # render + react to ROLL taps until Ctrl-C
+cargo run -p azula-demos -- demo-ui phone --once   # render once and exit
+cargo run -p azula-demos -- demo-ui "https://azula.app/s/<token>"   # dial a ticket directly
 ```
 
 Tapping **ROLL** in the app prints the event and pushes an `updateDataModel`
 back, so the dice faces and result update live — exercising the same path the
 LLM uses via `render_ui` / `get_messages` / `update_ui`.
+
+### `blackjack` — standalone Blackjack dealer
+
+Binds its own iroh endpoint (separate persisted identity, `~/.azula/blackjack.key`),
+prints a connect code, and deals a game of Blackjack — rendered as an A2UI
+surface — to each app that connects. No MCP client involved; unlike `demo-ui`
+it *accepts* inbound connections the way `serve` does.
+
+```sh
+cargo run -p azula-demos -- blackjack
+```
 
 ## ALPNs
 
@@ -381,19 +406,37 @@ client is responsible for any trailing newline).
 
 ## Crate layout
 
+This is a Cargo workspace: the root `azula` package (a library + the `azula`
+binary) and a `demos/` member (the `azula-demos` binary), so the demo tools
+build independently from the production server and don't bloat its binary.
+
 ```
 azula-cli/
-├── Cargo.toml
+├── Cargo.toml    # workspace root + the `azula` package (lib + bin)
 ├── README.md
 ├── .gitignore
-└── src/
-    ├── main.rs      # clap CLI (serve / serve-mcp / pair / devices / qr / demo-ui), serve loop
-    ├── proto.rs     # Frame enum + read_frame / write_frame helpers
-    ├── term.rs      # PTY bridge handler (azula/term/0)
-    ├── mcp.rs       # LLM relay handler: rmcp MCP client + result streaming + canned fallback
-    ├── bridge.rs    # serve-mcp: multi-device AzulaBridge MCP server + accept-side handler
-    ├── demo.rs      # demo-ui: dial a device and push a sample A2UI dice surface
-    ├── link.rs      # parse_ticket: URL / bare-token → token string
-    ├── qr.rs        # pairing_url / render_qr / print_pairing helpers
-    └── registry.rs  # Device registry: load / add / project_path / global_path
+├── src/
+│   ├── lib.rs       # pub mod declarations — the `azula` library other crates depend on
+│   ├── main.rs      # clap CLI (serve / serve-mcp / mcp / pair / devices / qr), serve loop
+│   ├── proto.rs     # Frame enum + read_frame / write_frame helpers
+│   ├── term.rs      # PTY bridge handler (azula/term/0)
+│   ├── mcp.rs       # LLM relay handler: rmcp MCP client + result streaming + canned fallback
+│   ├── bridge/      # serve-mcp (HTTP) + mcp (stdio): the AzulaBridge MCP server
+│   │   ├── mod.rs       # setup_bridge / run / run_stdio entrypoints
+│   │   ├── device.rs    # DeviceConn/DeviceMap, dial + accept + reconnect plumbing
+│   │   ├── state.rs     # runtime state file ($TMPDIR/azula/bridge.json)
+│   │   ├── tools.rs     # the 12 #[tool] MCP methods
+│   │   └── tests.rs     # in-process iroh integration tests
+│   ├── mailbox.rs   # per-device offline frame queue, flushed on reconnect
+│   ├── identity.rs  # persisted secret keys per identity name (~/.azula/<name>.key)
+│   ├── endpoint.rs  # shared bind_server_endpoint / print_banner helpers for serve, bridge, blackjack
+│   ├── link.rs      # parse_ticket: URL / bare-token → token string
+│   ├── qr.rs        # pairing_url / render_qr / print_pairing helpers
+│   └── registry.rs  # Device registry: load / add / remove / project_path / global_path
+└── demos/        # azula-demos: standalone manual-testing binaries, depends on `azula` as a library
+    ├── Cargo.toml
+    └── src/
+        ├── main.rs      # clap CLI (demo-ui / blackjack)
+        ├── demo.rs      # demo-ui: dial a device and push a sample A2UI dice surface
+        └── blackjack.rs # blackjack: standalone blackjack dealer served over iroh
 ```

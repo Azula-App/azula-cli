@@ -8,7 +8,7 @@
 //! `load()` merges both; project entries win on name collision.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,8 +23,8 @@ pub struct Device {
 
 /// On-disk format.
 #[derive(Serialize, Deserialize, Default)]
-struct RegistryFile {
-    devices: Vec<Device>,
+pub struct RegistryFile {
+    pub devices: Vec<Device>,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,11 @@ pub fn global_path() -> Option<PathBuf> {
 // Load / merge
 // ---------------------------------------------------------------------------
 
-fn read_file(path: &PathBuf) -> Vec<Device> {
+/// Read and parse a single registry file. Returns an empty list if the file
+/// is missing or unparseable — callers treat "no devices yet" and "corrupt
+/// file" the same way. Exposed so other modules (e.g. `main`'s device listing)
+/// can read a specific registry file without re-declaring its on-disk shape.
+pub fn read_file(path: &Path) -> Vec<Device> {
     let data = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -152,4 +156,25 @@ pub fn add(device: Device, global: bool) -> Result<PathBuf> {
     fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
 
     Ok(path)
+}
+
+/// Remove `name` from both the project and global registry files (whichever
+/// exist). Returns whether any entry was actually removed.
+pub fn remove(name: &str) -> Result<bool> {
+    let mut removed = false;
+    for path in [project_path(), global_path()].into_iter().flatten() {
+        if !path.exists() {
+            continue;
+        }
+        let mut devices = read_file(&path);
+        let before = devices.len();
+        devices.retain(|d| d.name != name);
+        if devices.len() == before {
+            continue;
+        }
+        removed = true;
+        let content = serde_json::to_string_pretty(&RegistryFile { devices })?;
+        fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(removed)
 }

@@ -1,9 +1,25 @@
+[workspace]
+members = ["demos"]
+
+[workspace.lints.rust]
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
 [package]
 name = "azula"
 version = "0.1.0"
 edition = "2021"
 description = "Server-side companion for the azula p2p app: binds an iroh endpoint and serves an LLM relay and a remote-shell bridge over ALPN protocols."
 license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+name = "azula"
+path = "src/lib.rs"
 
 [[bin]]
 name = "azula"
@@ -15,7 +31,7 @@ iroh-tickets = "1"
 
 anyhow = "1"
 indexmap = { version = "2", features = ["serde"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time", "signal"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

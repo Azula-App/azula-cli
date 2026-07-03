@@ -3,7 +3,7 @@
 //! Messages for offline devices are held in a JSONL file on disk and flushed
 //! when the device reconnects.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::proto::Frame;
 
 const MAX_FRAMES: usize = 1000;
@@ -30,13 +30,13 @@ fn sanitize(device: &str) -> String {
     device.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
 }
 
-fn device_path(dir: &PathBuf, device: &str) -> PathBuf {
+fn device_path(dir: &Path, device: &str) -> PathBuf {
     dir.join(format!("{}.jsonl", sanitize(device)))
 }
 
 /// Append `frames` to the device's mailbox file in `dir`.
 /// If the total would exceed MAX_FRAMES, keeps only the newest MAX_FRAMES.
-pub fn enqueue_in(dir: &PathBuf, device: &str, frames: &[Frame]) -> anyhow::Result<()> {
+pub fn enqueue_in(dir: &Path, device: &str, frames: &[Frame]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = device_path(dir, device);
 
@@ -78,7 +78,7 @@ pub fn enqueue(device: &str, frames: &[Frame]) {
 
 /// Load all queued frames for a device from `dir`.
 /// Skips malformed lines. Returns [] if no file.
-pub fn load_in(dir: &PathBuf, device: &str) -> Vec<Frame> {
+pub fn load_in(dir: &Path, device: &str) -> Vec<Frame> {
     let path = device_path(dir, device);
     let data = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -96,7 +96,7 @@ pub fn load(device: &str) -> Vec<Frame> {
 }
 
 /// Remove the mailbox file for a device in `dir`.
-pub fn clear_in(dir: &PathBuf, device: &str) {
+pub fn clear_in(dir: &Path, device: &str) {
     let path = device_path(dir, device);
     let _ = std::fs::remove_file(&path);
 }
