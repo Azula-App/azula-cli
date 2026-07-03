@@ -41,6 +41,8 @@ portable-pty = "0.9"
 shell-words = "1"
 axum = "0.8"
 qrcode = { version = "0.14", default-features = false }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
 rmcp = { version = "1.8", default-features = false, features = [
     "client",
     "server",

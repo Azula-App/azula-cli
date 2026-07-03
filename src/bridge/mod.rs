@@ -7,7 +7,8 @@
 //! - `connect`        — pair a new device or peer bridge by ticket/URL
 //! - `list_devices`   — show known + live-connection status
 //! - `send_message`   — send text to an azula app device (streamed assistant reply)
-//! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines + peer messages
+//! - `send_file`      — send a local file (e.g. an image) to a device as an inline attachment
+//! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines + peer messages + received files
 //! - `wait_for_reply` — long-poll until a device has new inbound activity, then drain it
 //! - `set_name`       — set the conversation's name/description shown in the app
 //! - `say`            — send a peer-to-peer chat message to another bridge

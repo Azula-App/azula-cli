@@ -5,7 +5,8 @@
 //! - `connect`        — pair a new device or peer bridge by ticket/URL
 //! - `list_devices`   — show known + live-connection status
 //! - `send_message`   — send text to an azula app device (streamed assistant reply)
-//! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines + peer messages
+//! - `send_file`      — send a local file (e.g. an image) to a device as an inline attachment
+//! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines + peer messages + received files
 //! - `wait_for_reply` — long-poll until a device has new inbound activity, then drain it
 //! - `set_name`       — set the conversation's name/description shown in the app
 //! - `say`            — send a peer-to-peer chat message to another bridge
@@ -31,6 +32,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::filexfer;
 use crate::link::parse_ticket;
 use crate::mailbox;
 use crate::proto::{write_frame, Frame};
@@ -73,6 +75,18 @@ pub(super) struct SendMessageArgs {
 pub(super) struct GetMessagesArgs {
     /// If specified, drain only this device; otherwise drain all devices.
     pub(super) device: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(super) struct SendFileArgs {
+    /// The device name to send to.
+    pub(super) device: String,
+    /// Path to the local file to send (a path on the machine running the
+    /// bridge, not the phone). Mime type is inferred from the extension.
+    pub(super) path: String,
+    /// Optional caption shown alongside the attachment in the app.
+    pub(super) caption: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -339,8 +353,64 @@ impl AzulaBridge {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
+    /// Send a local file (e.g. an image) to a device as an inline attachment.
+    #[tool(description = "Send a local file to a named azula device as an inline attachment — this is how to show the user an IMAGE (or share audio/video/PDF/text/any other file). `path` is a path on THIS machine (where the bridge runs), not the phone. Mime type is inferred from the file extension (png/jpg/jpeg/gif/webp/svg -> image/*, mp4/mov, mp3/wav/ogg, pdf, txt/md, else application/octet-stream). Files over 64 MiB are rejected. Optional `caption` is shown alongside the attachment in the app. Requires a live connection (like render_ui) — it is not queued for offline devices, since a large file would blow the mailbox's message cap.")]
+    pub(super) async fn send_file(&self, Parameters(args): Parameters<SendFileArgs>) -> Result<CallToolResult, ErrorData> {
+        let path = std::path::Path::new(&args.path);
+        let bytes = match tokio::fs::read(path).await {
+            Ok(b) => b,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "could not read '{}': {e}", args.path
+            ))])),
+        };
+
+        if bytes.len() as u64 > filexfer::MAX_FILE_BYTES {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "'{}' is {} bytes, which exceeds the {} byte (64 MiB) limit",
+                args.path,
+                bytes.len(),
+                filexfer::MAX_FILE_BYTES
+            ))]));
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mime = filexfer::guess_mime(path);
+        let size = bytes.len();
+
+        let conn = match self.ensure_device(&args.device).await {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let frames = match filexfer::build_file_frames(id, name.clone(), mime.clone(), args.caption.clone(), &bytes) {
+            Ok(f) => f,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        };
+
+        let mut send_guard = conn.send.lock().await;
+        let Some(send) = send_guard.as_mut() else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "device '{}' send stream closed", args.device
+            ))]));
+        };
+        for frame in &frames {
+            write_frame(send, frame)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "sent '{name}' ({mime}, {size} bytes) to '{}'", args.device
+        ))]))
+    }
+
     /// Drain new messages from one device or all devices.
-    #[tool(description = "Drain new inbound messages from a named device or peer bridge, or from all devices if no device name is given. Lines are either the peer's chat text (from `say` calls by another bridge) or the user's chat text, or `ui-event: {\"name\":...,\"surfaceId\":...,\"sourceComponentId\":...,\"context\":{...}}` JSON describing an interaction with an A2UI surface rendered via `render_ui` (match on surfaceId and respond with `update_ui`).")]
+    #[tool(description = "Drain new inbound messages from a named device or peer bridge, or from all devices if no device name is given. Lines are either the peer's chat text (from `say` calls by another bridge) or the user's chat text, `ui-event: {\"name\":...,\"surfaceId\":...,\"sourceComponentId\":...,\"context\":{...}}` JSON describing an interaction with an A2UI surface rendered via `render_ui` (match on surfaceId and respond with `update_ui`), or `[received file: <name> (<mime>, <size> bytes) -> <path>]` when the user attaches a file/image (the path is on this machine, readable directly).")]
     pub(super) async fn get_messages(&self, Parameters(args): Parameters<GetMessagesArgs>) -> Result<CallToolResult, ErrorData> {
         let guard = self.devices.lock().await;
 
@@ -370,7 +440,7 @@ impl AzulaBridge {
     }
 
     /// Long-poll: block until the device has new inbound activity, then drain it.
-    #[tool(description = "Wait (long-poll) until a named device has new inbound activity — the user's chat reply, or an A2UI `ui-event:` interaction with a surface from `render_ui` — then return it and drain the inbox. Blocks up to `timeout_s` seconds (default 120), returning \"(no reply within Ns)\" on timeout. Use this after `send_message` or `render_ui` to pause for the user's response; `get_messages` is the non-blocking drain.")]
+    #[tool(description = "Wait (long-poll) until a named device has new inbound activity — the user's chat reply, an A2UI `ui-event:` interaction with a surface from `render_ui`, or a received file/image (`[received file: ...]`) — then return it and drain the inbox. Blocks up to `timeout_s` seconds (default 120), returning \"(no reply within Ns)\" on timeout. Use this after `send_message` or `render_ui` to pause for the user's response; `get_messages` is the non-blocking drain.")]
     async fn wait_for_reply(&self, Parameters(args): Parameters<WaitForReplyArgs>) -> Result<CallToolResult, ErrorData> {
         let timeout_s = args.timeout_s.unwrap_or(120);
         // The DeviceConn's inbox is an Arc shared with the reader loop, so cloning
@@ -726,11 +796,14 @@ impl ServerHandler for AzulaBridge {
              To pair a phone: call `start_pairing` and show the user the returned URL + QR \
              code (they scan it or paste the code into the app's \"＋ connect a peer\"), OR \
              call `connect` with a share code the user copies from their app. Then use \
-             `send_message` to send a chat message and `render_ui` to show an interactive \
-             A2UI card (both raise a phone notification when the app is backgrounded). \
-             To receive the user's reply or a card tap, call `wait_for_reply` (blocks until \
-             they respond) or `get_messages` (drain now); A2UI taps arrive as `ui-event:` \
-             lines — react with `update_ui`. Once connected, call `set_name` with \
+             `send_message` to send a chat message, `send_file` to send an image or other \
+             file (the only way to show a real image — `render_ui`'s Image component only \
+             renders small embedded data URIs), and `render_ui` to show an interactive \
+             A2UI card (all three raise a phone notification when the app is backgrounded). \
+             To receive the user's reply, a card tap, or a file/image they send, call \
+             `wait_for_reply` (blocks until they respond) or `get_messages` (drain now); \
+             A2UI taps arrive as `ui-event:` lines — react with `update_ui` — and attachments \
+             arrive as `[received file: ...]` lines naming a local path. Once connected, call `set_name` with \
              description=\"<project> / <topic>\" (e.g. \"azula / terminal refactor\") to \
              label the conversation — the name stays \"Claude\"; keep the description for \
              the session, set a fresh one for a new session. `render_ui`'s description \

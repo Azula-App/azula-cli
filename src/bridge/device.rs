@@ -5,7 +5,10 @@
 //! Both directions converge on the same [`DeviceMap`]: `connect_device` fills
 //! in an entry when the bridge dials out, and [`BridgeAcceptHandler`] fills in
 //! (or updates) an entry when a device dials in. Each entry's [`Inbox`] is fed
-//! by a background reader task for the lifetime of that connection.
+//! by a background reader task for the lifetime of that connection. That
+//! reader also reassembles inbound `file_begin`/`file_chunk`/`file_end`
+//! sequences (see [`crate::filexfer`]), writing completed files to disk and
+//! surfacing a `[received file: ...]` text line into the inbox.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -22,6 +25,7 @@ use tokio::io::BufReader;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
+use crate::filexfer::{self, FileAssembler};
 use crate::mailbox;
 use crate::mcp::LLM_ALPN;
 use crate::proto::{read_frame, write_frame, Frame};
@@ -136,15 +140,88 @@ async fn reader_loop(recv: RecvStream, inbox: Inbox) {
     read_frames_into(BufReader::new(recv), inbox).await
 }
 
-/// Push a single frame into an inbox (Chat → text, A2uiAction → `ui-event:` line).
-fn push_frame(inbox: &Inbox, frame: Frame) {
+/// State for one in-flight inbound file transfer, keyed by `FileBegin.id`.
+struct PendingFile {
+    name: String,
+    mime: String,
+    caption: Option<String>,
+    assembler: FileAssembler,
+}
+
+/// In-flight inbound file transfers for one connection, keyed by transfer id.
+/// Lives for the lifetime of a single reader loop — no locking needed since
+/// only that loop (and the one-shot first-frame replay in `accept_incoming`,
+/// which shares the same map) ever touches it.
+type Transfers = HashMap<String, PendingFile>;
+
+fn push_line(inbox: &Inbox, line: String) {
     // A poisoned inbox mutex (a prior holder panicked mid-push) shouldn't cascade
     // into every subsequent frame for this device — recover the inner value.
+    inbox.lock().unwrap_or_else(|e| e.into_inner()).push_back(line);
+}
+
+/// Push a single frame into an inbox (Chat → text, A2uiAction → `ui-event:`
+/// line), or fold it into an in-flight file transfer (FileBegin/FileChunk/
+/// FileEnd) — completed transfers are written to disk and surfaced as a
+/// `[received file: ...]` text line.
+fn push_frame(inbox: &Inbox, transfers: &mut Transfers, frame: Frame) {
     match frame {
-        Frame::Chat { text } => inbox.lock().unwrap_or_else(|e| e.into_inner()).push_back(text),
+        Frame::Chat { text } => push_line(inbox, text),
         Frame::A2uiAction { action } => {
-            let line = format!("ui-event: {}", serde_json::to_string(&action).unwrap_or_default());
-            inbox.lock().unwrap_or_else(|e| e.into_inner()).push_back(line);
+            push_line(inbox, format!("ui-event: {}", serde_json::to_string(&action).unwrap_or_default()));
+        }
+        Frame::FileBegin { id, name, mime, size, encoding, caption } => {
+            if encoding != filexfer::ENCODING_BASE64 {
+                // The app only ever sends base64 from its File-attach path;
+                // skip gracefully rather than erroring the whole stream.
+                warn!(id = %id, %encoding, "bridge: incoming file uses unsupported encoding; skipping");
+                return;
+            }
+            if size > filexfer::MAX_FILE_BYTES {
+                warn!(id = %id, %name, size, "bridge: incoming file exceeds max size; rejecting");
+                push_line(inbox, format!(
+                    "[rejected file: {name} ({size} bytes) exceeds the {} byte (64 MiB) limit]",
+                    filexfer::MAX_FILE_BYTES
+                ));
+                return;
+            }
+            transfers.insert(id, PendingFile { name, mime, caption, assembler: FileAssembler::new() });
+        }
+        Frame::FileChunk { id, data, .. } => {
+            let Some(pending) = transfers.get_mut(&id) else {
+                // Stray chunk for an unknown (or rejected/oversize) id — skip.
+                return;
+            };
+            if let Err(e) = pending.assembler.push_chunk(&data) {
+                warn!(id = %id, error = %e, "bridge: bad file chunk; dropping transfer");
+                transfers.remove(&id);
+            }
+        }
+        Frame::FileEnd { id } => {
+            let Some(pending) = transfers.remove(&id) else {
+                // Stray end for an unknown (or already-dropped) id — skip.
+                return;
+            };
+            let bytes = pending.assembler.finish();
+            let size = bytes.len();
+            match filexfer::save_received_file(&filexfer::received_dir(), &pending.name, &bytes) {
+                Ok(path) => {
+                    let mut line = format!(
+                        "[received file: {} ({}, {size} bytes) -> {}]",
+                        pending.name,
+                        pending.mime,
+                        path.display()
+                    );
+                    if let Some(caption) = &pending.caption {
+                        line.push_str(&format!(" caption: {caption}"));
+                    }
+                    push_line(inbox, line);
+                }
+                Err(e) => {
+                    warn!(id = %id, name = %pending.name, error = %e, "bridge: failed to save received file");
+                    push_line(inbox, format!("[failed to save received file '{}': {e}]", pending.name));
+                }
+            }
         }
         _ => {}
     }
@@ -152,12 +229,24 @@ fn push_frame(inbox: &Inbox, frame: Frame) {
 
 /// Drain frames from a buffered reader into a device inbox. Chat text passes
 /// through verbatim; an A2UI action becomes a parseable `ui-event:` line so the
-/// LLM can react (match on surfaceId and respond with `update_ui`). Generic
-/// over the reader so the behavior is unit-testable over an in-memory pipe.
-pub(super) async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(mut reader: BufReader<R>, inbox: Inbox) {
+/// LLM can react (match on surfaceId and respond with `update_ui`); file
+/// transfers are reassembled and surfaced once complete (see [`push_frame`]).
+/// Generic over the reader so the behavior is unit-testable over an in-memory pipe.
+pub(super) async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(reader: BufReader<R>, inbox: Inbox) {
+    read_frames_into_with(reader, inbox, Transfers::new()).await
+}
+
+/// As [`read_frames_into`], but seeded with an existing `transfers` map — used
+/// by `accept_incoming` so a file transfer started by a replayed first frame
+/// isn't lost when handing off to the main read loop.
+async fn read_frames_into_with<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: BufReader<R>,
+    inbox: Inbox,
+    mut transfers: Transfers,
+) {
     loop {
         match read_frame(&mut reader).await {
-            Ok(Some(frame)) => push_frame(&inbox, frame),
+            Ok(Some(frame)) => push_frame(&inbox, &mut transfers, frame),
             Ok(None) => break,
             Err(e) => {
                 warn!(error = %e, "bridge: app stream read error");
@@ -329,10 +418,11 @@ async fn accept_incoming(
     }
 
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let mut transfers = Transfers::new();
 
     // Replay a non-hello first frame if present.
     if let Some(frame) = pending_frame {
-        push_frame(&inbox, frame);
+        push_frame(&inbox, &mut transfers, frame);
     }
 
     // Flush any queued mailbox frames before moving send into the map.
@@ -364,6 +454,6 @@ async fn accept_incoming(
     info!(%peer_name, "bridge: peer registered");
 
     // Continue draining frames; reader already consumed the hello.
-    read_frames_into(reader, inbox).await;
+    read_frames_into_with(reader, inbox, transfers).await;
     Ok(())
 }

@@ -15,13 +15,14 @@ use rmcp::handler::server::wrapper::Parameters;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::filexfer;
 use crate::mailbox;
 use crate::mcp::LLM_ALPN;
 use crate::proto::{read_frame, write_frame, Frame};
 use crate::registry::Device;
 
 use super::device::{dial_device, match_known_device, read_frames_into, BridgeAcceptHandler, DeviceConn, DeviceMap, Inbox};
-use super::tools::{AzulaBridge, ConnectArgs, GetMessagesArgs, SayArgs, SendMessageArgs};
+use super::tools::{AzulaBridge, ConnectArgs, GetMessagesArgs, SayArgs, SendFileArgs, SendMessageArgs};
 
 /// The reader surfaces user chat text verbatim and turns an A2UI action
 /// (sent by the app when a user taps a surface) into a `ui-event:` line the
@@ -50,6 +51,193 @@ async fn reader_surfaces_chat_and_ui_events() {
     assert!(got[1].starts_with("ui-event: "), "not a ui-event line: {}", got[1]);
     assert!(got[1].contains(r#""name":"roll""#), "missing action name: {}", got[1]);
     assert!(got[1].contains(r#""surfaceId":"dice-1""#), "missing surfaceId: {}", got[1]);
+}
+
+/// An inbound `file_begin`/`file_chunk`×N/`file_end` sequence is reassembled
+/// to disk and surfaced in the inbox as a `[received file: ...]` line naming
+/// the saved (absolute) path — the same reader path `get_messages`/
+/// `wait_for_reply` expose.
+#[tokio::test]
+async fn reader_reassembles_incoming_file() {
+    let recv_dir = std::env::temp_dir()
+        .join(format!("azula-bridge-test-{}", std::process::id()))
+        .join("reader_reassembles_incoming_file");
+    let _ = std::fs::remove_dir_all(&recv_dir);
+    std::env::set_var("AZULA_RECEIVED_DIR", &recv_dir);
+
+    let (mut writer, reader) = tokio::io::duplex(8192);
+    let inbox: Inbox = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let inbox_reader = inbox.clone();
+    let handle = tokio::spawn(async move {
+        read_frames_into(BufReader::new(reader), inbox_reader).await;
+    });
+
+    let bytes = b"hello file bytes".to_vec(); // 16 bytes
+    let frames = filexfer::build_file_frames(
+        "xfer-1".into(),
+        "note.txt".into(),
+        "text/plain".into(),
+        Some("a caption".into()),
+        &bytes,
+    )
+    .unwrap();
+
+    let mut wire = String::new();
+    for f in &frames {
+        wire.push_str(&serde_json::to_string(f).unwrap());
+        wire.push('\n');
+    }
+    writer.write_all(wire.as_bytes()).await.unwrap();
+    writer.shutdown().await.unwrap();
+    handle.await.unwrap();
+
+    let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+    assert_eq!(got.len(), 1, "expected one inbox line, got {got:?}");
+    assert!(
+        got[0].starts_with("[received file: note.txt (text/plain, 16 bytes) -> "),
+        "unexpected line: {}",
+        got[0]
+    );
+    assert!(got[0].contains("caption: a caption"), "missing caption: {}", got[0]);
+
+    // Extract the saved path (between "-> " and the closing "]") and verify
+    // the bytes on disk match what was sent.
+    let after_arrow = got[0].split("-> ").nth(1).expect("line should contain a path");
+    let path_str = after_arrow.split(']').next().expect("path should be bracket-terminated");
+    let saved = std::fs::read(path_str).unwrap_or_else(|e| panic!("reading saved file {path_str}: {e}"));
+    assert_eq!(saved, bytes);
+
+    std::env::remove_var("AZULA_RECEIVED_DIR");
+    let _ = std::fs::remove_dir_all(&recv_dir);
+}
+
+/// A `FileBegin` declaring a size over the 64 MiB cap is rejected up front:
+/// the transfer is dropped (subsequent chunks/end for that id are skipped)
+/// and a `[rejected file: ...]` line is surfaced instead of a saved file.
+#[tokio::test]
+async fn reader_rejects_oversize_incoming_file() {
+    let (mut writer, reader) = tokio::io::duplex(8192);
+    let inbox: Inbox = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let inbox_reader = inbox.clone();
+    let handle = tokio::spawn(async move {
+        read_frames_into(BufReader::new(reader), inbox_reader).await;
+    });
+
+    let begin = Frame::FileBegin {
+        id: "big-1".into(),
+        name: "huge.bin".into(),
+        mime: "application/octet-stream".into(),
+        size: filexfer::MAX_FILE_BYTES + 1,
+        encoding: "base64".into(),
+        caption: None,
+    };
+    let chunk = Frame::FileChunk { id: "big-1".into(), seq: 0, data: "aWdub3JlZA==".into() };
+    let end = Frame::FileEnd { id: "big-1".into() };
+
+    let mut wire = String::new();
+    for f in [&begin, &chunk, &end] {
+        wire.push_str(&serde_json::to_string(f).unwrap());
+        wire.push('\n');
+    }
+    writer.write_all(wire.as_bytes()).await.unwrap();
+    writer.shutdown().await.unwrap();
+    handle.await.unwrap();
+
+    let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+    assert_eq!(got.len(), 1, "expected only the rejection line, got {got:?}");
+    assert!(got[0].starts_with("[rejected file: huge.bin"), "unexpected line: {}", got[0]);
+    assert!(!got[0].contains("received file"), "should not report a saved file: {}", got[0]);
+}
+
+/// End-to-end over a real iroh connection: Alice's `send_file` tool reads a
+/// local file and streams it to Bob; Bob's accept-side reader reassembles it
+/// and surfaces a `[received file: ...]` line naming a path with matching
+/// bytes on disk. Exercises the exact wire path an LLM client drives.
+#[tokio::test]
+async fn send_file_tool_delivers_over_iroh() {
+    let recv_dir = std::env::temp_dir()
+        .join(format!("azula-bridge-test-{}", std::process::id()))
+        .join("send_file_tool_delivers_over_iroh");
+    let _ = std::fs::remove_dir_all(&recv_dir);
+    std::env::set_var("AZULA_RECEIVED_DIR", &recv_dir);
+
+    let alice_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+    let bob_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+
+    let alice_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+    let bob_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+    let bind_placeholder = "127.0.0.1:0".to_string();
+
+    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string());
+    let alice_router = Router::builder(alice_raw_ep).accept(LLM_ALPN, alice_accept).spawn();
+    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string());
+    let bob_router = Router::builder(bob_raw_ep).accept(LLM_ALPN, bob_accept).spawn();
+
+    let alice_ep = Arc::new(alice_router.endpoint().clone());
+    let bob_ep = Arc::new(bob_router.endpoint().clone());
+    let bob_ticket = EndpointTicket::new(bob_ep.addr()).to_string();
+
+    let alice = AzulaBridge::new(alice_ep.clone(), alice_devices.clone(), bind_placeholder.clone(), "alice-ticket".to_string(), "alice".to_string(), 20);
+
+    // Write a small "image" to send.
+    let src_path = std::env::temp_dir()
+        .join(format!("azula-bridge-test-{}", std::process::id()))
+        .join("send_file_tool_delivers_over_iroh-src.png");
+    std::fs::create_dir_all(src_path.parent().unwrap()).unwrap();
+    let payload = b"not really a png but bytes are bytes".to_vec();
+    std::fs::write(&src_path, &payload).unwrap();
+
+    // Alice connects to Bob, then sends the file.
+    let connect_result = alice
+        .connect(Parameters(ConnectArgs { url: bob_ticket.clone(), name: Some("bob".to_string()) }))
+        .await
+        .unwrap();
+    assert!(!connect_result.is_error.unwrap_or(false), "connect should succeed: {connect_result:?}");
+
+    let send_result = alice
+        .send_file(Parameters(SendFileArgs {
+            device: "bob".to_string(),
+            path: src_path.to_str().unwrap().to_string(),
+            caption: Some("a test image".to_string()),
+        }))
+        .await
+        .unwrap();
+    assert!(!send_result.is_error.unwrap_or(false), "send_file should succeed: {send_result:?}");
+    let send_text = send_result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.as_str())).collect::<Vec<_>>().join("\n");
+    assert!(send_text.contains("image/png"), "should infer image/png from .png extension: {send_text}");
+
+    // Wait for Bob's reader to reassemble the file into his inbox.
+    let mut bob_inbox_text = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let guard = bob_devices.lock().await;
+        if let Some(conn) = guard.get("alice") {
+            let msgs: Vec<String> = conn.inbox.lock().unwrap().iter().cloned().collect();
+            if !msgs.is_empty() {
+                bob_inbox_text = msgs.join("\n");
+                break;
+            }
+        }
+    }
+
+    assert!(
+        bob_inbox_text.starts_with("[received file:"),
+        "expected a received-file line, got: {bob_inbox_text:?}"
+    );
+    assert!(bob_inbox_text.contains("image/png"), "{bob_inbox_text}");
+    assert!(bob_inbox_text.contains(&format!("{} bytes", payload.len())), "{bob_inbox_text}");
+    assert!(bob_inbox_text.contains("caption: a test image"), "{bob_inbox_text}");
+
+    let after_arrow = bob_inbox_text.split("-> ").nth(1).expect("line should contain a path");
+    let path_str = after_arrow.split(']').next().expect("path should be bracket-terminated");
+    let saved = std::fs::read(path_str).unwrap_or_else(|e| panic!("reading saved file {path_str}: {e}"));
+    assert_eq!(saved, payload);
+
+    alice_router.shutdown().await.unwrap();
+    bob_router.shutdown().await.unwrap();
+    std::env::remove_var("AZULA_RECEIVED_DIR");
+    let _ = std::fs::remove_dir_all(&recv_dir);
+    let _ = std::fs::remove_file(&src_path);
 }
 
 /// Two bridges connect to each other over iroh. Alice dials Bob, says "ping",
