@@ -45,23 +45,52 @@ pub struct TermHandler {
     /// Admit invite-less strangers as unverified instead of closing the
     /// connection (`--allow-legacy`, default on for one release).
     allow_legacy: bool,
+    /// `--name` override for the terminal's announced `Frame::Profile.name`;
+    /// falls back to this machine's hostname when unset.
+    name_override: Option<String>,
+    /// `--description` override for the terminal's announced
+    /// `Frame::Profile.description`; falls back to the shell's launch
+    /// working directory when unset.
+    description_override: Option<String>,
 }
 
 impl TermHandler {
-    pub fn new(my_node_id: EndpointId, allow_legacy: bool) -> Self {
-        TermHandler { my_node_id, allow_legacy }
+    pub fn new(
+        my_node_id: EndpointId,
+        allow_legacy: bool,
+        name_override: Option<String>,
+        description_override: Option<String>,
+    ) -> Self {
+        TermHandler {
+            my_node_id,
+            allow_legacy,
+            name_override,
+            description_override,
+        }
     }
 }
 
 impl ProtocolHandler for TermHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        handle(connection, self.my_node_id, self.allow_legacy)
-            .await
-            .map_err(|e| AcceptError::from_boxed(e.into()))
+        handle(
+            connection,
+            self.my_node_id,
+            self.allow_legacy,
+            self.name_override.clone(),
+            self.description_override.clone(),
+        )
+        .await
+        .map_err(|e| AcceptError::from_boxed(e.into()))
     }
 }
 
-async fn handle(connection: Connection, my_node_id: EndpointId, allow_legacy: bool) -> Result<()> {
+async fn handle(
+    connection: Connection,
+    my_node_id: EndpointId,
+    allow_legacy: bool,
+    name_override: Option<String>,
+    description_override: Option<String>,
+) -> Result<()> {
     let remote_id = connection.remote_id();
     let remote = remote_id.to_string();
     info!(%remote, "term: client connected");
@@ -72,6 +101,14 @@ async fn handle(connection: Connection, my_node_id: EndpointId, allow_legacy: bo
     // then implicitly from a "known" peer for the rest of its lifetime.
     let mut known = registry::find_by_node_id(&remote_id).is_some();
     let mut first_stream = true;
+    // The app keys a terminal conversation by peer id, so every stream on this
+    // connection rewires the *same* conversation (see `ConnectService.wireStream`
+    // / `wireConv` in the app) — one `Profile` per connection is enough; a
+    // second one on a later stream would just redundantly re-announce the same
+    // name/description. Sent for the connection's first stream regardless of
+    // whether that stream belonged to an already-known device or a
+    // just-admitted stranger.
+    let mut profile_sent = false;
 
     // Each bi stream the client opens is an independent terminal session, so a
     // single connection can drive many terminals. Loop accepting new streams.
@@ -99,12 +136,65 @@ async fn handle(connection: Connection, my_node_id: EndpointId, allow_legacy: bo
         }
         first_stream = false;
 
+        let send_profile = !profile_sent;
+        profile_sent = true;
+
         let remote = remote.clone();
+        let name_override = name_override.clone();
+        let description_override = description_override.clone();
         tokio::spawn(async move {
-            if let Err(e) = term_session(send, reader, first_frame, remote.clone()).await {
+            if let Err(e) = term_session(
+                send,
+                reader,
+                first_frame,
+                remote.clone(),
+                send_profile,
+                name_override,
+                description_override,
+            )
+            .await
+            {
                 warn!(%remote, error = %e, "term: session error");
             }
         });
+    }
+}
+
+/// Strip a trailing macOS mDNS `.local` suffix from a hostname so it reads
+/// cleanly as a display name (e.g. `"Sals-MacBook-Pro.local"` ->
+/// `"Sals-MacBook-Pro"`). A no-op for hostnames that don't end in `.local`.
+fn strip_local_suffix(hostname: &str) -> &str {
+    hostname.strip_suffix(".local").unwrap_or(hostname)
+}
+
+/// This machine's host name, used as the terminal conversation's default
+/// display name. Falls back to `"azula"` if the OS reports an empty hostname.
+fn default_hostname() -> String {
+    let raw = gethostname::gethostname().to_string_lossy().into_owned();
+    let stripped = strip_local_suffix(&raw);
+    if stripped.is_empty() {
+        "azula".to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+/// Resolve the terminal's `Frame::Profile.name`: the `--name` override if set
+/// (and non-blank), else this machine's hostname.
+fn resolve_profile_name(name_override: &Option<String>) -> String {
+    match name_override {
+        Some(n) if !n.trim().is_empty() => n.clone(),
+        _ => default_hostname(),
+    }
+}
+
+/// Resolve the terminal's `Frame::Profile.description`: the `--description`
+/// override if set (and non-blank), else `launch_cwd` (the shell's launch
+/// working directory, captured once — this never live-tracks later `cd`s).
+fn resolve_profile_description(description_override: &Option<String>, launch_cwd: &str) -> String {
+    match description_override {
+        Some(d) if !d.trim().is_empty() => d.clone(),
+        _ => launch_cwd.to_string(),
     }
 }
 
@@ -149,8 +239,34 @@ async fn term_session(
     mut reader: BufReader<RecvStream>,
     first_frame: Option<Frame>,
     remote: String,
+    send_profile: bool,
+    name_override: Option<String>,
+    description_override: Option<String>,
 ) -> Result<()> {
     let mut send = send;
+
+    // Capture the server process's launch directory now, one-shot (this does
+    // NOT track later `cd`s in the shell) — the default terminal description
+    // unless `--description` overrides it.
+    let launch_cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Announce this terminal's identity before any shell output, so the app
+    // names the conversation from the very first frame it sees. Reused for
+    // both known devices and invite-verified/allow-legacy strangers — see the
+    // `profile_sent` comment in `handle` for why this is once per connection.
+    if send_profile {
+        let profile = Frame::Profile {
+            name: resolve_profile_name(&name_override),
+            description: Some(resolve_profile_description(&description_override, &launch_cwd)),
+            avatar: None,
+            mime: None,
+        };
+        if write_frame(&mut send, &profile).await.is_err() {
+            debug!(%remote, "term: failed to send profile frame; continuing");
+        }
+    }
 
     // Spin up a PTY running the user's shell.
     let pty_system = NativePtySystem::default();
@@ -304,6 +420,54 @@ async fn term_session(
 }
 
 // ---------------------------------------------------------------------------
+// Unit tests: name/description resolution
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::{resolve_profile_description, resolve_profile_name, strip_local_suffix};
+
+    #[test]
+    fn strip_local_suffix_strips_mdns_suffix() {
+        assert_eq!(strip_local_suffix("Sals-MacBook-Pro.local"), "Sals-MacBook-Pro");
+    }
+
+    #[test]
+    fn strip_local_suffix_leaves_other_hostnames_alone() {
+        assert_eq!(strip_local_suffix("my-server"), "my-server");
+    }
+
+    #[test]
+    fn resolve_profile_name_prefers_override() {
+        assert_eq!(resolve_profile_name(&Some("Foo".to_string())), "Foo");
+    }
+
+    #[test]
+    fn resolve_profile_name_ignores_blank_override() {
+        // A blank --name is treated as "not set" rather than announcing an
+        // empty display name.
+        let name = resolve_profile_name(&Some("   ".to_string()));
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn resolve_profile_name_falls_back_to_hostname_when_absent() {
+        let name = resolve_profile_name(&None);
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn resolve_profile_description_prefers_override() {
+        assert_eq!(resolve_profile_description(&Some("/bar".to_string()), "/home/x"), "/bar");
+    }
+
+    #[test]
+    fn resolve_profile_description_falls_back_to_cwd_when_absent() {
+        assert_eq!(resolve_profile_description(&None, "/home/x"), "/home/x");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Integration tests
 // ---------------------------------------------------------------------------
 
@@ -347,7 +511,7 @@ mod tests {
         let server_id = server_ep.id();
 
         let router = Router::builder(server_ep)
-            .accept(TERM_ALPN, TermHandler::new(server_id, true))
+            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None))
             .spawn();
 
         // ── Client ─────────────────────────────────────────────────────────
@@ -429,7 +593,7 @@ mod tests {
         let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
         let server_addr = server_ep.addr();
         let server_id = server_ep.id();
-        let router = Router::builder(server_ep).accept(TERM_ALPN, TermHandler::new(server_id, true)).spawn();
+        let router = Router::builder(server_ep).accept(TERM_ALPN, TermHandler::new(server_id, true, None, None)).spawn();
 
         let client_ep = Endpoint::bind(presets::Minimal).await.expect("client bind");
         let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
@@ -471,5 +635,50 @@ mod tests {
 
         assert!(a, "session A did not receive its marker over its own stream");
         assert!(b, "session B (2nd stream on the same connection) did not receive its marker");
+    }
+
+    /// A terminal connection announces its identity as a `Frame::Profile`
+    /// before any `Frame::Term` shell output, and `--name`/`--description`
+    /// overrides passed to `TermHandler::new` end up in that frame verbatim.
+    #[tokio::test]
+    async fn term_session_sends_profile_before_term_output() {
+        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        let server_addr = server_ep.addr();
+        let server_id = server_ep.id();
+        let router = Router::builder(server_ep)
+            .accept(
+                TERM_ALPN,
+                TermHandler::new(server_id, true, Some("Foo".to_string()), Some("/bar".to_string())),
+            )
+            .spawn();
+
+        let client_ep = Endpoint::bind(presets::Minimal).await.expect("client bind");
+        let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        write_frame(&mut send, &Frame::Input { text: "echo hi\n".to_string() })
+            .await
+            .expect("write");
+
+        let mut reader = BufReader::new(recv);
+        let first = timeout(Duration::from_secs(20), read_frame(&mut reader))
+            .await
+            .expect("timed out waiting for the first frame")
+            .expect("read_frame errored")
+            .expect("stream closed before any frame arrived");
+
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        let _ = router.shutdown().await;
+        client_ep.close().await;
+
+        match first {
+            Frame::Profile { name, description, avatar, mime } => {
+                assert_eq!(name, "Foo", "name override was not applied");
+                assert_eq!(description.as_deref(), Some("/bar"), "description override was not applied");
+                assert_eq!(avatar, None);
+                assert_eq!(mime, None);
+            }
+            other => panic!("expected the first frame to be a Profile, got {other:?}"),
+        }
     }
 }

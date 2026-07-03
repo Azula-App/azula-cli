@@ -232,6 +232,18 @@ struct ServeArgs {
     /// a signed 24h invite.
     #[arg(long = "legacy-ticket")]
     legacy_ticket: bool,
+
+    /// Override the name a connecting terminal announces to the app (sent as
+    /// `Frame::Profile.name`, becomes the conversation title). Defaults to
+    /// this machine's hostname.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Override the description a connecting terminal announces to the app
+    /// (sent as `Frame::Profile.description`, becomes the conversation
+    /// sub-line). Defaults to the shell's launch working directory.
+    #[arg(long, value_name = "DESCRIPTION")]
+    description: Option<String>,
 }
 
 #[tokio::main]
@@ -553,12 +565,18 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let router = if args.term_only {
         info!("term-only mode: serving the remote shell, no LLM");
         Router::builder(endpoint)
-            .accept(TERM_ALPN, TermHandler::new(node_id, args.allow_legacy))
+            .accept(
+                TERM_ALPN,
+                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone()),
+            )
             .spawn()
     } else {
         Router::builder(endpoint)
             .accept(LLM_ALPN, LlmHandler::new(mcp, node_id, args.allow_legacy))
-            .accept(TERM_ALPN, TermHandler::new(node_id, args.allow_legacy))
+            .accept(
+                TERM_ALPN,
+                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone()),
+            )
             .spawn()
     };
 
