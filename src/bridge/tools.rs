@@ -181,12 +181,17 @@ pub struct AzulaBridge {
     endpoint: Arc<Endpoint>,
     devices: DeviceMap,
     bind: String,
-    /// The bridge's own iroh ticket (base32 string) used by `start_pairing`.
+    /// The bridge's own iroh ticket (base32 string) — the dial target
+    /// `start_pairing` wraps in a freshly minted invite (or, with
+    /// `legacy_ticket`, returns directly).
     pairing_ticket: String,
     /// This bridge's display name (sent as `hello` to peer bridges).
     own_name: String,
     /// Hard turn cap per peer bridge conversation.
     max_turns: u64,
+    /// `start_pairing` returns the raw ticket link instead of minting an
+    /// invite (`--legacy-ticket`, mirrors the startup banner's escape hatch).
+    legacy_ticket: bool,
     #[allow(dead_code)]
     tool_router: ToolRouter<AzulaBridge>,
 }
@@ -200,6 +205,7 @@ impl AzulaBridge {
         pairing_ticket: String,
         own_name: String,
         max_turns: u64,
+        legacy_ticket: bool,
     ) -> Self {
         Self {
             endpoint,
@@ -208,6 +214,7 @@ impl AzulaBridge {
             pairing_ticket,
             own_name,
             max_turns,
+            legacy_ticket,
             tool_router: Self::tool_router(),
         }
     }
@@ -715,8 +722,19 @@ data_model: {"name":""}"##)]
 
     /// Show the bridge's pairing URL and QR code so a user can scan and connect.
     #[tool(description = "Return the bridge's pairing URL and a Unicode QR code. The user scans the QR with their phone camera to open the azula app and connect to this bridge automatically. No arguments needed.")]
-    async fn start_pairing(&self) -> Result<CallToolResult, ErrorData> {
-        let url = qr::pairing_url(&self.pairing_ticket);
+    pub(super) async fn start_pairing(&self) -> Result<CallToolResult, ErrorData> {
+        // Mint a signed 24h invite for the link/QR instead of the raw dial
+        // ticket, same rationale as the startup banner (`--legacy-ticket`
+        // opts back into the raw ticket, or minting can fail — e.g. $HOME
+        // unset — in which case fall back the same way).
+        let url = if self.legacy_ticket {
+            qr::pairing_url(&self.pairing_ticket)
+        } else {
+            match super::mint_bridge_invite(&self.pairing_ticket, self.endpoint.secret_key()) {
+                Some(encoded) => qr::invite_url(&encoded),
+                None => qr::pairing_url(&self.pairing_ticket),
+            }
+        };
         let qr_block = qr::render_qr(&url);
         let text = format!(
             "{url}\n\n```\n{qr_block}\n```\n\nScan with your phone's camera or open the URL to pair this device.",

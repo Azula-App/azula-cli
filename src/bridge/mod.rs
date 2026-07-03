@@ -196,23 +196,30 @@ async fn setup_bridge(
     Ok(BridgeCore { endpoint, devices, bridge_ticket, own_name, _router: iroh_router })
 }
 
-/// Mint a signed 24h invite for the bridge's startup pairing QR (spec: "serve
-/// mint a signed 24h invite for their startup pairing QR instead of printing
-/// the raw ticket"). `legacy_ticket` skips minting (the `--legacy-ticket`
-/// escape hatch); a mint failure (e.g. `$HOME` unset) also falls back to
-/// `None` so the raw-ticket QR still works.
+/// Mint a signed 24h invite wrapping `ticket` (spec: "serve/serve-mcp mint a
+/// signed 24h invite for their startup pairing QR instead of printing the raw
+/// ticket"). Shared by the startup banner ([`startup_invite`]) and the
+/// `start_pairing` MCP tool (`tools.rs`), so both surfaces retire the raw
+/// ticket link the same way. A mint failure (e.g. `$HOME` unset) falls back
+/// to `None` so callers can fall back to the raw-ticket link.
+pub(super) fn mint_bridge_invite(ticket: &str, secret_key: &iroh::SecretKey) -> Option<String> {
+    let expiry = invite::Expiry::In(std::time::Duration::from_secs(24 * 60 * 60));
+    match invite::mint(ticket, expiry, true, false, None, secret_key) {
+        Ok((payload, _)) => Some(payload.encode()),
+        Err(e) => {
+            tracing::warn!(error = %e, "bridge: failed to mint invite; falling back to raw ticket");
+            None
+        }
+    }
+}
+
+/// Mint a signed 24h invite for the bridge's startup pairing QR.
+/// `legacy_ticket` skips minting (the `--legacy-ticket` escape hatch).
 fn startup_invite(core: &BridgeCore, legacy_ticket: bool) -> Option<String> {
     if legacy_ticket {
         return None;
     }
-    let expiry = invite::Expiry::In(std::time::Duration::from_secs(24 * 60 * 60));
-    match invite::mint(&core.bridge_ticket, expiry, true, false, None, core.endpoint.secret_key()) {
-        Ok((payload, _)) => Some(payload.encode()),
-        Err(e) => {
-            tracing::warn!(error = %e, "bridge: failed to mint startup invite; falling back to raw ticket");
-            None
-        }
-    }
+    mint_bridge_invite(&core.bridge_ticket, core.endpoint.secret_key())
 }
 
 pub async fn run(
@@ -239,6 +246,7 @@ pub async fn run(
             ticket_svc.clone(),
             own_name_svc.clone(),
             max_turns,
+            legacy_ticket,
         )),
         Arc::new(LocalSessionManager::default()),
         Default::default(),
@@ -287,6 +295,7 @@ pub async fn run_stdio(
         core.bridge_ticket.clone(),
         core.own_name.clone(),
         max_turns,
+        legacy_ticket,
     );
     // Serve over stdio; core stays alive (holds the accept router) until we stop.
     let running = bridge.serve(rmcp::transport::stdio()).await?;

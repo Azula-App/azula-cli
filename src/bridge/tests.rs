@@ -177,7 +177,7 @@ async fn send_file_tool_delivers_over_iroh() {
     let bob_ep = Arc::new(bob_router.endpoint().clone());
     let bob_ticket = EndpointTicket::new(bob_ep.addr()).to_string();
 
-    let alice = AzulaBridge::new(alice_ep.clone(), alice_devices.clone(), bind_placeholder.clone(), "alice-ticket".to_string(), "alice".to_string(), 20);
+    let alice = AzulaBridge::new(alice_ep.clone(), alice_devices.clone(), bind_placeholder.clone(), "alice-ticket".to_string(), "alice".to_string(), 20, true);
 
     // Write a small "image" to send.
     let src_path = std::env::temp_dir()
@@ -279,6 +279,7 @@ async fn bridge_to_bridge_relay() {
         alice_ticket.clone(),
         "alice".to_string(),
         3,
+        true,
     );
     let bob = AzulaBridge::new(
         bob_ep.clone(),
@@ -287,6 +288,7 @@ async fn bridge_to_bridge_relay() {
         bob_ticket.clone(),
         "bob".to_string(),
         3,
+        true,
     );
 
     // Alice connects to Bob.
@@ -515,6 +517,7 @@ async fn offline_queue_then_flush() {
         "alice-ticket".to_string(),
         "alice".to_string(),
         20,
+        true,
     );
 
     // send_message to offline "phone" should queue, not error.
@@ -807,4 +810,67 @@ async fn reconnect_by_node_id_flushes_mailbox() {
     bridge_router.shutdown().await.unwrap();
     phone_ep.close().await;
     std::env::remove_var("AZULA_MAILBOX_DIR");
+}
+
+/// `start_pairing` mints a signed 24h invite for its pairing link/QR instead
+/// of returning the raw dial ticket, unless `legacy_ticket` is set (the same
+/// escape hatch as the `serve`/`serve-mcp` startup banner).
+#[tokio::test]
+async fn start_pairing_mints_invite_unless_legacy_ticket() {
+    let invites_dir = std::env::temp_dir()
+        .join(format!("azula-bridge-test-{}", std::process::id()))
+        .join("start_pairing_mints_invite");
+    let _ = std::fs::remove_dir_all(&invites_dir);
+    std::env::set_var("AZULA_INVITES_DIR", &invites_dir);
+
+    let ep = Endpoint::bind(presets::Minimal).await.unwrap();
+    let ep_arc = Arc::new(ep.clone());
+    let ticket = EndpointTicket::new(ep.addr()).to_string();
+    let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+    let bind_placeholder = "127.0.0.1:0".to_string();
+
+    // Default (legacy_ticket = false): mints an invite -> an /i/ link, not
+    // the raw /s/<ticket> link.
+    let bridge = AzulaBridge::new(
+        ep_arc.clone(),
+        devices.clone(),
+        bind_placeholder.clone(),
+        ticket.clone(),
+        "bridge".to_string(),
+        20,
+        false,
+    );
+    let result = bridge.start_pairing().await.expect("start_pairing succeeds");
+    let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.as_str())).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("https://azula.app/i/"), "expected an invite link, got: {text}");
+    assert!(
+        !text.contains(&format!("https://azula.app/s/{ticket}")),
+        "should not contain the raw ticket link: {text}"
+    );
+
+    // legacy_ticket = true: falls back to the raw ticket link, no mint.
+    let legacy_bridge = AzulaBridge::new(
+        ep_arc.clone(),
+        devices.clone(),
+        bind_placeholder.clone(),
+        ticket.clone(),
+        "bridge".to_string(),
+        20,
+        true,
+    );
+    let legacy_result = legacy_bridge.start_pairing().await.expect("start_pairing succeeds");
+    let legacy_text = legacy_result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        legacy_text.contains(&format!("https://azula.app/s/{ticket}")),
+        "expected the raw ticket link, got: {legacy_text}"
+    );
+    assert!(!legacy_text.contains("https://azula.app/i/"), "should not mint an invite: {legacy_text}");
+
+    std::env::remove_var("AZULA_INVITES_DIR");
+    ep.close().await;
 }
