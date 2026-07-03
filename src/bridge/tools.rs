@@ -33,7 +33,8 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::filexfer;
-use crate::link::parse_ticket;
+use crate::invite;
+use crate::link::{self, Parsed};
 use crate::mailbox;
 use crate::proto::{write_frame, Frame};
 use crate::qr;
@@ -211,35 +212,47 @@ impl AzulaBridge {
         }
     }
 
-    /// Connect to a new azula device or peer bridge by ticket URL or bare token.
-    #[tool(description = "Connect to a new azula device or peer bridge by ticket URL (https://azula.app/s/<token>, azula://connect?code=<token>) or bare token. Optionally provide a display name. When connecting to another bridge, a hello frame is exchanged so the remote bridge can name this one.")]
+    /// Connect to a new azula device or peer bridge by ticket URL, invite link, or bare token.
+    #[tool(description = "Connect to a new azula device or peer bridge by invite link (https://azula.app/i/<payload>, azula://i?c=<payload>, bare azi... payload) or legacy ticket URL (https://azula.app/s/<token>, azula://connect?code=<token>) or bare token. Optionally provide a display name. When connecting to another bridge, a hello frame is exchanged so the remote bridge can name this one; an invite is re-presented in that hello so the remote's accept gate can verify it.")]
     pub(super) async fn connect(&self, Parameters(args): Parameters<ConnectArgs>) -> Result<CallToolResult, ErrorData> {
-        let token = match parse_ticket(&args.url) {
-            Some(t) => t,
+        let (ticket, invite_str) = match link::parse(&args.url) {
+            Some(Parsed::Invite(payload)) => {
+                let decoded = match invite::InvitePayload::decode(&payload) {
+                    Ok(d) => d,
+                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("invalid invite: {e}"))])),
+                };
+                let ticket = match decoded.ticket() {
+                    Ok(t) => t.to_string(),
+                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("invalid invite ticket: {e}"))])),
+                };
+                (ticket, Some(payload))
+            }
+            Some(Parsed::Ticket(t)) => (t, None),
             None => return Ok(CallToolResult::error(vec![Content::text("invalid ticket or URL")])),
         };
 
         // Derive name if absent.
         let name = args.name.unwrap_or_else(|| {
-            let prefix: String = token.chars().take(8).collect();
+            let prefix: String = ticket.chars().take(8).collect();
             prefix
         });
 
         // Save to registry.
         let device = Device {
             name: name.clone(),
-            ticket: token.clone(),
+            ticket: ticket.clone(),
             added_at: Some(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()),
+            invite: invite_str.clone(),
         };
         if let Err(e) = registry::add(device, false) {
             warn!(error=%e, "bridge: registry add failed; continuing");
         }
 
-        // Dial the device.
-        let connected = connect_device(&self.endpoint, &name, &token, &self.devices, &self.own_name).await;
+        // Dial the device, presenting the invite (if any) in the hello.
+        let connected = connect_device(&self.endpoint, &name, &ticket, &self.devices, &self.own_name, invite_str.as_deref()).await;
 
         // If now connected, reset the conversation state.
         if connected {
@@ -252,7 +265,9 @@ impl AzulaBridge {
         // If not yet in map, add a placeholder.
         {
             let mut guard = self.devices.lock().await;
-            guard.entry(name.clone()).or_insert_with(|| DeviceConn::new(token.clone()));
+            guard
+                .entry(name.clone())
+                .or_insert_with(|| DeviceConn::new(ticket.clone()).with_invite(invite_str.clone()));
         }
 
         write_state(&self.bind, &self.devices).await;
@@ -261,7 +276,7 @@ impl AzulaBridge {
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Device '{}' {status}. Ticket fingerprint: {}…",
             name,
-            token.chars().take(8).collect::<String>()
+            ticket.chars().take(8).collect::<String>()
         ))]))
     }
 
@@ -753,13 +768,18 @@ impl AzulaBridge {
         };
 
         if needs_dial {
-            let ticket = {
+            let ticket_and_invite = {
                 let guard = self.devices.lock().await;
-                guard.get(device).map(|c| c.ticket.clone())
+                guard.get(device).map(|c| (c.ticket.clone(), c.invite.clone()))
             }
-            .or_else(|| registry::load().into_iter().find(|d| d.name == device).map(|d| d.ticket));
-            if let Some(t) = ticket {
-                connect_device(&self.endpoint, device, &t, &self.devices, &self.own_name).await;
+            .or_else(|| {
+                registry::load()
+                    .into_iter()
+                    .find(|d| d.name == device)
+                    .map(|d| (d.ticket, d.invite))
+            });
+            if let Some((t, invite)) = ticket_and_invite {
+                connect_device(&self.endpoint, device, &t, &self.devices, &self.own_name, invite.as_deref()).await;
             }
         }
 

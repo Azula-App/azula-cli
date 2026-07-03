@@ -21,8 +21,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
 pub enum Frame {
     /// peer -> peer: the sender's display name, sent as the very first frame on
     /// a new outbound connection so the remote bridge can label the device.
+    /// `invite` carries the full encoded invite string (`"azi…"`) when the
+    /// sender is dialing in as an unrecognized stranger presenting an invite
+    /// (see `invite.rs` / `azula-docs/docs/invitations.md`); omitted between
+    /// already-known peers. Old peers omit/ignore this field — no version
+    /// negotiation.
     #[serde(rename = "hello")]
-    Hello { name: String },
+    Hello {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite: Option<String>,
+    },
 
     /// client -> server (LLM prompt) and peer chat
     #[serde(rename = "chat")]
@@ -202,11 +211,28 @@ mod tests {
 
     #[test]
     fn hello_frame_roundtrips_with_type_tag() {
-        let f = Frame::Hello { name: "alice".into() };
+        let f = Frame::Hello { name: "alice".into(), invite: None };
         let json = serde_json::to_string(&f).unwrap();
         assert_eq!(json, r#"{"type":"hello","name":"alice"}"#);
         let back: Frame = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Frame::Hello { name } if name == "alice"));
+        assert!(matches!(back, Frame::Hello { name, invite: None } if name == "alice"));
+    }
+
+    #[test]
+    fn hello_frame_with_invite_roundtrips() {
+        let f = Frame::Hello { name: "alice".into(), invite: Some("azi...".into()) };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""invite":"azi...""#), "missing invite: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::Hello { invite: Some(i), .. } if i == "azi..."));
+    }
+
+    #[test]
+    fn hello_frame_without_invite_field_decodes() {
+        // Old peers omit the field entirely.
+        let json = r#"{"type":"hello","name":"bob"}"#;
+        let back: Frame = serde_json::from_str(json).unwrap();
+        assert!(matches!(back, Frame::Hello { name, invite: None } if name == "bob"));
     }
 
     #[test]

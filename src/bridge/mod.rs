@@ -57,6 +57,7 @@ use rmcp::ServiceExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 
+use crate::invite;
 use crate::link::parse_ticket;
 use crate::mailbox;
 use crate::mcp::LLM_ALPN;
@@ -85,17 +86,26 @@ struct BridgeCore {
 /// Bind the endpoint, stand up the accept router, preload known devices (+ any
 /// `--device` flags), and start the background dial + redelivery loops. `label` is
 /// a human tag written into the runtime state file (the HTTP bind, or "stdio").
-async fn setup_bridge(label: &str, device_urls: Vec<String>, name: Option<String>) -> Result<BridgeCore> {
+/// `allow_legacy` admits invite-less unknown strangers as unverified instead
+/// of closing the connection (see `BridgeAcceptHandler` / the invitations
+/// spec's transition policy).
+async fn setup_bridge(
+    label: &str,
+    device_urls: Vec<String>,
+    name: Option<String>,
+    allow_legacy: bool,
+) -> Result<BridgeCore> {
     // Reuse a persisted key so the bridge keeps a stable node id (and connect
     // code) across restarts; the one endpoint serves both accept and dial.
     let (raw_endpoint, bridge_ticket) = crate::endpoint::bind_server_endpoint("bridge").await?;
+    let my_node_id = raw_endpoint.id();
 
     let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
 
     // Our display name (the conversation title the app shows), announced to apps in
     // both the dial and accept directions. Computed before the accept handler so it
     // can use it. Falls back to bridge-<id> only when no --name was given.
-    let endpoint_id_str = raw_endpoint.id().to_string();
+    let endpoint_id_str = my_node_id.to_string();
     let own_name = name.unwrap_or_else(|| {
         let len = endpoint_id_str.len();
         format!("bridge-{}", &endpoint_id_str[..8_usize.min(len)])
@@ -103,7 +113,8 @@ async fn setup_bridge(label: &str, device_urls: Vec<String>, name: Option<String
 
     // Accept incoming azula app / peer-bridge connections (devices that scanned
     // the bridge's QR) and register them.
-    let accept_handler = BridgeAcceptHandler::new(devices.clone(), label.to_string(), own_name.clone());
+    let accept_handler =
+        BridgeAcceptHandler::new(devices.clone(), label.to_string(), own_name.clone(), my_node_id, allow_legacy);
     let iroh_router = Router::builder(raw_endpoint)
         .accept(LLM_ALPN, accept_handler)
         .spawn();
@@ -118,7 +129,7 @@ async fn setup_bridge(label: &str, device_urls: Vec<String>, name: Option<String
     {
         let mut guard = devices.lock().await;
         for d in &known {
-            guard.insert(d.name.clone(), device::DeviceConn::new(d.ticket.clone()));
+            guard.insert(d.name.clone(), device::DeviceConn::new(d.ticket.clone()).with_invite(d.invite.clone()));
         }
     }
 
@@ -136,21 +147,21 @@ async fn setup_bridge(label: &str, device_urls: Vec<String>, name: Option<String
     // Best-effort dial all known devices in the background.
     {
         let guard = devices.lock().await;
-        let entries: Vec<(String, String)> = guard
+        let entries: Vec<(String, String, Option<String>)> = guard
             .iter()
-            .map(|(n, c)| (n.clone(), c.ticket.clone()))
+            .map(|(n, c)| (n.clone(), c.ticket.clone(), c.invite.clone()))
             .collect();
         drop(guard);
 
         let own_name_clone = own_name.clone();
         let label_owned = label.to_string();
-        for (dev_name, ticket) in entries {
+        for (dev_name, ticket, invite) in entries {
             let ep = endpoint.clone();
             let devs = devices.clone();
             let label_str = label_owned.clone();
             let my_name = own_name_clone.clone();
             tokio::spawn(async move {
-                connect_device(&ep, &dev_name, &ticket, &devs, &my_name).await;
+                connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref()).await;
                 write_state(&label_str, &devs).await;
             });
         }
@@ -166,16 +177,16 @@ async fn setup_bridge(label: &str, device_urls: Vec<String>, name: Option<String
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(25)).await;
-                let pending: Vec<(String, String)> = {
+                let pending: Vec<(String, String, Option<String>)> = {
                     let guard = devs.lock().await;
                     guard.iter()
                         .filter(|(name, conn)| !conn.connected && mailbox::has_pending(name))
-                        .map(|(name, conn)| (name.clone(), conn.ticket.clone()))
+                        .map(|(name, conn)| (name.clone(), conn.ticket.clone(), conn.invite.clone()))
                         .collect()
                 };
-                for (dev_name, ticket) in pending {
+                for (dev_name, ticket, invite) in pending {
                     info!(device=%dev_name, "bridge: attempting redelivery of queued mail");
-                    connect_device(&ep, &dev_name, &ticket, &devs, &my_name).await;
+                    connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref()).await;
                     write_state(&label_owned, &devs).await;
                 }
             }
@@ -185,13 +196,34 @@ async fn setup_bridge(label: &str, device_urls: Vec<String>, name: Option<String
     Ok(BridgeCore { endpoint, devices, bridge_ticket, own_name, _router: iroh_router })
 }
 
+/// Mint a signed 24h invite for the bridge's startup pairing QR (spec: "serve
+/// mint a signed 24h invite for their startup pairing QR instead of printing
+/// the raw ticket"). `legacy_ticket` skips minting (the `--legacy-ticket`
+/// escape hatch); a mint failure (e.g. `$HOME` unset) also falls back to
+/// `None` so the raw-ticket QR still works.
+fn startup_invite(core: &BridgeCore, legacy_ticket: bool) -> Option<String> {
+    if legacy_ticket {
+        return None;
+    }
+    let expiry = invite::Expiry::In(std::time::Duration::from_secs(24 * 60 * 60));
+    match invite::mint(&core.bridge_ticket, expiry, true, false, None, core.endpoint.secret_key()) {
+        Ok((payload, _)) => Some(payload.encode()),
+        Err(e) => {
+            tracing::warn!(error = %e, "bridge: failed to mint startup invite; falling back to raw ticket");
+            None
+        }
+    }
+}
+
 pub async fn run(
     bind: String,
     device_urls: Vec<String>,
     name: Option<String>,
     max_turns: u64,
+    allow_legacy: bool,
+    legacy_ticket: bool,
 ) -> Result<()> {
-    let core = setup_bridge(&bind, device_urls, name).await?;
+    let core = setup_bridge(&bind, device_urls, name, allow_legacy).await?;
 
     // MCP server over Streamable HTTP, mounted at /mcp.
     let ep_svc = core.endpoint.clone();
@@ -221,7 +253,10 @@ pub async fn run(
             "  Add this URL to an MCP-capable LLM client.".to_string(),
         ],
     );
-    qr::print_pairing("Pair a device by scanning:", &core.bridge_ticket);
+    match startup_invite(&core, legacy_ticket) {
+        Some(encoded) => qr::print_invite_pairing("Pair a device by scanning:", &encoded),
+        None => qr::print_pairing("Pair a device by scanning:", &core.bridge_ticket),
+    }
     axum::serve(listener, http_router).await?;
     Ok(())
 }
@@ -229,11 +264,20 @@ pub async fn run(
 /// Run the bridge as a **stdio** MCP server — for `claude mcp add azula -- azula mcp`.
 /// Same `AzulaBridge` + iroh node as [`run`], but JSON-RPC is spoken over stdin/stdout,
 /// so all human output goes to **stderr** and never corrupts the protocol stream.
-pub async fn run_stdio(device_urls: Vec<String>, name: Option<String>, max_turns: u64) -> Result<()> {
-    let core = setup_bridge("stdio", device_urls, name).await?;
+pub async fn run_stdio(
+    device_urls: Vec<String>,
+    name: Option<String>,
+    max_turns: u64,
+    allow_legacy: bool,
+    legacy_ticket: bool,
+) -> Result<()> {
+    let core = setup_bridge("stdio", device_urls, name, allow_legacy).await?;
 
     eprintln!("azula MCP bridge (stdio) online as \"{}\"", core.own_name);
-    eprintln!("pairing URL: {}", qr::pairing_url(&core.bridge_ticket));
+    match startup_invite(&core, legacy_ticket) {
+        Some(encoded) => eprintln!("pairing URL: {}", qr::invite_url(&encoded)),
+        None => eprintln!("pairing URL: {}", qr::pairing_url(&core.bridge_ticket)),
+    }
     eprintln!("(call the start_pairing tool to show a QR and pair a phone)");
 
     let bridge = AzulaBridge::new(

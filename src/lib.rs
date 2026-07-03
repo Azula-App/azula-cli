@@ -17,6 +17,7 @@ pub mod bridge;
 pub mod endpoint;
 pub mod filexfer;
 pub mod identity;
+pub mod invite;
 pub mod link;
 pub mod mailbox;
 pub mod mcp;

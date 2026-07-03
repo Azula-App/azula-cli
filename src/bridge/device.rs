@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -26,6 +27,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
 use crate::filexfer::{self, FileAssembler};
+use crate::invite;
 use crate::mailbox;
 use crate::mcp::LLM_ALPN;
 use crate::proto::{read_frame, write_frame, Frame};
@@ -46,6 +48,10 @@ pub(super) struct DeviceConn {
     pub(super) send: AppSend,
     pub(super) inbox: Inbox,
     pub(super) ticket: String,
+    /// The encoded invite string (`"azi…"`) this device was paired with, if
+    /// any — re-presented in `Hello` on every (re)dial per the invitations
+    /// spec, until the issuer has accepted and this becomes a known peer.
+    pub(super) invite: Option<String>,
     pub(super) connected: bool,
     /// Turn counter for peer bridge conversations.
     pub(super) turns: Arc<std::sync::atomic::AtomicU64>,
@@ -59,10 +65,16 @@ impl DeviceConn {
             send: Arc::new(AsyncMutex::new(None)),
             inbox: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             ticket,
+            invite: None,
             connected: false,
             turns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub(super) fn with_invite(mut self, invite: Option<String>) -> Self {
+        self.invite = invite;
+        self
     }
 
     /// Reset conversation state (turns=0, closed=false) — call on (re)connect.
@@ -90,19 +102,24 @@ pub(super) async fn dial_device(
 }
 
 /// Dial and register a device in the map.  Returns whether it connected.
-/// Sends `Frame::Hello { name: own_name }` as the very first frame, then the
-/// `thinking(false)` handshake.  Calls `reset_conversation()` on the DeviceConn.
+/// Sends `Frame::Hello { name: own_name, invite }` as the very first frame
+/// (presenting `invite` — the encoded invite string, if this device was
+/// paired via one — so an unknown-to-the-peer dial can pass its accept
+/// gate), then the `thinking(false)` handshake.  Calls `reset_conversation()`
+/// on the DeviceConn.
 pub(super) async fn connect_device(
     endpoint: &Endpoint,
     name: &str,
     ticket: &str,
     devices: &DeviceMap,
     own_name: &str,
+    invite: Option<&str>,
 ) -> bool {
     match dial_device(endpoint, ticket).await {
         Ok((mut send, recv)) => {
-            // Send hello so the peer can name us.
-            if let Err(e) = write_frame(&mut send, &Frame::Hello { name: own_name.into() }).await {
+            // Send hello so the peer can name us (and verify our invite, if any).
+            let hello = Frame::Hello { name: own_name.into(), invite: invite.map(String::from) };
+            if let Err(e) = write_frame(&mut send, &hello).await {
                 warn!(device=%name, error=%e, "bridge: hello write failed");
                 return false;
             }
@@ -120,11 +137,14 @@ pub(super) async fn connect_device(
             tokio::spawn(async move { reader_loop(recv, inbox_reader).await });
 
             let mut guard = devices.lock().await;
-            let conn = guard.entry(name.to_string()).or_insert_with(|| DeviceConn::new(ticket.to_string()));
+            let conn = guard
+                .entry(name.to_string())
+                .or_insert_with(|| DeviceConn::new(ticket.to_string()).with_invite(invite.map(String::from)));
             *conn.send.lock().await = Some(send);
             conn.inbox = inbox;
             conn.connected = true;
             conn.ticket = ticket.to_string();
+            conn.invite = invite.map(String::from);
             conn.reset_conversation();
             info!(device=%name, "bridge: connected");
             true
@@ -326,16 +346,31 @@ pub(super) struct BridgeAcceptHandler {
     /// The name this bridge announces to apps that connect in (the conversation
     /// title on the phone), e.g. "Claude".
     own_name: String,
+    /// Our own node id — the invite-verification audience (rule 2: the
+    /// invite's embedded ticket must name *us*) and signature-verification key.
+    my_node_id: EndpointId,
+    /// Admit invite-less strangers as unverified pending devices instead of
+    /// closing the connection (transition escape hatch; `--allow-legacy`,
+    /// default on for one release per the invitations spec).
+    allow_legacy: bool,
     /// Counter to assign monotonically-increasing names to scanned devices.
     scan_counter: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl BridgeAcceptHandler {
-    pub(super) fn new(devices: DeviceMap, bind: String, own_name: String) -> Self {
+    pub(super) fn new(
+        devices: DeviceMap,
+        bind: String,
+        own_name: String,
+        my_node_id: EndpointId,
+        allow_legacy: bool,
+    ) -> Self {
         Self {
             devices,
             bind,
             own_name,
+            my_node_id,
+            allow_legacy,
             scan_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
@@ -343,11 +378,23 @@ impl BridgeAcceptHandler {
 
 impl ProtocolHandler for BridgeAcceptHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        accept_incoming(connection, self.devices.clone(), self.bind.clone(), self.own_name.clone(), self.scan_counter.clone())
-            .await
-            .map_err(|e| AcceptError::from_boxed(e.into()))
+        accept_incoming(
+            connection,
+            self.devices.clone(),
+            self.bind.clone(),
+            self.own_name.clone(),
+            self.scan_counter.clone(),
+            self.my_node_id,
+            self.allow_legacy,
+        )
+        .await
+        .map_err(|e| AcceptError::from_boxed(e.into()))
     }
 }
+
+/// 15 s cap on waiting for a stranger's first frame — long enough for a real
+/// dial, short enough that a silent connection doesn't tie up an accept slot.
+const STRANGER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn accept_incoming(
     connection: Connection,
@@ -355,6 +402,8 @@ async fn accept_incoming(
     bind: String,
     own_name: String,
     counter: Arc<std::sync::atomic::AtomicU32>,
+    my_node_id: EndpointId,
+    allow_legacy: bool,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
     let remote_id_str = remote_id.to_string();
@@ -378,16 +427,63 @@ async fn accept_incoming(
     if let Some(ref matched) = node_id_match {
         info!(peer=%matched, "bridge: recognised reconnecting device by node id");
     }
+    let known = node_id_match.is_some();
 
     // The dialer opens the bi stream.
     let (mut send, recv) = connection.accept_bi().await?;
     let mut reader = BufReader::new(recv);
 
+    // Read the very first frame. Known peers connect exactly as before (no
+    // gate, no timeout); a stranger gets a 15s cap on top of the accept-gate
+    // check below (invitations spec's verification rules).
+    let first_frame = if known {
+        read_frame(&mut reader).await
+    } else {
+        match tokio::time::timeout(STRANGER_HELLO_TIMEOUT, read_frame(&mut reader)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                info!(%fallback_name, "bridge: stranger's first frame timed out; closing");
+                return Ok(());
+            }
+        }
+    };
+
+    // --- Accept gate for strangers: require a valid invite in Hello.invite. ---
+    let mut verified: Option<invite::VerifiedInvite> = None;
+    if !known {
+        let invite_token = match &first_frame {
+            Ok(Some(Frame::Hello { invite: Some(tok), .. })) => Some(tok.clone()),
+            _ => None,
+        };
+        match invite_token {
+            Some(tok) => match invite::verify_inbound(&tok, my_node_id, &my_node_id) {
+                Ok(v) => {
+                    info!(%fallback_name, invite_id = %v.invite_id, "bridge: stranger presented a valid invite");
+                    verified = Some(v);
+                }
+                Err(e) if allow_legacy => {
+                    warn!(%fallback_name, error = %e, "bridge: invite verification failed; admitting as unverified (--allow-legacy)");
+                }
+                Err(e) => {
+                    warn!(%fallback_name, error = %e, "bridge: invite verification failed; closing (pass --allow-legacy to admit anyway)");
+                    return Ok(());
+                }
+            },
+            None if allow_legacy => {
+                info!(%fallback_name, "bridge: stranger connected without an invite; admitting as unverified (--allow-legacy)");
+            }
+            None => {
+                warn!(%fallback_name, "bridge: stranger connected without a valid invite; closing (pass --allow-legacy to admit anyway)");
+                return Ok(());
+            }
+        }
+    }
+
     // Read the very first frame to determine the peer's name.
     // Priority: (1) node-id matched known device, (2) Hello frame, (3) scan-<id>.
-    let recognised = node_id_match.is_some();
-    let (peer_name, pending_frame, from_app) = match read_frame(&mut reader).await {
-        Ok(Some(Frame::Hello { name })) => {
+    let recognised = known;
+    let (peer_name, pending_frame, from_app) = match first_frame {
+        Ok(Some(Frame::Hello { name, .. })) => {
             // An azula app announces its 64-hex node id as the Hello name; a peer
             // bridge announces a "bridge-…" name. Only app clients get our reply.
             let looks_like_node_id = name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit());
@@ -410,11 +506,36 @@ async fn accept_incoming(
         }
     };
 
+    // A stranger who verified an invite is admitted: register them like
+    // `azula pair` would (headless — verification *is* acceptance), and mark
+    // single-use invites consumed.
+    if let Some(v) = verified {
+        let device = Device {
+            name: peer_name.clone(),
+            ticket: remote_id_str.clone(),
+            added_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            invite: None,
+        };
+        if let Err(e) = registry::add(device, false) {
+            warn!(peer=%peer_name, error=%e, "bridge: failed to register invite-verified device");
+        }
+        if v.single_use {
+            if let Err(e) = invite::mark_consumed(&v.invite_id) {
+                warn!(peer=%peer_name, error=%e, "bridge: failed to mark invite consumed");
+            }
+        }
+    }
+
     // Announce ourselves to an azula app so it titles the conversation with our
     // name (e.g. "Claude"); the app keeps the bridge's peer code as the subtitle.
     // Never to peer bridges. The LLM can refine the title later via `set_name`.
     if from_app {
-        let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone() }).await;
+        let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone(), invite: None }).await;
     }
 
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
@@ -436,6 +557,7 @@ async fn accept_incoming(
             send: Arc::new(AsyncMutex::new(None)),
             inbox: inbox.clone(),
             ticket: remote_id_str.clone(),
+            invite: None,
             connected: false,
             turns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),

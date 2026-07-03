@@ -9,8 +9,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use iroh::EndpointId;
+use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
 
 /// A single registered device.
@@ -19,6 +22,13 @@ pub struct Device {
     pub name: String,
     pub ticket: String,
     pub added_at: Option<u64>,
+    /// The encoded invite string (`"azi…"`) this device was paired with, if
+    /// any — kept so a reconnect can keep presenting it (see
+    /// `azula-docs/docs/invitations.md`'s "redeemer re-presents" rule).
+    /// `None` for devices paired by bare ticket/legacy link, or accepted
+    /// in before invites existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
 }
 
 /// On-disk format.
@@ -156,6 +166,19 @@ pub fn add(device: Device, global: bool) -> Result<PathBuf> {
     fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
 
     Ok(path)
+}
+
+/// Find a registered device whose ticket's embedded node id matches
+/// `node_id`. Used by accept-side gates (`term.rs`, `bridge/device.rs`) to
+/// recognize a reconnecting known peer regardless of what name it announces.
+/// A device whose `ticket` doesn't parse as a dialable `EndpointTicket` (e.g.
+/// one registered from a bare inbound node-id string) never matches.
+pub fn find_by_node_id(node_id: &EndpointId) -> Option<Device> {
+    load().into_iter().find(|d| {
+        EndpointTicket::from_str(&d.ticket)
+            .map(|t| &t.endpoint_addr().id == node_id)
+            .unwrap_or(false)
+    })
 }
 
 /// Remove `name` from both the project and global registry files (whichever

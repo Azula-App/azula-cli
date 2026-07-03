@@ -134,7 +134,7 @@ async fn play_game(send: SendStream, recv: RecvStream, remote: String, tables: T
     // Announce a name so the app gives the game its own conversation ("Blackjack")
     // instead of dropping the surface into the shared "azula" thread. The
     // thinking-off frame then confirms the channel is live.
-    write_frame(&mut send, &Frame::Hello { name: "Blackjack".into() }).await?;
+    write_frame(&mut send, &Frame::Hello { name: "Blackjack".into(), invite: None }).await?;
     write_frame(&mut send, &Frame::thinking(false)).await?;
 
     // Resume this player's table if we have one, otherwise deal a new hand.

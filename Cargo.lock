@@ -253,6 +253,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "data-encoding",
  "indexmap",
  "iroh",
  "iroh-tickets",

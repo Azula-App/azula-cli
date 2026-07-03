@@ -6,9 +6,16 @@
 use qrcode::render::unicode::Dense1x2;
 use qrcode::QrCode;
 
-/// Build the universal-link / deep-link pairing URL for a given ticket.
+/// Build the universal-link / deep-link pairing URL for a **legacy** raw
+/// ticket (`--legacy-ticket` escape hatch; superseded by [`invite_url`]).
 pub fn pairing_url(ticket: &str) -> String {
     format!("https://azula.app/s/{ticket}")
+}
+
+/// Build the canonical share link for an encoded invite payload
+/// (`https://azula.app/i/<payload>`; see `azula-docs/docs/invitations.md`).
+pub fn invite_url(encoded: &str) -> String {
+    format!("https://azula.app/i/{encoded}")
 }
 
 /// Encode `data` as a QR code and render it as a compact Unicode string using
@@ -29,10 +36,20 @@ pub fn render_qr(data: &str) -> String {
 }
 
 /// Print a labelled pairing block to stdout: title, URL, a blank line, the QR
-/// code, and a camera-hint.  Reused by both `serve` and `serve-mcp`.
+/// code, and a camera-hint. `--legacy-ticket` escape hatch; prefer
+/// [`print_invite_pairing`].
 pub fn print_pairing(title: &str, ticket: &str) {
-    let url = pairing_url(ticket);
-    let qr = render_qr(&url);
+    print_pairing_url(title, &pairing_url(ticket));
+}
+
+/// As [`print_pairing`], but for an encoded invite payload
+/// (`https://azula.app/i/<payload>`).
+pub fn print_invite_pairing(title: &str, encoded_invite: &str) {
+    print_pairing_url(title, &invite_url(encoded_invite));
+}
+
+fn print_pairing_url(title: &str, url: &str) {
+    let qr = render_qr(url);
     println!();
     println!("  {title}");
     println!();

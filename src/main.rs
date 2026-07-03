@@ -9,14 +9,16 @@
 //!   server is configured.
 //! * `azula/term/0` — a remote shell ("SSH"-like) bridge over a PTY
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use iroh::protocol::Router;
 use tracing::{info, warn};
 
+use azula::invite::{self, Expiry};
+use azula::link::{self, Parsed};
 use azula::mcp::{self, LlmHandler, McpConfig, McpTransport, LLM_ALPN};
 use azula::term::{TermHandler, TERM_ALPN};
-use azula::{bridge, endpoint, link, qr, registry};
+use azula::{bridge, endpoint, qr, registry};
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -46,6 +48,10 @@ enum Command {
     Devices,
     /// Print a QR code for a ticket, URL, or bare token.
     Qr(QrArgs),
+    /// Mint a new invite (or, with `revoke`, delete a previously issued one).
+    Invite(InviteCliArgs),
+    /// List all invites this node has issued.
+    Invites,
 }
 
 /// Options for the `serve-mcp` command (the MCP↔iroh bridge).
@@ -69,6 +75,17 @@ struct ServeMcpArgs {
     /// either side reaches this many turns the conversation is closed.
     #[arg(long = "max-turns", value_name = "N", default_value_t = 20)]
     max_turns: u64,
+
+    /// Admit invite-less unknown strangers as unverified pending devices
+    /// instead of closing the connection. Transition escape hatch — default
+    /// on for one release, then off (see azula-docs/docs/invitations.md).
+    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
+    allow_legacy: bool,
+
+    /// Print the raw dial ticket in the startup pairing QR instead of minting
+    /// a signed 24h invite.
+    #[arg(long = "legacy-ticket")]
+    legacy_ticket: bool,
 }
 
 /// Options for the `mcp` command (the stdio MCP↔iroh bridge).
@@ -87,12 +104,24 @@ struct McpArgs {
     /// Hard per-peer turn cap for bridge-to-bridge `say` conversations.
     #[arg(long = "max-turns", value_name = "N", default_value_t = 20)]
     max_turns: u64,
+
+    /// Admit invite-less unknown strangers as unverified pending devices
+    /// instead of closing the connection. Transition escape hatch — default
+    /// on for one release, then off (see azula-docs/docs/invitations.md).
+    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
+    allow_legacy: bool,
+
+    /// Print the raw dial ticket in the startup pairing output instead of
+    /// minting a signed 24h invite.
+    #[arg(long = "legacy-ticket")]
+    legacy_ticket: bool,
 }
 
 /// Options for `azula pair`.
 #[derive(Debug, Clone, clap::Args)]
 struct PairArgs {
-    /// The device ticket URL or bare token.
+    /// The invite link (https://azula.app/i/<payload>, azula://i?c=<payload>,
+    /// bare azi... payload), legacy ticket URL, or bare token.
     url: String,
 
     /// Display name for this device.
@@ -109,6 +138,48 @@ struct PairArgs {
 struct QrArgs {
     /// A ticket, `https://azula.app/s/<token>`, or `azula://connect?code=<token>` URL.
     code: String,
+}
+
+/// Options for `azula invite`: mints by default, or `revoke <id-prefix>` to delete one.
+#[derive(Debug, Clone, clap::Args)]
+struct InviteCliArgs {
+    #[command(subcommand)]
+    action: Option<InviteAction>,
+
+    #[command(flatten)]
+    mint: InviteMintArgs,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum InviteAction {
+    /// Revoke (delete) an issued invite by id or id-prefix.
+    Revoke(InviteRevokeArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct InviteMintArgs {
+    /// Validity window: `1h`, `24h`, `7d`, or `never`.
+    #[arg(long, default_value = "24h")]
+    expires: String,
+
+    /// Sign the invite with this node's key so the redeemer/azula.app can
+    /// verify authenticity before dialing.
+    #[arg(long)]
+    sign: bool,
+
+    /// The invite may only be redeemed once.
+    #[arg(long = "single-use")]
+    single_use: bool,
+
+    /// A note shown next to this invite in `azula invites` (e.g. a recipient's name).
+    #[arg(long)]
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct InviteRevokeArgs {
+    /// The invite id (or a unique prefix of it) shown by `azula invites`.
+    id_prefix: String,
 }
 
 /// Options for the `serve` command (also used when run with no subcommand).
@@ -139,6 +210,19 @@ struct ServeArgs {
     /// Docker shell container.
     #[arg(long, env = "AZULA_TERM_ONLY")]
     term_only: bool,
+
+    /// Admit invite-less unknown strangers into the remote-shell ALPN as
+    /// unverified instead of closing the connection. Transition escape hatch
+    /// — default on for one release, then off (see
+    /// azula-docs/docs/invitations.md). Does not affect the LLM relay ALPN,
+    /// which has no device-registry concept.
+    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
+    allow_legacy: bool,
+
+    /// Print the raw dial ticket in the startup pairing QR instead of minting
+    /// a signed 24h invite.
+    #[arg(long = "legacy-ticket")]
+    legacy_ticket: bool,
 }
 
 #[tokio::main]
@@ -157,22 +241,48 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::ServeMcp(args)) => {
-            bridge::run(args.bind, args.device.unwrap_or_default(), args.name, args.max_turns).await
+            bridge::run(
+                args.bind,
+                args.device.unwrap_or_default(),
+                args.name,
+                args.max_turns,
+                args.allow_legacy,
+                args.legacy_ticket,
+            )
+            .await
         }
         Some(Command::Mcp(args)) => {
-            bridge::run_stdio(args.device.unwrap_or_default(), Some(args.name), args.max_turns).await
+            bridge::run_stdio(
+                args.device.unwrap_or_default(),
+                Some(args.name),
+                args.max_turns,
+                args.allow_legacy,
+                args.legacy_ticket,
+            )
+            .await
         }
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Pair(args)) => cmd_pair(args),
         Some(Command::Devices) => cmd_devices(),
         Some(Command::Qr(args)) => cmd_qr(args),
+        Some(Command::Invite(args)) => match args.action {
+            Some(InviteAction::Revoke(r)) => cmd_invite_revoke(r),
+            None => cmd_invite_mint(args.mint).await,
+        },
+        Some(Command::Invites) => cmd_invites(),
         None => serve(cli.serve).await,
     }
 }
 
 fn cmd_pair(args: PairArgs) -> Result<()> {
-    let token = match link::parse_ticket(&args.url) {
-        Some(t) => t,
+    let (token, invite_str) = match link::parse(&args.url) {
+        Some(Parsed::Invite(payload)) => {
+            let decoded = invite::InvitePayload::decode(&payload)
+                .with_context(|| format!("invalid invite: {:?}", args.url))?;
+            let ticket = decoded.ticket().context("invalid invite ticket")?;
+            (ticket.to_string(), Some(payload))
+        }
+        Some(Parsed::Ticket(t)) => (t, None),
         None => {
             eprintln!("error: could not extract a token from {:?}", args.url);
             std::process::exit(1);
@@ -192,6 +302,7 @@ fn cmd_pair(args: PairArgs) -> Result<()> {
                 .unwrap_or_default()
                 .as_secs(),
         ),
+        invite: invite_str,
     };
 
     let path = registry::add(device, args.global)?;
@@ -246,6 +357,100 @@ fn cmd_qr(args: QrArgs) -> Result<()> {
     Ok(())
 }
 
+/// Parse `--expires` (`1h`, `24h`, `7d`, `never`) into an [`Expiry`].
+fn parse_expiry(s: &str) -> Result<Expiry> {
+    match s {
+        "never" => Ok(Expiry::Never),
+        "1h" => Ok(Expiry::In(std::time::Duration::from_secs(60 * 60))),
+        "24h" => Ok(Expiry::In(std::time::Duration::from_secs(24 * 60 * 60))),
+        "7d" => Ok(Expiry::In(std::time::Duration::from_secs(7 * 24 * 60 * 60))),
+        other => anyhow::bail!("invalid --expires {other:?}; expected 1h, 24h, 7d, or never"),
+    }
+}
+
+async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
+    let expiry = parse_expiry(&args.expires)?;
+
+    // Mint against the `serve` identity's ticket — the same identity `azula
+    // serve`'s own startup pairing invite uses — so a minted invite is
+    // dialable against a running (or about-to-run) `azula serve`.
+    let (endpoint, ticket) = endpoint::bind_server_endpoint("serve").await?;
+
+    let (payload, record) = invite::mint(
+        &ticket,
+        expiry,
+        args.sign,
+        args.single_use,
+        args.label.clone(),
+        endpoint.secret_key(),
+    )?;
+    let encoded = payload.encode();
+    let url = qr::invite_url(&encoded);
+
+    println!("Minted invite {} (expires: {})", record.id, describe_expiry(record.expires_at));
+    if let Some(label) = &record.label {
+        println!("  label: {label}");
+    }
+    println!("  signed: {}, single-use: {}", record.is_signed(), record.is_single_use());
+    println!();
+    qr::print_invite_pairing("Share this invite:", &encoded);
+    println!("  {url}");
+    Ok(())
+}
+
+fn describe_expiry(expires_at: u32) -> String {
+    if expires_at == 0 {
+        "never".to_string()
+    } else {
+        format!("unix {expires_at}")
+    }
+}
+
+fn cmd_invites() -> Result<()> {
+    let issued = invite::list();
+    if issued.is_empty() {
+        println!("No invites issued. Use `azula invite` to mint one.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<18} {:<12} {:<20} {:<10} {:<8} LABEL",
+        "ID", "CREATED", "EXPIRES", "CONSUMED", "FLAGS"
+    );
+    println!("{}", "-".repeat(90));
+    for i in &issued {
+        let expires = if i.expires_at == 0 { "never".to_string() } else { i.expires_at.to_string() };
+        let mut flags = Vec::new();
+        if i.is_signed() {
+            flags.push("signed");
+        }
+        if i.is_single_use() {
+            flags.push("single-use");
+        }
+        let flags = if flags.is_empty() { "-".to_string() } else { flags.join(",") };
+        println!(
+            "{:<18} {:<12} {:<20} {:<10} {:<8} {}",
+            i.id,
+            i.created_at,
+            expires,
+            i.consumed,
+            flags,
+            i.label.as_deref().unwrap_or("-"),
+        );
+    }
+    Ok(())
+}
+
+fn cmd_invite_revoke(args: InviteRevokeArgs) -> Result<()> {
+    let removed = invite::revoke(&args.id_prefix)?;
+    if removed == 0 {
+        eprintln!("No invite matching {:?} found.", args.id_prefix);
+        std::process::exit(1);
+    }
+    println!("Revoked {removed} invite(s) matching {:?}.", args.id_prefix);
+    Ok(())
+}
+
 async fn serve(args: ServeArgs) -> Result<()> {
     // Bind with the n0 defaults (public discovery + relays), reusing a persisted
     // key so the node id (and connect code) stays stable across restarts.
@@ -284,7 +489,26 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
     banner_lines.push("    azula/term/0  remote shell".to_string());
     endpoint::print_banner("azula server", &banner_lines);
-    qr::print_pairing("Pair by scanning:", &ticket);
+
+    // Mint a signed 24h invite for the startup pairing QR instead of printing
+    // the raw ticket, unless --legacy-ticket asks for the old behavior (or
+    // minting fails, e.g. $HOME unset).
+    let startup_invite = if args.legacy_ticket {
+        None
+    } else {
+        let expiry = Expiry::In(std::time::Duration::from_secs(24 * 60 * 60));
+        match invite::mint(&ticket, expiry, true, false, None, endpoint.secret_key()) {
+            Ok((payload, _)) => Some(payload.encode()),
+            Err(e) => {
+                warn!(error = %e, "invite: failed to mint startup invite; falling back to raw ticket");
+                None
+            }
+        }
+    };
+    match &startup_invite {
+        Some(encoded) => qr::print_invite_pairing("Pair by scanning:", encoded),
+        None => qr::print_pairing("Pair by scanning:", &ticket),
+    }
 
     // Establish the shared upstream MCP session eagerly (when a transport flag
     // is set). A connect failure is non-fatal: log it and fall back to the
@@ -303,12 +527,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let router = if args.term_only {
         info!("term-only mode: serving the remote shell, no LLM");
         Router::builder(endpoint)
-            .accept(TERM_ALPN, TermHandler::new())
+            .accept(TERM_ALPN, TermHandler::new(node_id, args.allow_legacy))
             .spawn()
     } else {
         Router::builder(endpoint)
             .accept(LLM_ALPN, LlmHandler::new(mcp))
-            .accept(TERM_ALPN, TermHandler::new())
+            .accept(TERM_ALPN, TermHandler::new(node_id, args.allow_legacy))
             .spawn()
     };
 

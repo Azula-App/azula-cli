@@ -168,9 +168,9 @@ async fn send_file_tool_delivers_over_iroh() {
     let bob_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
     let bind_placeholder = "127.0.0.1:0".to_string();
 
-    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string());
+    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true);
     let alice_router = Router::builder(alice_raw_ep).accept(LLM_ALPN, alice_accept).spawn();
-    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string());
+    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true);
     let bob_router = Router::builder(bob_raw_ep).accept(LLM_ALPN, bob_accept).spawn();
 
     let alice_ep = Arc::new(alice_router.endpoint().clone());
@@ -255,12 +255,12 @@ async fn bridge_to_bridge_relay() {
     let bind_placeholder = "127.0.0.1:0".to_string();
 
     // Build iroh routers with accept handlers.
-    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string());
+    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true);
     let alice_router = Router::builder(alice_raw_ep)
         .accept(LLM_ALPN, alice_accept)
         .spawn();
 
-    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string());
+    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true);
     let bob_router = Router::builder(bob_raw_ep)
         .accept(LLM_ALPN, bob_accept)
         .spawn();
@@ -647,6 +647,7 @@ async fn match_known_device_by_node_id() {
         name: "phone-reg".to_string(),
         ticket: phone_ticket.clone(),
         added_at: None,
+        invite: None,
     }];
     assert_eq!(
         match_known_device(&phone_id, &map_empty, &reg_with_phone),
@@ -659,6 +660,7 @@ async fn match_known_device_by_node_id() {
         name: "phone-reg".to_string(),
         ticket: phone_ticket.clone(),
         added_at: None,
+        invite: None,
     }];
     assert_eq!(
         match_known_device(&phone_id, &map, &reg_conflict),
@@ -715,7 +717,7 @@ async fn reconnect_by_node_id_flushes_mailbox() {
     );
 
     // Stand up a bridge accept handler.
-    let bridge_accept = BridgeAcceptHandler::new(bridge_devices.clone(), bind_placeholder.clone(), "Claude".to_string());
+    let bridge_accept = BridgeAcceptHandler::new(bridge_devices.clone(), bind_placeholder.clone(), "Claude".to_string(), bridge_raw_ep.id(), true);
     let bridge_router = Router::builder(bridge_raw_ep)
         .accept(LLM_ALPN, bridge_accept)
         .spawn();
@@ -790,7 +792,7 @@ async fn reconnect_by_node_id_flushes_mailbox() {
         "phone should receive hello + 4 flushed frames, got: {received:?}"
     );
     assert!(
-        matches!(&received[0], Frame::Hello { name } if name == "Claude"),
+        matches!(&received[0], Frame::Hello { name, .. } if name == "Claude"),
         "first frame should announce the bridge's own name, got: {:?}", received[0]
     );
     assert!(matches!(&received[1], Frame::Thinking { on: true }));
