@@ -906,23 +906,26 @@ impl AzulaBridge {
 
 STRUCTURE: `components` is a flat JSON array; each element is {"id":"...","component":"<Type>", ...props}. Exactly one must have "id":"root". Containers reference children by id — `child` (single id) or `children` (array of ids); never nest component objects. Optional `data_model` is a JSON object; any prop value may be a literal OR a binding {"path":"/rfc6901/pointer"} into the data model.
 
+The app renders these in azula's "neon-glass" style (rounded, pink accent). Text is Markdown-rendered.
+
 COMPONENTS (props):
-- Text: text (string|binding); variant: h1|h2|body(default)|caption.
+- Text: text (string|binding; Markdown: ### headings, - bullets, **bold**, *italic*, `code`); variant: h1|h2|h3|h4|h5|h6|body(default)|caption(italic, dimmed).
 - Row: children[]; justify: start|center|end|spaceBetween|spaceAround|spaceEvenly; align: start|center|end.
 - Column: children[]; justify (vertical), align (horizontal).
-- List: children[]; direction: vertical(default)|horizontal; align.
-- Card: child; align.
-- Divider: (none).
-- Tabs: tabs: [{"title":"...","child":"<id>"}].
-- Modal: trigger:<id>, child:<id> (tapping the trigger opens the child).
-- Button: child:<id> (its label, usually a Text); variant: default|primary; action:{"event":{"name":"<event>","context":{...}}}.
-- TextField: label; value:{"path":"/f"} (two-way — edits write to the data model); variant: shortText(default)|longText|number|password.
+- List: children[]; direction: vertical(default)|horizontal(scrolls); align.
+- Card: child; variant: (default, filled surface) | nested (transparent + outline).
+- Divider: axis: horizontal(default)|vertical.
+- Tabs: tabs: [{"title":"...","child":"<id>"}] (underline style; local selection).
+- Modal: trigger:<id>, content:<id> (tapping the trigger opens content in a glass sheet with a ✕ close).
+- Button: child:<id> (its label, usually a Text); variant: default|primary(gradient)|borderless; action:{"event":{"name":"<event>","context":{...}}}.
+- TextField: label; value:{"path":"/f"} (two-way — edits write to the data model); variant: shortText(default)|longText|number|obscured.
 - CheckBox: label; value:{"path":"/flag"} (boolean, two-way).
-- ChoicePicker: label; value:{"path":"/sel"}; options:[{"value":"...","label":"..."}]; variant: mutuallyExclusive(default,single)|multiSelect; displayStyle: chips(default).
+- ChoicePicker: label; value:{"path":"/sel"} (array); options:[{"value","label","description"?}]; variant: mutuallyExclusive(default,single)|multipleSelection; displayStyle: chips(default, pills)|checkbox (radio for single, tick for multi).
 - Slider: label; value:{"path":"/n"}; min(default 0); max(default 100).
-- DateTimeInput: label; value:{"path":"/dt"}.
-- Image: url — MUST be a data URI ("data:image/png;base64,...."); http URLs render only as a placeholder. fit: contain(default)|cover|stretch.
-- Icon: name. Video/AudioPlayer: url (placeholder only).
+- DateTimeInput: label; value:{"path":"/dt"} (ISO 8601 string).
+- Image: url — MUST be a data URI ("data:image/png;base64,...."); http URLs render a themed placeholder. variant (size preset): icon|avatar(round)|smallFeature|mediumFeature(default)|largeFeature|header. fit: contain(default)|cover|stretch.
+- Icon: name — vector icons: bolt|terminal|lock|link|chat|controls (others: check|close|add|settings|star|warning|home|search|…); inherits text color.
+- Video / AudioPlayer: url — styled mock player (play button + scrubber / waveform; no live playback).
 
 INTERACTION: A Button tap emits a `ui-event: {"name","surfaceId","sourceComponentId","context"}` line you receive via wait_for_reply / get_messages (context bindings are resolved against the current data model). Input components (TextField/CheckBox/ChoicePicker/Slider) write into the data model at their bound path; to READ those values, reference them in a Button's action `context` (e.g. "context":{"note":{"path":"/note"}}) — the tap's ui-event then carries the resolved values. Respond by calling update_ui (change the data model at a JSON-pointer) or render_ui (a new surface).
 
