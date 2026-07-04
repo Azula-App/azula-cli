@@ -595,6 +595,27 @@ struct ProfileAnnounce {
     description_override: Option<String>,
 }
 
+/// One bounded (`FIRST_FRAME_TIMEOUT`) read of a single frame off `reader`,
+/// for resolving a stream's leading frame outside the accept gate. `Ok(None)`
+/// covers both a clean stream end and the timeout elapsing with nothing
+/// sent — both mean "proceed as if idle". `Err(())` means a real I/O error,
+/// which the caller should treat as fatal for the stream (log already
+/// emitted here so callers don't need to).
+async fn read_bounded_frame(
+    reader: &mut BufReader<RecvStream>,
+    remote: &str,
+    what: &str,
+) -> Result<Option<Frame>, ()> {
+    match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(reader)).await {
+        Ok(Ok(f)) => Ok(f),
+        Ok(Err(e)) => {
+            warn!(%remote, error = %e, what, "term: read error waiting for a leading frame");
+            Err(())
+        }
+        Err(_elapsed) => Ok(None), // Nothing sent yet; proceed as if idle.
+    }
+}
+
 /// Bridge one bi stream. `reader` may already have consumed a first frame
 /// while gating the connection (see `gate_stranger`); that frame — or,
 /// absent one, a frame read fresh here with a bounded timeout — decides
@@ -641,15 +662,39 @@ async fn term_session(
     // checked for `TermAttach` too.
     let leading_frame: Option<Frame> = match first_frame {
         Some(f) => Some(f),
-        None => match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut reader)).await {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => {
-                warn!(%remote, error = %e, "term: read error waiting for the first frame");
+        None => match read_bounded_frame(&mut reader, &remote, "the first frame").await {
+            Ok(f) => f,
+            Err(()) => {
                 let _ = send.finish();
                 return Ok(());
             }
-            Err(_elapsed) => None, // Nothing sent yet; proceed as if idle.
         },
+    };
+
+    // The azula app's `ConnectService.ping()` sends `Frame::Hello` as the
+    // literal first frame on every dialed stream, on every ALPN, including
+    // this one — then `wireConv` follows up with `Frame::TermAttach`. The
+    // accept gate above consumes a leading `Hello` only while verifying a
+    // *stranger's* invite; once a peer is known, `first_stream && !known` is
+    // false, the gate never runs, and the fresh read just above is the one
+    // that captures the Hello. Without skipping it here, that Hello would be
+    // treated as the stream's leading frame, the real `TermAttach` right
+    // behind it would never be inspected, and every reconnect from a known
+    // peer would silently fall through to `legacy_bridge` (fresh shell, no
+    // resume) instead of the persistent-session path. Bounded to skipping at
+    // most one `Hello` — it's sent exactly once per stream, so this never
+    // loops. A `Hello` is never terminal input or a session command, so
+    // skipping it changes nothing for the legacy path either: it was never
+    // valid to replay as PTY input in the first place.
+    let leading_frame: Option<Frame> = match leading_frame {
+        Some(Frame::Hello { .. }) => match read_bounded_frame(&mut reader, &remote, "the frame after Hello").await {
+            Ok(f) => f,
+            Err(()) => {
+                let _ = send.finish();
+                return Ok(());
+            }
+        },
+        other => other,
     };
 
     if let Some(Frame::TermAttach { session }) = leading_frame {
@@ -1778,5 +1823,118 @@ mod tests {
         let _ = router.shutdown().await;
         owner_ep.close().await;
         stranger_ep.close().await;
+    }
+
+    /// Reproduces the azula app's real wire shape for a KNOWN peer: every
+    /// dialed stream starts with `Frame::Hello` (`ConnectService.ping()`)
+    /// before the actual `Frame::TermAttach` (`wireConv`). Pre-registering the
+    /// client's node id makes the server treat it as known from its very
+    /// first stream, so the accept gate never runs and `term_session`'s own
+    /// leading-frame read is what has to see past the Hello — this is
+    /// exactly the bug: a known peer's reconnect used to fall through to
+    /// `legacy_bridge` (fresh shell, no resume) because the Hello masked the
+    /// TermAttach behind it.
+    #[tokio::test]
+    async fn known_peer_hello_then_term_attach_still_resumes() {
+        use crate::registry::{self, Device};
+
+        // Holds ENV_TEST_LOCK for the whole body — see its doc comment: this
+        // mutates the process-global AZULA_REGISTRY_DIR, which other tests
+        // (accept_gate.rs, bridge/tests.rs) also mutate under the same lock.
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let registry_dir = std::env::temp_dir()
+            .join(format!("azula-term-test-{}", std::process::id()))
+            .join("known_peer_hello");
+        let _ = std::fs::remove_dir_all(&registry_dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &registry_dir);
+
+        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        let server_addr = server_ep.addr();
+        let server_id = server_ep.id();
+
+        let client_ep = Endpoint::bind(presets::Minimal).await.expect("client bind");
+        let client_id = client_ep.id();
+
+        // Register the client as a known device BEFORE it ever connects, so
+        // `known` is true on its very first stream (see `handle`'s
+        // `registry::find_by_node_id` check) — no invite, no gate, exactly
+        // like a device that paired in a previous session.
+        registry::add(
+            Device { name: "known-term-peer".to_string(), ticket: client_id.to_string(), added_at: None, invite: None },
+            false,
+        )
+        .expect("register known device");
+
+        let router = Router::builder(server_ep)
+            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(3600))))
+            .spawn();
+
+        let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
+
+        // ── First stream: Hello, then TermAttach{None} ──────────────────────
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        write_frame(&mut send, &Frame::Hello { name: "client".to_string(), invite: None })
+            .await
+            .expect("write hello");
+        write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write attach");
+
+        let mut reader = BufReader::new(recv);
+        let sess = read_until(&mut reader, |f| match f {
+            Frame::TermSession { session, resumed } => Some((session.clone(), *resumed)),
+            _ => None,
+        })
+        .await
+        .expect("expected a term_session frame even with a known peer's leading Hello");
+        assert!(!sess.1, "a brand new session must not be marked resumed");
+
+        write_frame(&mut send, &Frame::Input { text: "echo AZULA_KNOWN_HELLO_MARKER\n".to_string() })
+            .await
+            .expect("write");
+        let saw_marker = read_until(&mut reader, |f| match f {
+            Frame::Term { line } if line.contains("AZULA_KNOWN_HELLO_MARKER") => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(saw_marker.is_some(), "expected the echoed marker in Term output — session must be a real working shell, not the legacy path");
+
+        let _ = send.finish(); // detach: end the stream without killing the PTY
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // ── Second stream (same connection, still "known"): Hello, then
+        // TermAttach{Some(id)} ───────────────────────────────────────────────
+        let (mut send2, recv2) = conn.open_bi().await.expect("open_bi reattach");
+        write_frame(&mut send2, &Frame::Hello { name: "client".to_string(), invite: None })
+            .await
+            .expect("write hello 2");
+        write_frame(&mut send2, &Frame::TermAttach { session: Some(sess.0.clone()) })
+            .await
+            .expect("write attach 2");
+
+        let mut reader2 = BufReader::new(recv2);
+        let (id2, resumed2) = read_until(&mut reader2, |f| match f {
+            Frame::TermSession { session, resumed } => Some((session.clone(), *resumed)),
+            _ => None,
+        })
+        .await
+        .expect("expected term_session on reattach");
+        assert_eq!(id2, sess.0, "a known peer's Hello-then-TermAttach reattach must resume the SAME session");
+        assert!(resumed2, "reattach must be marked resumed");
+
+        // The marker must show up from the REPLAY — i.e. without sending any
+        // new Input at all — proving scrollback survived the detach.
+        let replayed = read_until(&mut reader2, |f| match f {
+            Frame::Term { line } if line.contains("AZULA_KNOWN_HELLO_MARKER") => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(replayed.is_some(), "expected the marker to be replayed on reattach, without re-running it");
+
+        let _ = send2.finish();
+        conn.close(0u32.into(), b"done");
+        super::kill_session(&sess.0); // still alive — see kill_session's doc comment.
+        let _ = router.shutdown().await;
+        client_ep.close().await;
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
     }
 }
