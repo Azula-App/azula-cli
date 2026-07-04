@@ -244,6 +244,14 @@ struct ServeArgs {
     /// sub-line). Defaults to the shell's launch working directory.
     #[arg(long, value_name = "DESCRIPTION")]
     description: Option<String>,
+
+    /// How long (in minutes) a detached persistent terminal session's shell
+    /// stays alive waiting for a `term_attach` reattach before it's killed.
+    /// `0` disables persistence entirely — a `term_attach` handshake is
+    /// still honored, but the shell never outlives its stream (same as a
+    /// legacy client, just speaking the new frames).
+    #[arg(long = "session-ttl", value_name = "MINUTES", default_value_t = 60)]
+    session_ttl: u64,
 }
 
 #[tokio::main]
@@ -495,6 +503,17 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let (endpoint, ticket) = endpoint::bind_server_endpoint("serve").await?;
     let node_id = endpoint.id();
 
+    // `0` disables persistence outright (no reaper needed — sessions never
+    // survive a detach in that mode, see `term::bind_attachment`).
+    let session_ttl = if args.session_ttl == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(args.session_ttl * 60))
+    };
+    if let Some(ttl) = session_ttl {
+        azula::term::spawn_ttl_reaper(ttl);
+    }
+
     // MCP backend config. Exactly one transport flag may be set (clap enforces
     // mutual exclusion); neither set is allowed and yields the canned fallback.
     let transport = match (args.mcp_stdio, args.mcp_url) {
@@ -525,7 +544,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if !args.term_only {
         banner_lines.push(format!("    azula/llm/0   MCP relay  -> {mcp_target}"));
     }
-    banner_lines.push("    azula/term/0  remote shell".to_string());
+    let session_ttl_desc = match session_ttl {
+        Some(ttl) => format!("{} min", ttl.as_secs() / 60),
+        None => "disabled (--session-ttl 0)".to_string(),
+    };
+    banner_lines.push(format!("    azula/term/0  remote shell (session ttl: {session_ttl_desc})"));
     endpoint::print_banner("azula server", &banner_lines);
 
     // Mint a signed 24h invite for the startup pairing QR instead of printing
@@ -567,7 +590,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         Router::builder(endpoint)
             .accept(
                 TERM_ALPN,
-                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone()),
+                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
             )
             .spawn()
     } else {
@@ -575,7 +598,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .accept(LLM_ALPN, LlmHandler::new(mcp, node_id, args.allow_legacy))
             .accept(
                 TERM_ALPN,
-                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone()),
+                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
             )
             .spawn()
     };
@@ -584,5 +607,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("shutting down…");
     router.shutdown().await?;
+    // A live persistent session's PTY-reader thread is parked in a blocking
+    // read from a shell that's still running; #[tokio::main]'s runtime
+    // (dropped when this function returns) would otherwise hang waiting for
+    // that thread to join. Kill every session's shell so it unblocks.
+    azula::term::kill_all_sessions();
     Ok(())
 }

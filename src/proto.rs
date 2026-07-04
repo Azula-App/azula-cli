@@ -46,6 +46,42 @@ pub enum Frame {
     #[serde(rename = "resize")]
     Resize { cols: u16, rows: u16 },
 
+    /// client -> server: attach to a persistent shell session, or (when
+    /// `session` is absent/null) create a brand new persistent one. Sending
+    /// this as a stream's very first frame opts into `azula serve`'s
+    /// persistent-session path; a client that never sends it gets the exact
+    /// pre-existing ephemeral behavior — the PTY dies with the stream and
+    /// nothing is kept in the server's session registry. See
+    /// `term.rs`'s module docs for the full compat story.
+    #[serde(rename = "term_attach")]
+    TermAttach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
+
+    /// server -> client: acknowledges a `term_attach`. `resumed` is `true`
+    /// when an existing PTY was reattached — a ring-buffer replay follows
+    /// immediately as ordinary `Frame::Term` chunks, before any new live
+    /// output — or `false` when a fresh persistent session was created (the
+    /// requested `session` id, if any, either didn't exist or belonged to a
+    /// different peer).
+    #[serde(rename = "term_session")]
+    TermSession {
+        session: String,
+        #[serde(default)]
+        resumed: bool,
+    },
+
+    /// server -> client: the persistent session's shell exited. The session
+    /// id is now gone from the server's registry — a later `term_attach` for
+    /// it creates a fresh session instead of resuming.
+    #[serde(rename = "term_exit")]
+    TermExit {
+        session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+    },
+
     /// server -> client (LLM token stream)
     #[serde(rename = "token")]
     Token {
@@ -416,6 +452,69 @@ mod tests {
             }
             other => panic!("expected MediaOffer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn term_attach_with_session_roundtrips() {
+        let f = Frame::TermAttach { session: Some("abc123".into()) };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"term_attach""#), "wrong type tag: {json}");
+        assert!(json.contains(r#""session":"abc123""#), "missing session: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::TermAttach { session: Some(s) } if s == "abc123"));
+    }
+
+    #[test]
+    fn term_attach_kotlin_null_session_decodes_to_none() {
+        // kotlinx.serialization's FrameCodec uses encodeDefaults = true, so a
+        // "create a new session" term_attach is sent with an explicit
+        // `"session":null` rather than the field omitted entirely.
+        let json = r#"{"type":"term_attach","session":null}"#;
+        let back: Frame = serde_json::from_str(json).unwrap();
+        assert!(matches!(back, Frame::TermAttach { session: None }));
+    }
+
+    #[test]
+    fn term_attach_missing_session_field_decodes_to_none() {
+        let json = r#"{"type":"term_attach"}"#;
+        let back: Frame = serde_json::from_str(json).unwrap();
+        assert!(matches!(back, Frame::TermAttach { session: None }));
+    }
+
+    #[test]
+    fn term_session_roundtrips_resumed_true() {
+        let f = Frame::TermSession { session: "sess-1".into(), resumed: true };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"term_session""#), "wrong type tag: {json}");
+        assert!(json.contains(r#""resumed":true"#), "missing resumed: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::TermSession { session, resumed: true } if session == "sess-1"));
+    }
+
+    #[test]
+    fn term_session_resumed_defaults_to_false_when_absent() {
+        let json = r#"{"type":"term_session","session":"sess-2"}"#;
+        let back: Frame = serde_json::from_str(json).unwrap();
+        assert!(matches!(back, Frame::TermSession { session, resumed: false } if session == "sess-2"));
+    }
+
+    #[test]
+    fn term_exit_roundtrips_with_code() {
+        let f = Frame::TermExit { session: "sess-1".into(), code: Some(0) };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"term_exit""#), "wrong type tag: {json}");
+        assert!(json.contains(r#""code":0"#), "missing code: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::TermExit { session, code: Some(0) } if session == "sess-1"));
+    }
+
+    #[test]
+    fn term_exit_without_code_omits_field() {
+        let f = Frame::TermExit { session: "sess-1".into(), code: None };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("code"), "code should be absent: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::TermExit { code: None, .. }));
     }
 
     #[test]
