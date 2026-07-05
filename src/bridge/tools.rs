@@ -622,7 +622,8 @@ COMPONENTS (props):
 - DateTimeInput: label; value:{"path":"/dt"} (ISO 8601 string).
 - Image: url — MUST be a data URI ("data:image/png;base64,...."); http URLs render a themed placeholder. variant (size preset): icon|avatar(round)|smallFeature|mediumFeature(default)|largeFeature|header. fit: contain(default)|cover|stretch.
 - Icon: name — vector icons: bolt|terminal|lock|link|chat|controls (others: check|close|add|settings|star|warning|home|search|…); inherits text color.
-- Video / AudioPlayer: url — styled mock player (play button + scrubber / waveform; no live playback).
+- Video: url — styled mock player (play button + scrubber; no live playback).
+- AudioPlayer: url — a `data:audio/...;base64,...` URI plays for real (play/pause + seekable waveform); a remote http url or no url renders the same static mock player as before (no live playback).
 
 INTERACTION: A Button tap emits a `ui-event: {"name","surfaceId","sourceComponentId","context"}` line you receive via wait_for_reply / get_messages (context bindings are resolved against the current data model). Input components (TextField/CheckBox/ChoicePicker/Slider) write into the data model at their bound path; to READ those values, reference them in a Button's action `context` (e.g. "context":{"note":{"path":"/note"}}) — the tap's ui-event then carries the resolved values. Respond by calling update_ui (change the data model at a JSON-pointer) or render_ui (a new surface).
 
