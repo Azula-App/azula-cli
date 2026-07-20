@@ -6,7 +6,7 @@
 //! stream only. A known peer (registry node-id match, checked by the caller)
 //! skips the gate entirely; a stranger's first stream must open with
 //! `Hello.invite`, verified the same way `bridge/device.rs`'s accept path
-//! verifies it. See `azula-docs/docs/invitations.md`.
+//! verifies it. See `azula-docs/openspec/specs/invitations/design.md`.
 //!
 //! `bridge/device.rs`'s own accept path is *not* built on this helper — it
 //! also has to resolve a peer display name from the `Hello`, reply with its

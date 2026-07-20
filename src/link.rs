@@ -10,7 +10,7 @@
 //! [`parse`] additionally recognizes the **invite** forms
 //! (`https://azula.app/i/<payload>`, `azula://i?c=<payload>`, a bare
 //! `azi…` payload) and tags the result so callers can tell an invite from a
-//! raw ticket — see `azula-docs/docs/invitations.md`.
+//! raw ticket — see `azula-docs/openspec/specs/invitations/design.md`.
 //!
 //! In all cases the token/payload is returned with no query-string, fragment,
 //! or trailing slash. No network access is performed; nothing is validated

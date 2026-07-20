@@ -34,7 +34,7 @@ pub struct Device {
     pub added_at: Option<u64>,
     /// The encoded invite string (`"azi…"`) this device was paired with, if
     /// any — kept so a reconnect can keep presenting it (see
-    /// `azula-docs/docs/invitations.md`'s "redeemer re-presents" rule).
+    /// `azula-docs/openspec/specs/invitations/design.md`'s "redeemer re-presents" rule).
     /// `None` for devices paired by bare ticket/legacy link, or accepted
     /// in before invites existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

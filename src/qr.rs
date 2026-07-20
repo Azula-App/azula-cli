@@ -13,7 +13,7 @@ pub fn pairing_url(ticket: &str) -> String {
 }
 
 /// Build the canonical share link for an encoded invite payload
-/// (`https://azula.app/i/<payload>`; see `azula-docs/docs/invitations.md`).
+/// (`https://azula.app/i/<payload>`; see `azula-docs/openspec/specs/invitations/design.md`).
 pub fn invite_url(encoded: &str) -> String {
     format!("https://azula.app/i/{encoded}")
 }

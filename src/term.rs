@@ -91,7 +91,7 @@ const TTL_REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// multi-device map), `serve`'s term ALPN has no device-session concept — it
 /// just needs to know whether an inbound connection is from a device already
 /// in the registry, and gate strangers on a valid invite per
-/// `azula-docs/docs/invitations.md` (see `accept_gate::gate_stranger`, shared
+/// `azula-docs/openspec/specs/invitations/design.md` (see `accept_gate::gate_stranger`, shared
 /// with `mcp.rs`'s `LlmHandler`).
 #[derive(Debug, Clone)]
 pub struct TermHandler {

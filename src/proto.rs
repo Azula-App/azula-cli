@@ -23,7 +23,7 @@ pub enum Frame {
     /// a new outbound connection so the remote bridge can label the device.
     /// `invite` carries the full encoded invite string (`"azi…"`) when the
     /// sender is dialing in as an unrecognized stranger presenting an invite
-    /// (see `invite.rs` / `azula-docs/docs/invitations.md`); omitted between
+    /// (see `invite.rs` / `azula-docs/openspec/specs/invitations/design.md`); omitted between
     /// already-known peers. Old peers omit/ignore this field — no version
     /// negotiation.
     #[serde(rename = "hello")]

@@ -1,6 +1,6 @@
 //! Invite payload codec, signing, and the issuer-side invite store.
 //!
-//! See `azula-docs/docs/invitations.md` for the full spec: payload layout,
+//! See `azula-docs/openspec/specs/invitations/design.md` for the full spec: payload layout,
 //! encoding, link formats, verification rules, and the shared test vectors
 //! this module's tests must pass byte-for-byte.
 //!
@@ -478,7 +478,7 @@ pub fn verify_inbound_in(
 mod tests {
     use super::*;
 
-    // --- Shared test vectors (azula-docs/docs/invitations.md) ---
+    // --- Shared test vectors (azula-docs/openspec/specs/invitations/design.md) ---
     // Signing key: RFC 8032 TEST 1 (test-only, never a real identity).
     const TEST_SEED: [u8; 32] = hex_array_32(
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",

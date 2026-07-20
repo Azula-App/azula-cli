@@ -78,7 +78,7 @@ struct ServeMcpArgs {
 
     /// Admit invite-less unknown strangers as unverified pending devices
     /// instead of closing the connection. Transition escape hatch — default
-    /// on for one release, then off (see azula-docs/docs/invitations.md).
+    /// on for one release, then off (see azula-docs/openspec/specs/invitations/design.md).
     #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
     allow_legacy: bool,
 
@@ -107,7 +107,7 @@ struct McpArgs {
 
     /// Admit invite-less unknown strangers as unverified pending devices
     /// instead of closing the connection. Transition escape hatch — default
-    /// on for one release, then off (see azula-docs/docs/invitations.md).
+    /// on for one release, then off (see azula-docs/openspec/specs/invitations/design.md).
     #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
     allow_legacy: bool,
 
@@ -223,7 +223,7 @@ struct ServeArgs {
     /// Admit invite-less unknown strangers into the remote-shell ALPN as
     /// unverified instead of closing the connection. Transition escape hatch
     /// — default on for one release, then off (see
-    /// azula-docs/docs/invitations.md). Does not affect the LLM relay ALPN,
+    /// azula-docs/openspec/specs/invitations/design.md). Does not affect the LLM relay ALPN,
     /// which has no device-registry concept.
     #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
     allow_legacy: bool,
