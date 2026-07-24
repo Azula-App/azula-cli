@@ -40,6 +40,23 @@ use crate::proto::{read_frame, write_frame, Frame, IdentityBundle};
 /// side; [`RootlessLinkHandler`] is what an already-linked CLI device (e.g.
 /// `azula mailbox`) answers with if something dials its link ALPN anyway —
 /// it always declines, since only a root-holding device can ever grant one.
+///
+/// **Transport note (task 6.7):** the first *frame* on this ALPN is sent by
+/// the **accepting** side (`LinkHello`, from the new device) — but QUIC's
+/// `accept_bi()` does not resolve until the dialer has written bytes on the
+/// freshly opened stream (the exact gotcha `term.rs` documents: "`accept_bi`,
+/// which blocks until the client sends data"). So the dialing (root-holding)
+/// side MUST write one priming blank line (`"\n"`) immediately after opening
+/// the bi-stream, before its first read. Without it the two sides deadlock:
+/// the acceptor parks in `accept_bi()` while the dialer blocks reading a
+/// `LinkHello` that can never be sent. The priming line is invisible at the
+/// frame layer — `proto::read_frame` skips blank lines on every read (and the
+/// Kotlin reader, `DeviceLinkProtocol.receiveFrameLine`, mirrors that). The
+/// CLI never dials LINK, so the write itself only exists on the app side
+/// (`ConnectService.beginGrantDial`); this crate's job is to keep tolerating
+/// it in every reader, which
+/// `new_device_session_skips_a_priming_blank_line_before_the_reply` and
+/// `link_handshake_completes_over_a_real_quic_connection` below pin down.
 pub const LINK_ALPN: &[u8] = b"azula/link/0";
 
 // ---------------------------------------------------------------------------
@@ -147,6 +164,9 @@ impl ProtocolHandler for LinkHandler {
         println!("  Confirm these match the words shown on the other device before it grants.");
         println!();
 
+        // This resolves only once the dialer has written its priming blank
+        // line — see LINK_ALPN's transport note (task 6.7). `read_frame`
+        // inside the session skips that line before the real reply.
         let (send, recv) = connection.accept_bi().await.map_err(|e| AcceptError::from_boxed(e.into()))?;
         let outcome = run_new_device_session(recv, send, self.device_pk, &self.name, self.roles)
             .await
@@ -549,6 +569,98 @@ mod tests {
 
         let err = run_new_device_session(my_reader, my_writer, device_pk, "phone", 0).await.unwrap_err();
         assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn new_device_session_skips_a_priming_blank_line_before_the_reply() {
+        use tokio::io::AsyncWriteExt;
+
+        let device_pk = SecretKey::from_bytes(&seed(0x15)).public();
+        let (mut other_writer, _other_reader, my_reader, my_writer) = wire_pair();
+
+        // Simulate the fixed dialer (LINK_ALPN's transport note, task 6.7): a
+        // priming blank line arrives before the real reply. `read_frame` must
+        // skip it rather than choke on a zero-length JSON frame.
+        other_writer.write_all(b"\n").await.unwrap();
+        let bundle = sample_bundle();
+        write_frame(&mut other_writer, &Frame::LinkGrant { cert: "azd-granted".into(), bundle: bundle.clone() })
+            .await
+            .unwrap();
+
+        let outcome = run_new_device_session(my_reader, my_writer, device_pk, "phone", 0).await.unwrap();
+        assert_eq!(outcome, LinkOutcome::Granted { cert: "azd-granted".into(), bundle });
+    }
+
+    /// Real-transport regression test for the task-6.7 deadlock. The duplex
+    /// tests above are deliberately transport-free — which is exactly why they
+    /// could never catch this bug: an in-memory pipe is live in both
+    /// directions the moment it exists, while a real QUIC connection does not
+    /// even surface a freshly opened bi-stream to the acceptor until the
+    /// dialer writes bytes on it. This test stands up two real iroh endpoints
+    /// in-process, accepts with the same [`LinkHandler`] `azula link` uses,
+    /// and plays the dialing (root-holding) side by hand — the CLI never
+    /// dials LINK in production; that side is the Kotlin app
+    /// (`ConnectService.beginGrantDial`) — including its priming newline.
+    /// If the priming write (or the readers' blank-line tolerance) ever
+    /// regresses, the `LinkHello` read below times out instead of hanging CI
+    /// forever, reproducing the on-device failure of 2026-07-24.
+    #[tokio::test]
+    async fn link_handshake_completes_over_a_real_quic_connection() {
+        use iroh::endpoint::presets;
+        use iroh::protocol::Router;
+        use iroh::Endpoint;
+        use tokio::time::timeout;
+
+        // ── New device (accept side), wired exactly as `azula link` does ──
+        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server endpoint bind");
+        let server_addr = server_ep.addr();
+        let device_pk = server_ep.id();
+        let (result_tx, result_rx) = oneshot::channel();
+        let router = Router::builder(server_ep)
+            .accept(LINK_ALPN, LinkHandler::new(device_pk, "new-device".into(), 0, result_tx))
+            .spawn();
+
+        // ── Root-holding dialer ────────────────────────────────────────────
+        let client_ep = Endpoint::bind(presets::Minimal).await.expect("client endpoint bind");
+        let conn = client_ep.connect(server_addr, LINK_ALPN).await.expect("client connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+
+        // THE POINT OF THIS TEST: the dialer's priming newline. Comment this
+        // write out and the whole handshake deadlocks — the acceptor's
+        // `accept_bi()` never resolves, no LinkHello is ever sent, and the
+        // timeout below fires. See LINK_ALPN's transport note (task 6.7).
+        send.write_all(b"\n").await.expect("priming newline");
+
+        let mut reader = BufReader::new(recv);
+        let hello = timeout(Duration::from_secs(30), read_frame(&mut reader))
+            .await
+            .expect("timed out waiting for LinkHello — the task-6.7 accept_bi deadlock is back")
+            .expect("read LinkHello")
+            .expect("stream closed before LinkHello");
+        match hello {
+            Frame::LinkHello { device_pk: pk, name, roles } => {
+                assert_eq!(pk, device_pk.to_string());
+                assert_eq!(name, "new-device");
+                assert_eq!(roles, 0);
+            }
+            other => panic!("expected LinkHello, got {other:?}"),
+        }
+
+        let bundle = sample_bundle();
+        write_frame(&mut send, &Frame::LinkGrant { cert: "azd-granted".into(), bundle: bundle.clone() })
+            .await
+            .expect("write grant");
+
+        let outcome = timeout(Duration::from_secs(30), result_rx)
+            .await
+            .expect("timed out waiting for the accept side's outcome")
+            .expect("accept side dropped its result channel");
+        assert_eq!(outcome, LinkOutcome::Granted { cert: "azd-granted".into(), bundle });
+
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        let _ = router.shutdown().await;
+        client_ep.close().await;
     }
 
     #[tokio::test]
