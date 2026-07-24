@@ -425,4 +425,69 @@ mod tests {
         let result = CallToolResult::error(vec![]);
         assert_eq!(render_result(&result), "[mcp tool error]");
     }
+
+    /// Real-transport smoke test, following
+    /// `link::tests::link_handshake_completes_over_a_real_quic_connection`
+    /// (the task-6.7 regression guard). `bridge/tests.rs` exercises this
+    /// ALPN string over real endpoints, but with the bridge's own
+    /// `BridgeAcceptHandler` — the [`LlmHandler`] that `azula serve`
+    /// actually binds had no real-transport coverage at all. The dialer
+    /// speaks first here (its `Chat`), which is what lets the server's
+    /// `accept_bi()` resolve; a full prompt→streamed-tokens→done round trip
+    /// over two real iroh endpoints proves the accept→gate→session wiring.
+    /// No MCP backend is configured, so the canned fallback responder
+    /// streams the reply — exactly the "the iroh path stays testable"
+    /// fallback this module's doc comment promises.
+    #[tokio::test]
+    async fn llm_session_completes_over_a_real_quic_connection() {
+        use std::time::Duration;
+
+        use iroh::endpoint::presets;
+        use iroh::protocol::Router;
+        use iroh::Endpoint;
+        use tokio::time::timeout;
+
+        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server endpoint bind");
+        let server_addr = server_ep.addr();
+        let server_id = server_ep.id();
+        let router = Router::builder(server_ep)
+            .accept(LLM_ALPN, LlmHandler::new(None, server_id, true))
+            .spawn();
+
+        let client_ep = Endpoint::bind(presets::Minimal).await.expect("client endpoint bind");
+        let conn = client_ep.connect(server_addr, LLM_ALPN).await.expect("client connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+
+        // A legacy client's opener: a bare `Chat` with no preceding `Hello`
+        // — admitted by `allow_legacy` and replayed into the session by the
+        // gate, so the prompt must not be lost.
+        write_frame(&mut send, &Frame::Chat { text: "ping".into(), id: None })
+            .await
+            .expect("write chat");
+
+        let mut reader = BufReader::new(recv);
+        let mut streamed = String::new();
+        let done = timeout(Duration::from_secs(30), async {
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(Some(Frame::Token { done: true, .. })) => return true,
+                    Ok(Some(Frame::Token { delta, .. })) => streamed.push_str(&delta),
+                    Ok(Some(_)) => {} // thinking on/off etc.
+                    Ok(None) | Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the token stream over a real connection");
+        assert!(done, "stream ended before the terminal done token; got: {streamed:?}");
+        assert!(
+            streamed.contains("no MCP server configured"),
+            "expected the canned fallback notice, got: {streamed:?}"
+        );
+
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        let _ = router.shutdown().await;
+        client_ep.close().await;
+    }
 }

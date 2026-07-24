@@ -17,10 +17,10 @@ use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
 
 /// Serializes tests (in this file, `bridge/tests.rs`, and `accept_gate.rs`)
-/// that mutate the process-global `AZULA_REGISTRY_DIR`/`AZULA_INVITES_DIR`
-/// env vars, so two tests touching them concurrently — which `cargo test`'s
-/// default parallelism otherwise allows — don't race and read back a value
-/// neither of them set. Acquire for the full duration of env mutation plus
+/// that mutate the process-global `AZULA_REGISTRY_DIR`/`AZULA_INVITES_DIR`/
+/// `AZULA_MAILBOX_DIR` env vars, so two tests touching them concurrently —
+/// which `cargo test`'s default parallelism otherwise allows — don't race
+/// and read back a value neither of them set. Acquire for the full duration of env mutation plus
 /// any calls whose behavior depends on it. A `tokio::sync::Mutex`, not
 /// `std::sync::Mutex`: guards here are held across `.await` points.
 #[cfg(test)]

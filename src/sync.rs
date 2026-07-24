@@ -1266,6 +1266,88 @@ mod tests {
         assert_eq!(b_entries_from_a, b_entries_from_b);
     }
 
+    /// Real-transport smoke test, following
+    /// `link::tests::link_handshake_completes_over_a_real_quic_connection`
+    /// (the task-6.7 regression guard). Every other test in this module runs
+    /// over an in-memory duplex, which is live in both directions the moment
+    /// it exists — while a real QUIC connection does not surface a freshly
+    /// opened bi-stream to the acceptor until the dialer writes bytes on it.
+    /// `azula/sync/0` should be immune by construction (the session opens
+    /// with a *mutual* hello, and [`dial_sync`]'s first action after
+    /// `open_bi` is a write, which is exactly what lets [`SyncHandler`]'s
+    /// `accept_bi()` resolve) — but "immune by reasoning" is precisely the
+    /// assumption that failed for `azula/link/0`, so this test settles it:
+    /// two real iroh endpoints, the same handler `azula mailbox` binds, a
+    /// real dial via [`dial_sync`], and full two-way convergence. If either
+    /// side's first action ever becomes a read, this deadlocks and the
+    /// timeout below fires. Edge cases stay on the fast duplex tests above.
+    #[tokio::test]
+    async fn sync_session_converges_over_a_real_quic_connection() {
+        use iroh::endpoint::presets;
+        use iroh::protocol::Router;
+
+        let root = root_secret();
+        let device_a = device_a_secret(); // dialer
+        let device_b = device_b_secret(); // acceptor
+        let cert_a = make_cert(&root, &device_a, "a");
+        let cert_b = make_cert(&root, &device_b, "b");
+
+        let store_a = LogStore::open(test_dir("quic_converge_a"), root.public()).unwrap();
+        let store_b = LogStore::open(test_dir("quic_converge_b"), root.public()).unwrap();
+        append_chain(&store_a, &device_a, 3).await;
+        append_chain(&store_b, &device_b, 2).await;
+
+        // The certs must bind to the connections' *transport* node ids
+        // (`read_and_verify_hello` checks it), so each endpoint is bound
+        // with its device's own secret key rather than a random one.
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(device_b.clone())
+            .bind()
+            .await
+            .expect("server endpoint bind");
+        let server_addr = server_ep.addr();
+        let router = Router::builder(server_ep)
+            .accept(SYNC_ALPN, SyncHandler::new(cert_b, vec![], store_b.clone()))
+            .spawn();
+
+        let client_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(device_a.clone())
+            .bind()
+            .await
+            .expect("client endpoint bind");
+        let dial = dial_sync(&client_ep, server_addr, &cert_a, &[], store_a.clone());
+
+        let a_hex = device_a.public().to_string();
+        let b_hex = device_b.public().to_string();
+        let converge = async {
+            loop {
+                let va = store_a.vector().await;
+                let vb = store_b.vector().await;
+                if va.get(&a_hex) == Some(&3)
+                    && va.get(&b_hex) == Some(&2)
+                    && vb.get(&a_hex) == Some(&3)
+                    && vb.get(&b_hex) == Some(&2)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+
+        // The session stays open for live push after catch-up, so the dial
+        // future completing at all before convergence is a failure.
+        let outcome: std::result::Result<(), String> = tokio::select! {
+            r = dial => Err(format!("dialing session ended before convergence: {r:?}")),
+            r = tokio::time::timeout(std::time::Duration::from_secs(30), converge) => {
+                r.map_err(|_| "timed out waiting for convergence over a real connection".to_string())
+            }
+        };
+        outcome.expect("the two devices should converge over real QUIC");
+
+        let _ = router.shutdown().await;
+        client_ep.close().await;
+    }
+
     /// Task 6.5, end to end: the literal device-linking spec scenario "Own
     /// devices enforce revocation after sync", using the *real* sync wire
     /// path (not `append_own`) to land the `device_revoke` entry. An

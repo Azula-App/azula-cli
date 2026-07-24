@@ -209,8 +209,22 @@ pub struct RootlessLinkHandler;
 
 impl ProtocolHandler for RootlessLinkHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let (send, recv) = connection.accept_bi().await.map_err(|e| AcceptError::from_boxed(e.into()))?;
-        run_rootless_session(recv, send).await.map_err(|e| AcceptError::from_boxed(e.into()))
+        let (mut send, recv) =
+            connection.accept_bi().await.map_err(|e| AcceptError::from_boxed(e.into()))?;
+        run_rootless_session(recv, &mut send).await.map_err(|e| AcceptError::from_boxed(e.into()))?;
+        // The `LinkReject` is this side's last word, and the router closes
+        // the connection the moment accept() returns — a QUIC close discards
+        // stream data still in flight, so without the wait below the dialer
+        // sees a bare `closed by peer: 0` instead of the reject. (Found by
+        // `rootless_link_rejects_over_a_real_quic_connection`; an in-memory
+        // duplex delivers every write instantly, so the duplex tests are
+        // structurally blind to this — the same blind spot as task 6.7.)
+        // `stopped()` after `finish()` resolves once the peer acknowledges
+        // receipt of all stream data; the timeout bounds a peer that never
+        // reads, so it can't pin this accept task forever.
+        let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+        Ok(())
     }
 }
 
@@ -680,6 +694,60 @@ mod tests {
             Frame::LinkReject { reason } => assert!(reason.contains("no root secret"), "{reason}"),
             other => panic!("expected LinkReject, got {other:?}"),
         }
+    }
+
+    /// Real-transport smoke test for the rootless accept path — the sibling
+    /// of `link_handshake_completes_over_a_real_quic_connection` above, for
+    /// what an already-linked device (`azula mailbox`) answers on this ALPN.
+    /// The duplex tests around it cover the frame logic; this one pins the
+    /// transport property: a dialer that opens a bi-stream and writes gets
+    /// the `LinkReject` back over a real connection. The dialer here sends a
+    /// `LinkHello` after its priming newline so the acceptor replies
+    /// immediately — a production granting dialer sends only the newline and
+    /// would sit out `run_rootless_session`'s 5 s read timeout first, which
+    /// proves nothing extra and would slow the suite.
+    #[tokio::test]
+    async fn rootless_link_rejects_over_a_real_quic_connection() {
+        use iroh::endpoint::presets;
+        use iroh::protocol::Router;
+        use iroh::Endpoint;
+        use tokio::time::timeout;
+
+        // ── Already-linked device (accept side), wired as `azula mailbox` ──
+        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server endpoint bind");
+        let server_addr = server_ep.addr();
+        let router = Router::builder(server_ep).accept(LINK_ALPN, RootlessLinkHandler).spawn();
+
+        // ── Dialer (plays the root-holding app's side) ─────────────────────
+        let client_ep = Endpoint::bind(presets::Minimal).await.expect("client endpoint bind");
+        let conn = client_ep.connect(server_addr, LINK_ALPN).await.expect("client connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+
+        // The dialer's priming newline — without a write here the acceptor's
+        // `accept_bi()` never resolves (LINK_ALPN's transport note, task 6.7).
+        send.write_all(b"\n").await.expect("priming newline");
+        write_frame(
+            &mut send,
+            &Frame::LinkHello { device_pk: "abcd".into(), name: "someone".into(), roles: 0 },
+        )
+        .await
+        .expect("write hello");
+
+        let mut reader = BufReader::new(recv);
+        let reply = timeout(Duration::from_secs(30), read_frame(&mut reader))
+            .await
+            .expect("timed out waiting for LinkReject over a real connection")
+            .expect("read LinkReject")
+            .expect("stream closed before LinkReject");
+        match reply {
+            Frame::LinkReject { reason } => assert!(reason.contains("no root secret"), "{reason}"),
+            other => panic!("expected LinkReject, got {other:?}"),
+        }
+
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        let _ = router.shutdown().await;
+        client_ep.close().await;
     }
 
     #[tokio::test]

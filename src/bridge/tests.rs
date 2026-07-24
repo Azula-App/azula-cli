@@ -493,6 +493,14 @@ async fn bridge_to_bridge_relay() {
 /// when the device reconnects. Uses in-memory duplex for the flush path.
 #[tokio::test]
 async fn offline_queue_then_flush() {
+    // Holds ENV_TEST_LOCK for the whole body — see its doc comment: this test
+    // mutates the process-global AZULA_MAILBOX_DIR, which
+    // `reconnect_by_node_id_flushes_mailbox` also mutates (both queue frames
+    // for a device named "phone"), and cargo test runs them concurrently by
+    // default — unguarded, either test's `has_pending("phone")` can resolve
+    // against the other's directory, or lose the var to the other's cleanup.
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+
     // Set a unique mailbox dir for this test so it doesn't interfere with others.
     let mbox_dir = std::env::temp_dir()
         .join(format!("azula-bridge-test-{}", std::process::id()))
@@ -685,6 +693,12 @@ async fn match_known_device_by_node_id() {
 /// and flush the offline mailbox.
 #[tokio::test]
 async fn reconnect_by_node_id_flushes_mailbox() {
+    // Holds ENV_TEST_LOCK for the whole body — see its doc comment: this test
+    // mutates the process-global AZULA_MAILBOX_DIR, which
+    // `offline_queue_then_flush` also mutates (both queue frames for a device
+    // named "phone"), and cargo test runs them concurrently by default.
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+
     // Unique mailbox dir for this test.
     let mbox_dir = std::env::temp_dir()
         .join(format!("azula-bridge-test-{}-reconnect", std::process::id()));

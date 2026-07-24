@@ -618,6 +618,115 @@ mod tests {
         );
     }
 
+    /// Real-transport smoke test, following
+    /// `link::tests::link_handshake_completes_over_a_real_quic_connection`
+    /// (the task-6.7 regression guard): the duplex tests above are blind to
+    /// QUIC stream-establishment semantics — a real connection does not
+    /// surface a freshly opened bi-stream to the acceptor until the dialer
+    /// writes bytes on it. On this ALPN the dialer speaks first (its
+    /// `Hello`), which is also what lets [`ChatHandler`]'s `accept_bi()`
+    /// resolve at all — but the acceptor's first *frame-level* action is a
+    /// read (`gate_peer`), so only a real-two-endpoint run proves the wiring
+    /// isn't deadlock-shaped. Two real iroh endpoints, the same handler
+    /// `azula mailbox` binds, a certified peer dialing in: the mailbox's
+    /// announce `Hello` comes back and the `Chat` lands as a `message_in`
+    /// entry. Edge cases stay on the fast duplex tests.
+    #[tokio::test]
+    async fn chat_session_stores_a_message_over_a_real_quic_connection() {
+        use std::time::Duration;
+
+        use iroh::endpoint::presets;
+        use iroh::Endpoint;
+        use tokio::time::timeout;
+
+        let mailbox_root = SecretKey::from_bytes(&seed(0x30));
+        let mailbox_device = SecretKey::from_bytes(&seed(0x31));
+        let mailbox_cert = make_cert(&mailbox_root, &mailbox_device, "mailbox");
+
+        let peer_root = SecretKey::from_bytes(&seed(0x32));
+        let peer_device = SecretKey::from_bytes(&seed(0x33));
+        let peer_cert = make_cert(&peer_root, &peer_device, "phone");
+
+        let store = LogStore::open(test_dir("quic_chat"), mailbox_root.public()).unwrap();
+
+        // The peer's cert must bind to its *transport* node id
+        // (`accept_gate::check_cert`), so both endpoints are bound with
+        // their device's own secret key rather than a random one.
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(mailbox_device.clone())
+            .bind()
+            .await
+            .expect("server endpoint bind");
+        let server_addr = server_ep.addr();
+        let handler = ChatHandler::new(
+            Arc::new(mailbox_device.clone()),
+            mailbox_cert.encode(),
+            store.clone(),
+            vec![peer_root.public()],
+            vec![],
+            false, // strict: the cert path alone must admit the peer
+        );
+        let router = Router::builder(server_ep).accept(CHAT_ALPN, handler).spawn();
+
+        let client_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(peer_device.clone())
+            .bind()
+            .await
+            .expect("client endpoint bind");
+        let conn = client_ep.connect(server_addr, CHAT_ALPN).await.expect("client connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+
+        write_frame(
+            &mut send,
+            &Frame::Hello { name: "phone".into(), invite: None, cert: Some(peer_cert.encode()) },
+        )
+        .await
+        .expect("write hello");
+        write_frame(&mut send, &Frame::Chat { text: "over real quic".into(), id: None })
+            .await
+            .expect("write chat");
+
+        // The mailbox announces itself back (spec: `Hello.cert` "on every
+        // ALPN in both directions") — the reply reaching us over the real
+        // connection is the session-completed signal.
+        let mut reader = BufReader::new(recv);
+        let announce = timeout(Duration::from_secs(30), read_frame(&mut reader))
+            .await
+            .expect("timed out waiting for the mailbox's announce Hello over a real connection")
+            .expect("read Hello")
+            .expect("stream closed before the mailbox's Hello");
+        match announce {
+            Frame::Hello { cert, .. } => {
+                assert_eq!(cert.as_deref(), Some(mailbox_cert.encode().as_str()))
+            }
+            other => panic!("expected the mailbox's announce Hello, got {other:?}"),
+        }
+
+        // The Chat frame must land as a message_in entry on the mailbox's log.
+        let landed = timeout(Duration::from_secs(30), async {
+            loop {
+                let entries = store.read_from(&mailbox_device.public(), 0).await.unwrap();
+                if !entries.is_empty() {
+                    return entries;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the message to land in the mailbox's store");
+        assert_eq!(landed.len(), 1);
+        assert_eq!(landed[0].kind, Kind::MessageIn);
+        let body: serde_json::Value = serde_json::from_str(&landed[0].body).unwrap();
+        assert_eq!(body["conversation"].as_str().unwrap(), peer_root.public().to_string());
+        assert_eq!(body["from_device_pk"].as_str().unwrap(), peer_device.public().to_string());
+        assert_eq!(body["text"].as_str().unwrap(), "over real quic");
+
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        let _ = router.shutdown().await;
+        client_ep.close().await;
+    }
+
     // --- Headline scenarios (tasks 8.3 / 9.1) -------------------------------
     //
     // These exercise `sync::run_session` + `sync::LogStore` directly (the
