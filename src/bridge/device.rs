@@ -118,7 +118,7 @@ pub(super) async fn connect_device(
     match dial_device(endpoint, ticket).await {
         Ok((mut send, recv)) => {
             // Send hello so the peer can name us (and verify our invite, if any).
-            let hello = Frame::Hello { name: own_name.into(), invite: invite.map(String::from) };
+            let hello = Frame::Hello { name: own_name.into(), invite: invite.map(String::from), cert: None };
             if let Err(e) = write_frame(&mut send, &hello).await {
                 warn!(device=%name, error=%e, "bridge: hello write failed");
                 return false;
@@ -186,7 +186,7 @@ fn push_line(inbox: &Inbox, line: String) {
 /// `[received file: ...]` text line.
 fn push_frame(inbox: &Inbox, transfers: &mut Transfers, frame: Frame) {
     match frame {
-        Frame::Chat { text } => push_line(inbox, text),
+        Frame::Chat { text, .. } => push_line(inbox, text),
         Frame::A2uiAction { action } => {
             push_line(inbox, format!("ui-event: {}", serde_json::to_string(&action).unwrap_or_default()));
         }
@@ -535,7 +535,7 @@ async fn accept_incoming(
     // name (e.g. "Claude"); the app keeps the bridge's peer code as the subtitle.
     // Never to peer bridges. The LLM can refine the title later via `set_name`.
     if from_app {
-        let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone(), invite: None }).await;
+        let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone(), invite: None, cert: None }).await;
     }
 
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));

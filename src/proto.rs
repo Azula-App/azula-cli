@@ -10,9 +10,50 @@
 //! reader/writer. iroh's `RecvStream`/`SendStream` implement the tokio
 //! `AsyncRead`/`AsyncWrite` traits, so they can be used directly.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
+
+// ---------------------------------------------------------------------------
+// Identity bundle (device-linking spec: the payload `LinkGrant` delivers)
+// ---------------------------------------------------------------------------
+
+/// A contact entry inside an [`IdentityBundle`] snapshot: pins either the
+/// contact's root public key (a certified contact) or its legacy node id —
+/// exactly one of the two, never both — plus an optional display name.
+/// Senders are responsible for setting exactly one of `root_pk`/`node_id`;
+/// this is not enforced at the type level, matching `certs.rs`'s convention
+/// of leaving encode-side invariants to the caller.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Contact {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "rootPk")]
+    pub root_pk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "nodeId")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The identity snapshot delivered inside a `LinkGrant` (device-linking
+/// spec: "the grant SHALL deliver the new certificate and an identity
+/// bundle: root public key, all known certificates, revocation set,
+/// contacts snapshot, and a mailbox hint when one exists"). `mailbox` is the
+/// connect ticket of a mailbox-role sibling, when the identity has one —
+/// omitted otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct IdentityBundle {
+    #[serde(rename = "rootPk")]
+    pub root_pk: String,
+    /// `"azd…"`-encoded device certificates (`certs::DeviceCert::encode`).
+    pub certs: Vec<String>,
+    /// `"azr…"`-encoded revocation statements (`certs::Revocation::encode`).
+    pub revocations: Vec<String>,
+    pub contacts: Vec<Contact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox: Option<String>,
+}
 
 /// A single protocol frame. Internally tagged on `"type"` to match the Kotlin
 /// client's sealed `Frame` class.
@@ -25,17 +66,29 @@ pub enum Frame {
     /// sender is dialing in as an unrecognized stranger presenting an invite
     /// (see `invite.rs` / `azula-docs/openspec/specs/invitations/design.md`); omitted between
     /// already-known peers. Old peers omit/ignore this field — no version
-    /// negotiation.
+    /// negotiation. `cert` is the sender's `"azd…"`-encoded device
+    /// certificate, when it has one (multi-device-identity); an invalid cert
+    /// is treated the same as an absent one. Additive/optional so old peers
+    /// that omit it keep working (task 7.1 — wire format only, no
+    /// validation/attach-on-send wiring here).
     #[serde(rename = "hello")]
     Hello {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invite: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cert: Option<String>,
     },
 
-    /// client -> server (LLM prompt) and peer chat
+    /// client -> server (LLM prompt) and peer chat. `id` is 16 random bytes
+    /// as lowercase hex, used for retry deduplication (multi-device-identity,
+    /// task 7.1); additive/optional so old peers that omit it keep working.
     #[serde(rename = "chat")]
-    Chat { text: String },
+    Chat {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 
     /// client -> server (terminal keystrokes / command)
     #[serde(rename = "input")]
@@ -170,6 +223,65 @@ pub enum Frame {
         fetch_ticket: String,
     },
 
+    // -----------------------------------------------------------------
+    // Sync (`azula/sync/0`) and link (`azula/link/0`) frames — see `sync.rs`
+    // and `azula-docs/openspec/changes/multi-device-identity/specs/
+    // {account-sync,device-linking}/spec.md`. These JSON shapes are fixed:
+    // the Kotlin client is written to match them byte-for-byte.
+    // -----------------------------------------------------------------
+
+    /// device -> device (sync ALPN): first frame on a new connection. `cert`
+    /// is the sender's `"azd…"`-encoded device certificate
+    /// (`certs::DeviceCert`). Each side verifies the other's cert — chains
+    /// to its own root key, not revoked, `device_pk` matches the
+    /// connection's transport node id — before any vector or entry
+    /// exchange; any failure closes the connection (see `sync.rs`'s
+    /// `run_session`).
+    #[serde(rename = "sync_hello")]
+    SyncHello { cert: String },
+
+    /// device -> device (sync ALPN): the sender's per-device high-water
+    /// vector — device public key hex to the highest **contiguous** `seq`
+    /// held for that device.
+    #[serde(rename = "sync_vector")]
+    SyncVector { vector: BTreeMap<String, u64> },
+
+    /// device -> device (sync ALPN): a batch of base64-encoded log entries
+    /// (`eventlog::LogEntry::to_base64`/`from_base64`), at most 64 per
+    /// frame, per-device in ascending `seq` order.
+    #[serde(rename = "sync_entries")]
+    SyncEntries { entries: Vec<String> },
+
+    /// device -> device (sync ALPN): acknowledges that the vector exchange
+    /// above is complete. Sent after the last `SyncEntries` batch; entries
+    /// appended afterwards are pushed live as further `SyncEntries` frames
+    /// with no further `SyncVector`/`SyncAck` round trip.
+    #[serde(rename = "sync_ack")]
+    SyncAck { vector: BTreeMap<String, u64> },
+
+    /// new device -> root-holding device (link ALPN): first frame,
+    /// presenting the new device's freshly generated node public key,
+    /// requested display name, and requested roles bitfield (see
+    /// `certs::FLAG_MAILBOX`/`FLAG_BOT`).
+    #[serde(rename = "link_hello")]
+    LinkHello {
+        #[serde(rename = "devicePk")]
+        device_pk: String,
+        name: String,
+        roles: u8,
+    },
+
+    /// root-holding device -> new device (link ALPN): grants a certificate
+    /// plus an [`IdentityBundle`] snapshot. Sent only after explicit user
+    /// confirmation on the root-holding device (device-linking spec).
+    #[serde(rename = "link_grant")]
+    LinkGrant { cert: String, bundle: IdentityBundle },
+
+    /// root-holding device -> new device (link ALPN): the link was declined
+    /// (or otherwise failed) — no certificate exists.
+    #[serde(rename = "link_reject")]
+    LinkReject { reason: String },
+
     /// Any frame type this build doesn't recognize. Forward-compatibility
     /// fallback: an unrecognized "type" tag deserializes into this variant
     /// instead of failing the whole read, so a stream isn't torn down just
@@ -247,16 +359,16 @@ mod tests {
 
     #[test]
     fn hello_frame_roundtrips_with_type_tag() {
-        let f = Frame::Hello { name: "alice".into(), invite: None };
+        let f = Frame::Hello { name: "alice".into(), invite: None, cert: None };
         let json = serde_json::to_string(&f).unwrap();
         assert_eq!(json, r#"{"type":"hello","name":"alice"}"#);
         let back: Frame = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Frame::Hello { name, invite: None } if name == "alice"));
+        assert!(matches!(back, Frame::Hello { name, invite: None, cert: None } if name == "alice"));
     }
 
     #[test]
     fn hello_frame_with_invite_roundtrips() {
-        let f = Frame::Hello { name: "alice".into(), invite: Some("azi...".into()) };
+        let f = Frame::Hello { name: "alice".into(), invite: Some("azi...".into()), cert: None };
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains(r#""invite":"azi...""#), "missing invite: {json}");
         let back: Frame = serde_json::from_str(&json).unwrap();
@@ -268,18 +380,74 @@ mod tests {
         // Old peers omit the field entirely.
         let json = r#"{"type":"hello","name":"bob"}"#;
         let back: Frame = serde_json::from_str(json).unwrap();
-        assert!(matches!(back, Frame::Hello { name, invite: None } if name == "bob"));
+        assert!(matches!(back, Frame::Hello { name, invite: None, cert: None } if name == "bob"));
     }
 
     #[test]
     fn chat_frame_roundtrips_with_type_tag() {
         let f = Frame::Chat {
             text: "hello".into(),
+            id: None,
         };
         let json = serde_json::to_string(&f).unwrap();
         assert_eq!(json, r#"{"type":"chat","text":"hello"}"#);
         let back: Frame = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Frame::Chat { text } if text == "hello"));
+        assert!(matches!(back, Frame::Chat { text, id: None } if text == "hello"));
+    }
+
+    // --- Hello.cert / Chat.id (task 7.1) -------------------------------------
+    // Additive/optional wire fields: omitted when absent, tolerant of legacy
+    // peers that never send them. No cert validation or attach-on-send wiring
+    // here — that's tasks 7.2/7.3/7.4.
+
+    #[test]
+    fn hello_cert_roundtrips() {
+        let f = Frame::Hello { name: "alice".into(), invite: None, cert: Some("azd-mine".into()) };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""cert":"azd-mine""#), "missing cert: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::Hello { cert: Some(c), .. } if c == "azd-mine"));
+    }
+
+    #[test]
+    fn hello_cert_omitted_from_json_when_absent() {
+        let f = Frame::Hello { name: "alice".into(), invite: None, cert: None };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("cert"), "cert should be absent: {json}");
+    }
+
+    #[test]
+    fn hello_without_cert_field_still_parses() {
+        // Legacy-peer compatibility: a frame from a build that doesn't know
+        // about `cert` at all must still parse, with cert defaulting to None.
+        let json = r#"{"type":"hello","name":"bob"}"#;
+        let back: Frame = serde_json::from_str(json).unwrap();
+        assert!(matches!(back, Frame::Hello { name, cert: None, .. } if name == "bob"));
+    }
+
+    #[test]
+    fn chat_id_roundtrips() {
+        let f = Frame::Chat { text: "hi".into(), id: Some("0123456789abcdef0123456789abcdef".into()) };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""id":"0123456789abcdef0123456789abcdef""#), "missing id: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::Chat { id: Some(i), .. } if i == "0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn chat_id_omitted_from_json_when_absent() {
+        let f = Frame::Chat { text: "hi".into(), id: None };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("\"id\""), "id should be absent: {json}");
+    }
+
+    #[test]
+    fn chat_without_id_field_still_parses() {
+        // Legacy-peer compatibility: a frame from a build that doesn't know
+        // about `id` at all must still parse, with id defaulting to None.
+        let json = r#"{"type":"chat","text":"hi"}"#;
+        let back: Frame = serde_json::from_str(json).unwrap();
+        assert!(matches!(back, Frame::Chat { text, id: None } if text == "hi"));
     }
 
     #[test]
@@ -520,6 +688,116 @@ mod tests {
     #[test]
     fn unknown_type_tag_decodes_to_unknown_variant() {
         let json = r#"{"type":"totally_new_frame","foo":"bar"}"#;
+        let f: Frame = serde_json::from_str(json).unwrap();
+        assert!(matches!(f, Frame::Unknown));
+    }
+
+    // --- Sync / link frames (task 5.1) --------------------------------------
+
+    #[test]
+    fn sync_hello_roundtrips_with_type_tag() {
+        let f = Frame::SyncHello { cert: "azd-example-cert".into() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"sync_hello","cert":"azd-example-cert"}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::SyncHello { cert } if cert == "azd-example-cert"));
+    }
+
+    #[test]
+    fn sync_vector_roundtrips_with_type_tag() {
+        let mut vector = BTreeMap::new();
+        vector.insert("aabb".to_string(), 3u64);
+        let f = Frame::SyncVector { vector: vector.clone() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"sync_vector","vector":{"aabb":3}}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::SyncVector { vector: v } if v == vector));
+    }
+
+    #[test]
+    fn sync_entries_roundtrips_with_type_tag() {
+        let f = Frame::SyncEntries { entries: vec!["ZW50cnkx".into(), "ZW50cnky".into()] };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"sync_entries","entries":["ZW50cnkx","ZW50cnky"]}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::SyncEntries { entries } if entries.len() == 2));
+    }
+
+    #[test]
+    fn sync_ack_roundtrips_with_type_tag() {
+        let mut vector = BTreeMap::new();
+        vector.insert("ccdd".to_string(), 7u64);
+        let f = Frame::SyncAck { vector: vector.clone() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"sync_ack","vector":{"ccdd":7}}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::SyncAck { vector: v } if v == vector));
+    }
+
+    #[test]
+    fn link_hello_roundtrips_with_type_tag() {
+        let f = Frame::LinkHello { device_pk: "abcd1234".into(), name: "laptop".into(), roles: 1 };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"link_hello","devicePk":"abcd1234","name":"laptop","roles":1}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            Frame::LinkHello { device_pk, name, roles: 1 } if device_pk == "abcd1234" && name == "laptop"
+        ));
+    }
+
+    #[test]
+    fn link_grant_roundtrips_with_type_tag() {
+        let bundle = IdentityBundle {
+            root_pk: "root-hex".into(),
+            certs: vec!["azd1".into()],
+            revocations: vec![],
+            contacts: vec![Contact { root_pk: Some("contact-root".into()), node_id: None, name: Some("Alice".into()) }],
+            mailbox: Some("mailbox-ticket".into()),
+        };
+        let f = Frame::LinkGrant { cert: "azd-mine".into(), bundle: bundle.clone() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"link_grant","cert":"azd-mine","bundle":{"rootPk":"root-hex","certs":["azd1"],"revocations":[],"contacts":[{"rootPk":"contact-root","name":"Alice"}],"mailbox":"mailbox-ticket"}}"#
+        );
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::LinkGrant { cert, bundle: b } if cert == "azd-mine" && b == bundle));
+    }
+
+    #[test]
+    fn link_grant_bundle_omits_mailbox_and_uses_node_id_contact() {
+        let bundle = IdentityBundle {
+            root_pk: "root-hex".into(),
+            certs: vec![],
+            revocations: vec![],
+            contacts: vec![Contact { root_pk: None, node_id: Some("legacy-node".into()), name: None }],
+            mailbox: None,
+        };
+        let f = Frame::LinkGrant { cert: "azd-mine".into(), bundle };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"link_grant","cert":"azd-mine","bundle":{"rootPk":"root-hex","certs":[],"revocations":[],"contacts":[{"nodeId":"legacy-node"}]}}"#
+        );
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::LinkGrant { .. }));
+    }
+
+    #[test]
+    fn link_reject_roundtrips_with_type_tag() {
+        let f = Frame::LinkReject { reason: "user declined".into() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"link_reject","reason":"user declined"}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::LinkReject { reason } if reason == "user declined"));
+    }
+
+    #[test]
+    fn unrecognized_sync_frame_type_decodes_to_unknown() {
+        // A future sibling introduces a new sync/link frame kind this build
+        // doesn't know about yet — must not error the whole read.
+        let json = r#"{"type":"sync_resync_request","foo":"bar"}"#;
         let f: Frame = serde_json::from_str(json).unwrap();
         assert!(matches!(f, Frame::Unknown));
     }

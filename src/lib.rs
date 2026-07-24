@@ -14,15 +14,21 @@
 //! binaries that used to live here.
 
 pub mod accept_gate;
+pub mod bip39_wordlist;
 pub mod bridge;
+pub mod certs;
 pub mod endpoint;
+pub mod eventlog;
 pub mod filexfer;
 pub mod identity;
 pub mod invite;
 pub mod link;
+pub mod linked_identity;
 pub mod mailbox;
+pub mod mailbox_role;
 pub mod mcp;
 pub mod proto;
 pub mod qr;
 pub mod registry;
+pub mod sync;
 pub mod term;

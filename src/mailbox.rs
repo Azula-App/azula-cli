@@ -150,12 +150,12 @@ mod tests {
     #[test]
     fn persistence_across_fresh_load() {
         let dir = test_dir("persistence");
-        let frames = vec![Frame::Chat { text: "stored".into() }];
+        let frames = vec![Frame::Chat { text: "stored".into(), id: None }];
         enqueue_in(&dir, "dev1", &frames).unwrap();
         // Simulate a fresh load by calling load_in again from the same dir.
         let loaded = load_in(&dir, "dev1");
         assert_eq!(loaded.len(), 1);
-        assert!(matches!(&loaded[0], Frame::Chat { text } if text == "stored"));
+        assert!(matches!(&loaded[0], Frame::Chat { text, .. } if text == "stored"));
     }
 
     #[test]

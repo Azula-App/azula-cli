@@ -15,10 +15,11 @@
 
 use std::time::Duration;
 
-use iroh::EndpointId;
+use iroh::{EndpointId, PublicKey};
 use tokio::io::{AsyncRead, BufReader};
 use tracing::{info, warn};
 
+use crate::certs::{DeviceCert, Revocation};
 use crate::invite;
 use crate::proto::{read_frame, Frame};
 use crate::registry::{self, Device};
@@ -125,6 +126,195 @@ where
     GateOutcome::Admit { replay }
 }
 
+// ---------------------------------------------------------------------------
+// Cert-aware gate (multi-device-identity): the mailbox's accept path
+// ---------------------------------------------------------------------------
+//
+// `gate_stranger` above is untouched (and stays the gate `term.rs`/`mcp.rs`
+// use — those ALPNs have no cert/root concept). `gate_peer` below is an
+// additive extension for ALPNs that understand `Hello.cert`, per
+// `specs/invitations/spec.md`'s "Hello Carries an Optional Device
+// Certificate" and (MODIFIED) "Known Peers Bypass the Invite Gate"
+// requirements: a cert that verifies, isn't revoked, and chains to an
+// already-known contact root is admitted with no invite required at all;
+// anything else (no cert, a cert that fails to decode/verify, one bound to
+// the wrong connection, or a revoked device) is treated exactly as if no
+// cert had been presented and falls through to the ordinary invite path.
+
+/// Inputs needed to check a presented `Hello.cert` against this device's
+/// known contacts and revocations.
+pub struct CertGate<'a> {
+    /// Root public keys already accepted as contacts.
+    pub known_roots: &'a [PublicKey],
+    /// Already-verified revocation statements this device holds (same
+    /// contract as `certs::DeviceCert::is_revoked_by`: callers must have
+    /// verified each one themselves).
+    pub revocations: &'a [Revocation],
+}
+
+/// Outcome of checking one presented `Hello.cert` (if any) against a
+/// [`CertGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertCheck {
+    /// The cert verifies, binds to this connection, isn't revoked, and its
+    /// root is already a known contact — known by root match, no invite
+    /// needed (spec: "A contact's new device is known by root").
+    KnownByRoot { root_pk: PublicKey },
+    /// The cert verifies, binds to this connection, and isn't revoked, but
+    /// its root is not (yet) a known contact — falls through to the
+    /// ordinary invite path; if that admits the connection, its root should
+    /// be recorded as a new contact (spec: "Accepting a certified stranger
+    /// pins the root").
+    CertifiedStranger { root_pk: PublicKey },
+    /// No cert was presented, it failed to decode/verify, didn't bind to
+    /// this connection (transport node id != the cert's device key), or its
+    /// device key has been revoked — every one of these is treated exactly
+    /// as if the field were absent (spec: "a certificate that fails
+    /// verification SHALL be treated exactly as if the field were absent");
+    /// a revoked device is folded in here rather than given a distinct
+    /// outcome because the observable behavior the spec asks for is
+    /// identical either way — "SHALL NOT be treated as known and SHALL fall
+    /// through to the stranger path".
+    Absent,
+}
+
+/// Check a presented `Hello.cert` (`"azd…"`, or `None`) against `gate`, for
+/// a connection whose transport peer id is `connection_node_id`.
+pub fn check_cert(cert: Option<&str>, connection_node_id: EndpointId, gate: &CertGate<'_>) -> CertCheck {
+    let Some(cert_str) = cert else { return CertCheck::Absent };
+    let Ok(cert) = DeviceCert::decode(cert_str) else { return CertCheck::Absent };
+    if cert.verify().is_err() {
+        return CertCheck::Absent;
+    }
+    if !cert.binds_to_connection(connection_node_id) {
+        return CertCheck::Absent;
+    }
+    if cert.is_revoked_by(gate.revocations) {
+        return CertCheck::Absent;
+    }
+    if gate.known_roots.contains(&cert.root_pk) {
+        CertCheck::KnownByRoot { root_pk: cert.root_pk }
+    } else {
+        CertCheck::CertifiedStranger { root_pk: cert.root_pk }
+    }
+}
+
+/// Outcome of gating a peer's first stream through the cert-aware path.
+pub enum GatePeerOutcome {
+    /// Admit the connection. `replay` is a frame already consumed off the
+    /// stream that the caller must still process (mirrors
+    /// [`GateOutcome::Admit`]). `root_pk` is set whenever this connection is
+    /// now associated with a certified root — whether it was already known,
+    /// or a certified stranger the invite path just admitted, whose root the
+    /// caller should now record as a contact.
+    Admit { replay: Option<Box<Frame>>, root_pk: Option<PublicKey> },
+    Close,
+}
+
+/// Gate a peer's first stream for an ALPN that understands `Hello.cert`
+/// (the mailbox's chat ALPN). A cert that verifies, binds to this
+/// connection, isn't revoked, and chains to an already-known contact root is
+/// admitted immediately — no invite required. Otherwise (no cert, an
+/// invalid one, one bound to the wrong connection, a revoked one, or a valid
+/// but not-yet-known root) this falls through to exactly the same
+/// invite-verification rules [`gate_stranger`] uses.
+#[allow(clippy::too_many_arguments)]
+pub async fn gate_peer<R>(
+    reader: &mut BufReader<R>,
+    my_node_id: EndpointId,
+    remote_node_id: EndpointId,
+    allow_legacy: bool,
+    remote: &str,
+    device_name: &str,
+    component: &str,
+    cert_gate: &CertGate<'_>,
+) -> GatePeerOutcome
+where
+    R: AsyncRead + Unpin,
+{
+    let first = match tokio::time::timeout(STRANGER_HELLO_TIMEOUT, read_frame(reader)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            info!(%remote, component, "peer's first frame timed out; closing");
+            return GatePeerOutcome::Close;
+        }
+    };
+
+    let (cert_field, invite_field) = match &first {
+        Ok(Some(Frame::Hello { cert, invite, .. })) => (cert.clone(), invite.clone()),
+        _ => (None, None),
+    };
+
+    let cert_check = check_cert(cert_field.as_deref(), remote_node_id, cert_gate);
+    if let CertCheck::KnownByRoot { root_pk } = cert_check {
+        info!(%remote, component, %root_pk, "peer known by certified root match; admitting without an invite");
+        return GatePeerOutcome::Admit { replay: replay_of(first), root_pk: Some(root_pk) };
+    }
+
+    let verified = match invite_field {
+        Some(tok) => match invite::verify_inbound(&tok, my_node_id, &my_node_id) {
+            Ok(v) => {
+                info!(%remote, component, invite_id = %v.invite_id, "peer presented a valid invite");
+                Some(v)
+            }
+            Err(e) if allow_legacy => {
+                warn!(%remote, component, error = %e, "invite verification failed; admitting as unverified (--allow-legacy)");
+                None
+            }
+            Err(e) => {
+                warn!(%remote, component, error = %e, "invite verification failed; closing (pass --allow-legacy to admit anyway)");
+                return GatePeerOutcome::Close;
+            }
+        },
+        None if allow_legacy => {
+            info!(%remote, component, "peer connected without an invite; admitting as unverified (--allow-legacy)");
+            None
+        }
+        None => {
+            warn!(%remote, component, "peer connected without a valid invite; closing (pass --allow-legacy to admit anyway)");
+            return GatePeerOutcome::Close;
+        }
+    };
+
+    if let Some(v) = &verified {
+        let device = Device {
+            name: device_name.to_string(),
+            ticket: remote.to_string(),
+            added_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            invite: None,
+        };
+        if let Err(e) = registry::add(device, false) {
+            warn!(%remote, component, error = %e, "failed to register invite-verified peer");
+        }
+        if v.single_use {
+            if let Err(e) = invite::mark_consumed(&v.invite_id) {
+                warn!(%remote, component, error = %e, "failed to mark invite consumed");
+            }
+        }
+    }
+
+    let root_pk = match cert_check {
+        CertCheck::CertifiedStranger { root_pk } => Some(root_pk),
+        _ => None,
+    };
+    GatePeerOutcome::Admit { replay: replay_of(first), root_pk }
+}
+
+/// Shared by [`gate_peer`]: a non-`Hello` first frame must be replayed into
+/// the session so it isn't lost; a `Hello` is fully consumed by the gate.
+fn replay_of(first: anyhow::Result<Option<Frame>>) -> Option<Box<Frame>> {
+    match first {
+        Ok(Some(Frame::Hello { .. })) => None,
+        Ok(Some(other)) => Some(Box::new(other)),
+        Ok(None) | Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,9 +331,12 @@ mod tests {
         let node_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
-        write_frame(&mut writer, &Frame::Hello { name: "peer".into(), invite: Some("azi-not-a-real-token".into()) })
-            .await
-            .unwrap();
+        write_frame(
+            &mut writer,
+            &Frame::Hello { name: "peer".into(), invite: Some("azi-not-a-real-token".into()), cert: None },
+        )
+        .await
+        .unwrap();
 
         let outcome = gate_stranger(&mut buf_reader, node_id, false, "remote-invalid", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
@@ -154,9 +347,12 @@ mod tests {
         let node_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
-        write_frame(&mut writer, &Frame::Hello { name: "peer".into(), invite: Some("azi-not-a-real-token".into()) })
-            .await
-            .unwrap();
+        write_frame(
+            &mut writer,
+            &Frame::Hello { name: "peer".into(), invite: Some("azi-not-a-real-token".into()), cert: None },
+        )
+        .await
+        .unwrap();
 
         let outcome = gate_stranger(&mut buf_reader, node_id, true, "remote-invalid-legacy", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Admit { replay: None }));
@@ -169,7 +365,7 @@ mod tests {
         let mut buf_reader = BufReader::new(reader);
         // A legacy client that never sends Hello at all — its first real
         // frame arrives directly.
-        write_frame(&mut writer, &Frame::Chat { text: "hi".into() }).await.unwrap();
+        write_frame(&mut writer, &Frame::Chat { text: "hi".into(), id: None }).await.unwrap();
 
         let outcome = gate_stranger(&mut buf_reader, node_id, false, "remote-none", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
@@ -180,13 +376,13 @@ mod tests {
         let node_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
-        write_frame(&mut writer, &Frame::Chat { text: "hi".into() }).await.unwrap();
+        write_frame(&mut writer, &Frame::Chat { text: "hi".into(), id: None }).await.unwrap();
 
         let outcome = gate_stranger(&mut buf_reader, node_id, true, "remote-none-legacy", "peer-device", "test").await;
         match outcome {
             GateOutcome::Admit { replay } => {
                 assert!(
-                    matches!(replay.as_deref(), Some(Frame::Chat { text }) if text == "hi"),
+                    matches!(replay.as_deref(), Some(Frame::Chat { text, .. }) if text == "hi"),
                     "the stranger's first real frame must be replayed, not dropped"
                 );
             }
@@ -242,10 +438,306 @@ mod tests {
 
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
-        write_frame(&mut writer, &Frame::Hello { name: "peer".into(), invite: Some(token) }).await.unwrap();
+        write_frame(&mut writer, &Frame::Hello { name: "peer".into(), invite: Some(token), cert: None }).await.unwrap();
 
         let outcome = gate_stranger(&mut buf_reader, node_id, false, "remote-valid", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Admit { replay: None }));
+
+        std::env::remove_var("AZULA_INVITES_DIR");
+    }
+
+    // --- check_cert / gate_peer (task 8.2: cert-aware accept-gate parity) --
+
+    fn seed(start: u8) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = start.wrapping_add(i as u8);
+        }
+        s
+    }
+
+    fn cert_gate_root_secret() -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&seed(0x00))
+    }
+    fn cert_gate_device_secret() -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&seed(0x20))
+    }
+
+    fn make_cert(root: &iroh::SecretKey, device: &iroh::SecretKey) -> DeviceCert {
+        let mut cert = DeviceCert {
+            version: 1,
+            flags: 0,
+            root_pk: root.public(),
+            device_pk: device.public(),
+            issued_at: 1_767_225_600,
+            expires_at: 0,
+            name: "peer".to_string(),
+            signature: [0u8; 64],
+        };
+        cert.sign(root);
+        cert
+    }
+
+    #[test]
+    fn check_cert_admits_a_known_root() {
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let cert = make_cert(&root, &device);
+        let known_roots = [root.public()];
+        let gate = CertGate { known_roots: &known_roots, revocations: &[] };
+
+        let outcome = check_cert(Some(&cert.encode()), device.public(), &gate);
+        assert_eq!(outcome, CertCheck::KnownByRoot { root_pk: root.public() });
+    }
+
+    #[test]
+    fn check_cert_reports_certified_stranger_when_root_not_yet_known() {
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let cert = make_cert(&root, &device);
+        let gate = CertGate { known_roots: &[], revocations: &[] };
+
+        let outcome = check_cert(Some(&cert.encode()), device.public(), &gate);
+        assert_eq!(outcome, CertCheck::CertifiedStranger { root_pk: root.public() });
+    }
+
+    #[test]
+    fn check_cert_treats_a_revoked_device_as_absent_even_for_a_known_root() {
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let cert = make_cert(&root, &device);
+        let mut revocation = Revocation {
+            version: 1,
+            root_pk: root.public(),
+            device_pk: device.public(),
+            revoked_at: 1_767_225_600,
+            signature: [0u8; 64],
+        };
+        revocation.sign(&root);
+        let known_roots = [root.public()];
+        let revocations = [revocation];
+        let gate = CertGate { known_roots: &known_roots, revocations: &revocations };
+
+        let outcome = check_cert(Some(&cert.encode()), device.public(), &gate);
+        assert_eq!(outcome, CertCheck::Absent);
+    }
+
+    #[test]
+    fn check_cert_treats_a_bad_signature_as_absent() {
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let mut cert = make_cert(&root, &device);
+        cert.signature[0] ^= 0xff;
+        let known_roots = [root.public()];
+        let gate = CertGate { known_roots: &known_roots, revocations: &[] };
+
+        let outcome = check_cert(Some(&cert.encode()), device.public(), &gate);
+        assert_eq!(outcome, CertCheck::Absent);
+    }
+
+    #[test]
+    fn check_cert_treats_a_wrong_connection_binding_as_absent() {
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let cert = make_cert(&root, &device);
+        let known_roots = [root.public()];
+        let gate = CertGate { known_roots: &known_roots, revocations: &[] };
+
+        // The presented cert's device_pk doesn't match this connection's
+        // transport node id.
+        let someone_else = iroh::SecretKey::from_bytes(&seed(0x40)).public();
+        let outcome = check_cert(Some(&cert.encode()), someone_else, &gate);
+        assert_eq!(outcome, CertCheck::Absent);
+    }
+
+    #[test]
+    fn check_cert_treats_absent_field_as_absent() {
+        let gate = CertGate { known_roots: &[], revocations: &[] };
+        let outcome = check_cert(None, cert_gate_device_secret().public(), &gate);
+        assert_eq!(outcome, CertCheck::Absent);
+    }
+
+    #[tokio::test]
+    async fn gate_peer_admits_a_known_cert_root_with_no_invite_needed() {
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let cert = make_cert(&root, &device);
+        let my_node_id = iroh::SecretKey::generate().public();
+        let known_roots = [root.public()];
+        let gate = CertGate { known_roots: &known_roots, revocations: &[] };
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut buf_reader = BufReader::new(reader);
+        write_frame(
+            &mut writer,
+            &Frame::Hello { name: "peer".into(), invite: None, cert: Some(cert.encode()) },
+        )
+        .await
+        .unwrap();
+
+        // allow_legacy: false and no invite at all -- only the root match
+        // can admit this connection.
+        let outcome = gate_peer(
+            &mut buf_reader,
+            my_node_id,
+            device.public(),
+            false,
+            "remote-known-root",
+            "peer-device",
+            "test",
+            &gate,
+        )
+        .await;
+        match outcome {
+            GatePeerOutcome::Admit { replay: None, root_pk: Some(r) } => assert_eq!(r, root.public()),
+            _ => panic!("expected Admit{{root_pk: Some}}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_peer_falls_through_to_stranger_path_for_a_revoked_device_and_closes_without_invite() {
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let cert = make_cert(&root, &device);
+        let mut revocation = Revocation {
+            version: 1,
+            root_pk: root.public(),
+            device_pk: device.public(),
+            revoked_at: 1_767_225_600,
+            signature: [0u8; 64],
+        };
+        revocation.sign(&root);
+        let my_node_id = iroh::SecretKey::generate().public();
+        let known_roots = [root.public()];
+        let revocations = [revocation];
+        let gate = CertGate { known_roots: &known_roots, revocations: &revocations };
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut buf_reader = BufReader::new(reader);
+        write_frame(
+            &mut writer,
+            &Frame::Hello { name: "peer".into(), invite: None, cert: Some(cert.encode()) },
+        )
+        .await
+        .unwrap();
+
+        // Revoked -> not treated as known -> falls to the stranger path;
+        // strict (no --allow-legacy) and no invite -> closed. This is the
+        // spec's "Revoked device does not ride the root match" scenario.
+        let outcome = gate_peer(
+            &mut buf_reader,
+            my_node_id,
+            device.public(),
+            false,
+            "remote-revoked",
+            "peer-device",
+            "test",
+            &gate,
+        )
+        .await;
+        assert!(matches!(outcome, GatePeerOutcome::Close));
+    }
+
+    #[tokio::test]
+    async fn gate_peer_never_trusts_an_invalid_cert_but_still_admits_via_a_valid_invite() {
+        // Holds ENV_TEST_LOCK for the whole body — touches the real
+        // issued-invite store, same convention as `valid_invite_admits_with_no_replay`.
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let base = std::env::temp_dir()
+            .join(format!("azula-accept-gate-test-{}", std::process::id()))
+            .join("gate_peer_invalid_cert");
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("AZULA_INVITES_DIR", base.join("invites"));
+
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let mut cert = make_cert(&root, &device);
+        cert.signature[0] ^= 0xff; // invalid signature
+        let known_roots = [root.public()]; // even though the root would be known...
+        let gate = CertGate { known_roots: &known_roots, revocations: &[] };
+
+        let my_secret = iroh::SecretKey::generate();
+        let my_node_id = my_secret.public();
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(my_node_id)).to_string();
+        let (payload, _) =
+            invite::mint(&ticket_str, invite::Expiry::Never, false, false, None, &my_secret).unwrap();
+        let token = payload.encode();
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut buf_reader = BufReader::new(reader);
+        write_frame(
+            &mut writer,
+            &Frame::Hello { name: "peer".into(), invite: Some(token), cert: Some(cert.encode()) },
+        )
+        .await
+        .unwrap();
+
+        let outcome = gate_peer(
+            &mut buf_reader,
+            my_node_id,
+            device.public(),
+            false,
+            "remote-invalid-cert",
+            "peer-device",
+            "test",
+            &gate,
+        )
+        .await;
+        // Admitted via the invite, NOT via the (invalid) cert -- so no root
+        // is reported.
+        match outcome {
+            GatePeerOutcome::Admit { replay: None, root_pk: None } => {}
+            _ => panic!("expected Admit{{root_pk: None}} (admitted by invite, not by the untrusted cert)"),
+        }
+
+        std::env::remove_var("AZULA_INVITES_DIR");
+    }
+
+    #[tokio::test]
+    async fn gate_peer_admits_a_certified_stranger_via_invite_and_reports_its_root() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let base = std::env::temp_dir()
+            .join(format!("azula-accept-gate-test-{}", std::process::id()))
+            .join("gate_peer_certified_stranger");
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("AZULA_INVITES_DIR", base.join("invites"));
+
+        let root = cert_gate_root_secret();
+        let device = cert_gate_device_secret();
+        let cert = make_cert(&root, &device);
+        let gate = CertGate { known_roots: &[], revocations: &[] }; // root not yet known
+
+        let my_secret = iroh::SecretKey::generate();
+        let my_node_id = my_secret.public();
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(my_node_id)).to_string();
+        let (payload, _) =
+            invite::mint(&ticket_str, invite::Expiry::Never, false, false, None, &my_secret).unwrap();
+        let token = payload.encode();
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut buf_reader = BufReader::new(reader);
+        write_frame(
+            &mut writer,
+            &Frame::Hello { name: "peer".into(), invite: Some(token), cert: Some(cert.encode()) },
+        )
+        .await
+        .unwrap();
+
+        let outcome = gate_peer(
+            &mut buf_reader,
+            my_node_id,
+            device.public(),
+            false,
+            "remote-certified-stranger",
+            "peer-device",
+            "test",
+            &gate,
+        )
+        .await;
+        match outcome {
+            GatePeerOutcome::Admit { replay: None, root_pk: Some(r) } => assert_eq!(r, root.public()),
+            _ => panic!("expected Admit{{root_pk: Some}} (a certified stranger admitted by invite pins its root)"),
+        }
 
         std::env::remove_var("AZULA_INVITES_DIR");
     }

@@ -526,7 +526,7 @@ impl AzulaBridge {
         let conn = match self.ensure_device(&args.device).await {
             Ok(c) => c,
             Err(_) => {
-                mailbox::enqueue(&args.device, &[Frame::Chat { text: args.text.clone() }]);
+                mailbox::enqueue(&args.device, &[Frame::Chat { text: args.text.clone(), id: None }]);
                 return Ok(CallToolResult::success(vec![Content::text(format!(
                     "queued for delivery to '{}' (offline)", args.device
                 ))]));
@@ -550,7 +550,7 @@ impl AzulaBridge {
                 if let Some(send) = send_guard.as_mut() {
                     let _ = write_frame(
                         send,
-                        &Frame::Chat { text: "[conversation ended: turn limit]".into() },
+                        &Frame::Chat { text: "[conversation ended: turn limit]".into(), id: None },
                     )
                     .await;
                 }
@@ -566,12 +566,12 @@ impl AzulaBridge {
         {
             let mut send_guard = conn.send.lock().await;
             let Some(send) = send_guard.as_mut() else {
-                mailbox::enqueue(&args.device, &[Frame::Chat { text: args.text.clone() }]);
+                mailbox::enqueue(&args.device, &[Frame::Chat { text: args.text.clone(), id: None }]);
                 return Ok(CallToolResult::success(vec![Content::text(format!(
                     "queued for delivery to '{}' (offline)", args.device
                 ))]));
             };
-            if let Err(e) = write_frame(send, &Frame::Chat { text: args.text }).await {
+            if let Err(e) = write_frame(send, &Frame::Chat { text: args.text, id: None }).await {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "failed to send to '{}': {e}",
                     args.device
@@ -581,6 +581,7 @@ impl AzulaBridge {
             if args.done == Some(true) {
                 let closing = Frame::Chat {
                     text: format!("[conversation ended by {}]", self.own_name),
+                    id: None,
                 };
                 let _ = write_frame(send, &closing).await;
             }

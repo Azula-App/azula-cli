@@ -11,14 +11,20 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use iroh::endpoint::presets;
 use iroh::protocol::Router;
+use iroh_tickets::endpoint::EndpointTicket;
+use iroh_tickets::Ticket as _;
 use tracing::{info, warn};
 
+use azula::certs::{self, FLAG_MAILBOX};
 use azula::invite::{self, Expiry};
-use azula::link::{self, Parsed};
+use azula::link::{self, LinkHandler, LinkOutcome, Parsed};
+use azula::linked_identity::{self, LinkedIdentity, NODE_IDENTITY_NAME};
 use azula::mcp::{self, LlmHandler, McpConfig, McpTransport, LLM_ALPN};
+use azula::proto::IdentityBundle;
 use azula::term::{TermHandler, TERM_ALPN};
-use azula::{bridge, endpoint, qr, registry};
+use azula::{bridge, endpoint, mailbox_role, qr, registry};
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -52,6 +58,36 @@ enum Command {
     Invite(InviteCliArgs),
     /// List all invites this node has issued.
     Invites,
+    /// Link this CLI as a new device of an existing multi-device identity:
+    /// print an `azl…` QR/string for a root-holding device to scan, then
+    /// wait for it to grant a certificate.
+    Link(LinkArgs),
+    /// Serve the mailbox role for a linked identity (see `azula link`):
+    /// store-and-forward + bootstrap sync, long-running.
+    Mailbox(MailboxArgs),
+}
+
+/// Options for `azula link`.
+#[derive(Debug, Clone, clap::Args)]
+struct LinkArgs {
+    /// Display name to present to the root-holding device. Defaults to this
+    /// machine's hostname.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Request the mailbox role — the root-holding device's confirmation UI
+    /// shows this before granting.
+    #[arg(long)]
+    mailbox: bool,
+}
+
+/// Options for `azula mailbox`.
+#[derive(Debug, Clone, clap::Args)]
+struct MailboxArgs {
+    /// Admit invite-less unverified strangers instead of closing the
+    /// connection (same convention as `serve`/`serve-mcp`).
+    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
+    allow_legacy: bool,
 }
 
 /// Options for the `serve-mcp` command (the MCP↔iroh bridge).
@@ -299,6 +335,8 @@ async fn main() -> Result<()> {
             None => cmd_invite_mint(args.mint).await,
         },
         Some(Command::Invites) => cmd_invites(),
+        Some(Command::Link(args)) => cmd_link(args).await,
+        Some(Command::Mailbox(args)) => mailbox_role::run(args.allow_legacy).await,
         None => serve(cli.serve).await,
     }
 }
@@ -497,6 +535,107 @@ fn cmd_invite_revoke(args: InviteRevokeArgs) -> Result<()> {
     Ok(())
 }
 
+/// `azula link`: generate (or reuse) the `"link"`-named persisted node key
+/// (kept separate from `serve`/`bridge`/`blackjack`'s own identities — see
+/// `identity::load_or_create_secret`), print the `azl…` payload as a
+/// terminal QR and copyable string, accept the inbound `azula/link/0` dial,
+/// and persist whatever the root-holding device grants (or nothing, on
+/// `LinkReject`).
+async fn cmd_link(args: LinkArgs) -> Result<()> {
+    let secret = azula::identity::load_or_create_secret(NODE_IDENTITY_NAME);
+    let endpoint = iroh::Endpoint::builder(presets::N0).secret_key(secret).bind().await?;
+    info!("bringing endpoint online…");
+    endpoint.online().await;
+    let device_pk = endpoint.id();
+
+    let name = args.name.clone().unwrap_or_else(default_link_name);
+    let roles = if args.mailbox { FLAG_MAILBOX } else { 0 };
+
+    let ticket = EndpointTicket::new(endpoint.addr());
+    let payload = certs::LinkPayload::new(device_pk, name.clone(), ticket.encode_bytes());
+    let encoded = payload.encode();
+
+    println!();
+    println!("  Scan this on the device that already holds your identity");
+    println!("  (or paste the string there):");
+    println!();
+    println!("  {encoded}");
+    println!();
+    println!("{}", qr::render_qr(&encoded));
+    println!("  Waiting for it to connect… (Ctrl-C to cancel)");
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let handler = LinkHandler::new(device_pk, name, roles, result_tx);
+    let router = Router::builder(endpoint).accept(link::LINK_ALPN, handler).spawn();
+
+    let outcome = tokio::select! {
+        outcome = result_rx => outcome.context("link: session ended without a result")?,
+        _ = tokio::signal::ctrl_c() => {
+            router.shutdown().await?;
+            println!("Cancelled — nothing was saved.");
+            return Ok(());
+        }
+    };
+    router.shutdown().await?;
+
+    match outcome {
+        LinkOutcome::Granted { cert, bundle } => match verify_granted_cert(&cert, device_pk, &bundle) {
+            Ok(()) => {
+                linked_identity::save(&LinkedIdentity { cert, bundle })?;
+                println!();
+                println!("Linked! Certificate and identity bundle saved.");
+                println!("Run `azula mailbox` to serve this identity's mailbox role from this machine.");
+            }
+            Err(e) => {
+                println!();
+                println!("Link request was granted, but the certificate did not check out ({e}); nothing was saved.");
+            }
+        },
+        LinkOutcome::Rejected { reason } => {
+            println!();
+            println!("Link request was declined: {reason}");
+            println!("Nothing was saved.");
+        }
+    }
+    Ok(())
+}
+
+/// Verify a freshly granted certificate before persisting it, per
+/// `specs/device-linking/spec.md`'s "Certificate Verification Is
+/// Self-Contained" and "Revocation Statements Invalidate Certificates": it
+/// must verify (signature + expiry), its `device_pk` must equal this
+/// device's own freshly generated key (a `LinkGrant` should always name us,
+/// never a different device), and it must not already be revoked per the
+/// accompanying bundle's own revocation set. Catches a malformed or
+/// already-revoked grant immediately, rather than silently persisting it
+/// and only discovering the problem later when `azula mailbox` tries to use
+/// it.
+fn verify_granted_cert(cert_str: &str, device_pk: iroh::PublicKey, bundle: &IdentityBundle) -> Result<()> {
+    let cert = certs::DeviceCert::decode(cert_str).context("certificate is malformed")?;
+    cert.verify().context("certificate failed verification")?;
+    anyhow::ensure!(
+        cert.binds_to_connection(device_pk),
+        "certificate's device key does not match this device's own key"
+    );
+    let revocations = mailbox_role::verified_revocations_from_bundle(bundle);
+    anyhow::ensure!(
+        !cert.is_revoked_by(&revocations),
+        "certificate's device key is already revoked in the accompanying bundle"
+    );
+    Ok(())
+}
+
+/// Default display name for `azula link` when `--name` is omitted: this
+/// machine's hostname, falling back to `"azula-cli"` if empty/unavailable.
+fn default_link_name() -> String {
+    let raw = gethostname::gethostname().to_string_lossy().into_owned();
+    if raw.trim().is_empty() {
+        "azula-cli".to_string()
+    } else {
+        raw
+    }
+}
+
 async fn serve(args: ServeArgs) -> Result<()> {
     // Bind with the n0 defaults (public discovery + relays), reusing a persisted
     // key so the node id (and connect code) stays stable across restarts.
@@ -613,4 +752,98 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // that thread to join. Kill every session's shell so it unblocks.
     azula::term::kill_all_sessions();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azula::certs::DeviceCert;
+    use iroh::SecretKey;
+
+    // Fixed, deterministic seeds -- same convention as certs.rs/sync.rs.
+    fn seed(start: u8) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = start.wrapping_add(i as u8);
+        }
+        s
+    }
+
+    fn make_cert(root: &SecretKey, device: &SecretKey) -> DeviceCert {
+        let mut cert = DeviceCert {
+            version: 1,
+            flags: 0,
+            root_pk: root.public(),
+            device_pk: device.public(),
+            issued_at: 1_767_225_600,
+            expires_at: 0,
+            name: "new-device".to_string(),
+            signature: [0u8; 64],
+        };
+        cert.sign(root);
+        cert
+    }
+
+    fn empty_bundle(root: &SecretKey) -> IdentityBundle {
+        IdentityBundle {
+            root_pk: root.public().to_string(),
+            certs: vec![],
+            revocations: vec![],
+            contacts: vec![],
+            mailbox: None,
+        }
+    }
+
+    #[test]
+    fn verify_granted_cert_accepts_a_valid_unrevoked_grant() {
+        let root = SecretKey::from_bytes(&seed(0x01));
+        let device = SecretKey::from_bytes(&seed(0x02));
+        let cert = make_cert(&root, &device);
+        let bundle = empty_bundle(&root);
+
+        verify_granted_cert(&cert.encode(), device.public(), &bundle).expect("a valid, unrevoked grant passes");
+    }
+
+    #[test]
+    fn verify_granted_cert_rejects_a_malformed_certificate() {
+        let device = SecretKey::from_bytes(&seed(0x03));
+        let bundle = empty_bundle(&SecretKey::from_bytes(&seed(0x04)));
+
+        let err = verify_granted_cert("not-a-real-cert", device.public(), &bundle).unwrap_err();
+        assert!(err.to_string().contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn verify_granted_cert_rejects_a_cert_naming_a_different_device() {
+        let root = SecretKey::from_bytes(&seed(0x05));
+        let granted_device = SecretKey::from_bytes(&seed(0x06));
+        let cert = make_cert(&root, &granted_device);
+        let bundle = empty_bundle(&root);
+
+        // Our own freshly generated device key differs from the cert's.
+        let our_device_pk = SecretKey::from_bytes(&seed(0x07)).public();
+        let err = verify_granted_cert(&cert.encode(), our_device_pk, &bundle).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn verify_granted_cert_rejects_a_cert_already_revoked_in_the_bundle() {
+        let root = SecretKey::from_bytes(&seed(0x08));
+        let device = SecretKey::from_bytes(&seed(0x09));
+        let cert = make_cert(&root, &device);
+
+        let mut revocation = certs::Revocation {
+            version: 1,
+            root_pk: root.public(),
+            device_pk: device.public(),
+            revoked_at: 1_767_225_600,
+            signature: [0u8; 64],
+        };
+        revocation.sign(&root);
+        let mut bundle = empty_bundle(&root);
+        bundle.revocations.push(revocation.encode());
+
+        let err = verify_granted_cert(&cert.encode(), device.public(), &bundle).unwrap_err();
+        assert!(err.to_string().contains("revoked"), "{err}");
+    }
 }

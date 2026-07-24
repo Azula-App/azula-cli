@@ -319,7 +319,7 @@ impl LlmHandler {
             };
 
             match frame {
-                Frame::Chat { text } => {
+                Frame::Chat { text, .. } => {
                     info!(%remote, prompt = %truncate(&text, 80), "llm: prompt");
                     write_frame(&mut send, &Frame::thinking(true)).await?;
 

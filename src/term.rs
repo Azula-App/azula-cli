@@ -1873,7 +1873,7 @@ mod tests {
 
         // ── First stream: Hello, then TermAttach{None} ──────────────────────
         let (mut send, recv) = conn.open_bi().await.expect("open_bi");
-        write_frame(&mut send, &Frame::Hello { name: "client".to_string(), invite: None })
+        write_frame(&mut send, &Frame::Hello { name: "client".to_string(), invite: None, cert: None })
             .await
             .expect("write hello");
         write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write attach");
@@ -1903,7 +1903,7 @@ mod tests {
         // ── Second stream (same connection, still "known"): Hello, then
         // TermAttach{Some(id)} ───────────────────────────────────────────────
         let (mut send2, recv2) = conn.open_bi().await.expect("open_bi reattach");
-        write_frame(&mut send2, &Frame::Hello { name: "client".to_string(), invite: None })
+        write_frame(&mut send2, &Frame::Hello { name: "client".to_string(), invite: None, cert: None })
             .await
             .expect("write hello 2");
         write_frame(&mut send2, &Frame::TermAttach { session: Some(sess.0.clone()) })

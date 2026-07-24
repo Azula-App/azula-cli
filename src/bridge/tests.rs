@@ -36,7 +36,7 @@ async fn reader_surfaces_chat_and_ui_events() {
         read_frames_into(BufReader::new(reader), inbox_reader).await;
     });
 
-    let chat = serde_json::to_string(&Frame::Chat { text: "hello".into() }).unwrap();
+    let chat = serde_json::to_string(&Frame::Chat { text: "hello".into(), id: None }).unwrap();
     let action = serde_json::json!({
         "name": "roll", "surfaceId": "dice-1", "sourceComponentId": "rollBtn", "context": {}
     });
