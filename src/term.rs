@@ -1244,7 +1244,6 @@ async fn bind_attachment(
             // around with no TTL reaper to ever clean it up.
             let _ = session.killer.lock().unwrap().kill();
             sigkill_process_group(session.child_pid);
-        sigkill_process_group(session.child_pid);
             sessions().lock().unwrap().remove(&session.id);
             debug!(%remote, session = %session.id, "term: --session-ttl 0; killed on detach");
         }

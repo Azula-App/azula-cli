@@ -101,10 +101,11 @@ pub(super) struct LinkArgs {
     #[arg(long, value_name = "NAME")]
     name: Option<String>,
 
-    /// Request the mailbox role — the root-holding device's confirmation UI
-    /// shows this before granting.
-    #[arg(long)]
-    mailbox: bool,
+    /// Request the relay role (always-on store-and-forward sibling; the
+    /// root-holding device's confirmation UI shows this before granting).
+    /// `--mailbox` is the deprecated alias for the same role bit.
+    #[arg(long, alias = "mailbox")]
+    relay: bool,
 }
 
 /// Options for the deprecated `azula mailbox` alias.
@@ -422,7 +423,7 @@ pub(super) async fn cmd_link(args: LinkArgs) -> Result<()> {
     let device_pk = endpoint.id();
 
     let name = args.name.clone().unwrap_or_else(default_link_name);
-    let roles = if args.mailbox { FLAG_MAILBOX } else { 0 };
+    let roles = if args.relay { FLAG_MAILBOX } else { 0 };
 
     let ticket = EndpointTicket::new(endpoint.addr());
     let payload = certs::LinkPayload::new(device_pk, name.clone(), ticket.encode_bytes());
