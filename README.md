@@ -20,6 +20,91 @@ The MCP client is built on the official Rust MCP SDK,
 This is a standalone Cargo crate. It is **not** part of the Amper/Kotlin build
 in the rest of the repository.
 
+## Install
+
+Prebuilt binaries, an npm wrapper, and a Homebrew tap all publish from the
+same GitHub Release, cut automatically the first time a `v*` tag is pushed
+(see `.github/workflows/release.yml` and `dist/README.md`). Until that first
+tag exists, none of these channels are live yet — build from source (below)
+in the meantime.
+
+### Homebrew (macOS, Linux)
+
+```sh
+brew install azula-app/azula/azula
+```
+
+### cargo (any platform with a Rust toolchain)
+
+```sh
+cargo install azula
+```
+
+Builds and installs the `azula` binary from the crates.io source package.
+
+### npx (no install — works anywhere Node runs, including the Claude Code
+web container)
+
+```sh
+npx -y azula-cli --version
+```
+
+`azula-cli` is a meta package: it fetches the right prebuilt binary for your
+platform as an npm optional dependency (`@azula-app/cli-darwin-arm64`,
+`-darwin-x64`, `-linux-x64`, or `-linux-arm64`) and execs it. There's nothing
+to install ahead of time — `npx -y azula-cli@<version> …` pins an exact
+release if you don't want to float on latest.
+
+### `mcp.json` — azula as an MCP server
+
+`npx -y azula-cli mcp` works on a machine that has never touched azula
+before, which makes it the most portable way to wire azula into an MCP
+client config:
+
+```jsonc
+{
+  "mcpServers": {
+    "azula": {
+      "command": "npx",
+      "args": ["-y", "azula-cli", "mcp"]
+    }
+  }
+}
+```
+
+If you installed via Homebrew or `cargo install` instead, use
+`"command": "azula", "args": ["mcp"]`.
+
+### Claude Code web container: relay-only (no-UDP) networking
+
+The Claude Code web container's egress is proxied HTTPS only — no raw UDP —
+so iroh's direct QUIC hole-punching path can't connect. Pairing and
+messaging still work, but only over iroh's **relay-over-HTTPS fallback**,
+which means the container's outbound proxy allowlist must permit the n0
+relay hosts iroh dials by default:
+
+| Region  | Hostname                     |
+| ------- | ----------------------------- |
+| NA East | `use1-1.relay.n0.iroh.link`   |
+| NA West | `usw1-1.relay.n0.iroh.link`   |
+| EU      | `euc1-1.relay.n0.iroh.link`   |
+| AP      | `aps1-1.relay.n0.iroh.link`   |
+
+Reached over HTTPS (443). Source:
+[`iroh/src/defaults.rs`](https://github.com/n0-computer/iroh/blob/main/iroh/src/defaults.rs)'s
+`prod` module — verified against `iroh 1.0.0`, the version pinned in
+`Cargo.lock` as of this writing. n0 can add or retire relay nodes between
+iroh releases, so re-check that file (or `cargo tree -p iroh` for the
+locked version, then the matching tag on GitHub) if the pinned iroh version
+changes and pairing from a proxied environment stops working.
+
+If the container's proxy blocks those hosts, azula cannot reach the phone at
+all in that environment — there is no user-controlled-relay fallback in this
+release (see `openspec/changes/cli-multi-session-relay/design.md`, decision
+D8). This constraint is specific to relay-only egress; `azula relay` (the
+always-on relay role) and normal dev-machine usage with UDP egress are
+unaffected.
+
 ## Build
 
 ```sh

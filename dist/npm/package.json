@@ -1,0 +1,31 @@
+{
+  "name": "azula-cli",
+  "version": "0.0.0-dev",
+  "description": "azula CLI — pair, message, and drive the azula p2p app from the command line, and run it as an MCP server (`npx -y azula-cli mcp`).",
+  "homepage": "https://azula.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Azula-App/azula-cli.git"
+  },
+  "license": "MIT OR Apache-2.0",
+  "bin": {
+    "azula": "bin/azula.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "azula",
+    "iroh",
+    "p2p",
+    "mcp",
+    "cli"
+  ]
+}

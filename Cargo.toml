@@ -13,6 +13,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Server-side companion for the azula p2p app: binds an iroh endpoint and serves an LLM relay and a remote-shell bridge over ALPN protocols."
 license = "MIT OR Apache-2.0"
+homepage = "https://azula.app"
+repository = "https://github.com/Azula-App/azula-cli"
+readme = "README.md"
 
 [lints]
 workspace = true

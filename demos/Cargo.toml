@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Standalone demo binaries for the azula p2p app (dice roll-off, Blackjack over A2UI)."
 license = "MIT OR Apache-2.0"
+publish = false
 
 [lints]
 workspace = true
