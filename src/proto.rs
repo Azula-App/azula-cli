@@ -282,6 +282,46 @@ pub enum Frame {
     #[serde(rename = "link_reject")]
     LinkReject { reason: String },
 
+    // -----------------------------------------------------------------
+    // Relay frames (cli-multi-session-relay `relay` capability) — see
+    // `mailbox_role.rs`'s LLM-ALPN admission path and `core::relay_a2ui`.
+    // -----------------------------------------------------------------
+
+    /// phone -> session/machine (sent on the app device's existing chat/LLM
+    /// stream at pairing time): the identity's relay dial ticket, so a
+    /// session that can't reach the phone directly knows where to deliver
+    /// queueable traffic instead (relay spec: "Sessions SHALL learn the
+    /// relay's ticket from a relay hint the phone shares at machine pairing
+    /// time"). Sessions only parse and persist this (`registry::set_relay`) —
+    /// never construct it for sending.
+    #[serde(rename = "relay_hint")]
+    RelayHint { ticket: String },
+
+    /// session -> relay (LLM ALPN): a coalesced full-surface A2UI snapshot,
+    /// replacing whatever the relay previously held for `(conversation,
+    /// surface)`. `components: None` is a tombstone (the surface was
+    /// deleted); `data_model: None` means "no data model to set" (distinct
+    /// from an explicit empty object). `lamport` is a per-session monotonic
+    /// sequence the relay uses to ignore a stale, out-of-order snapshot.
+    #[serde(rename = "a2ui_snapshot")]
+    A2uiSnapshot {
+        conversation: String,
+        surface: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        components: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data_model: Option<serde_json::Value>,
+        lamport: u64,
+    },
+
+    /// relay -> phone (sync ALPN, after catch-up): replay of pending A2UI
+    /// snapshots for one conversation, sent as ordinary A2UI wire messages
+    /// (`createSurface`/`updateComponents`/`updateDataModel`, or
+    /// `deleteSurface` for a tombstone) — the same object shapes
+    /// `Frame::A2ui.message` carries on a live connection.
+    #[serde(rename = "sync_a2ui")]
+    SyncA2ui { conversation: String, messages: Vec<serde_json::Value> },
+
     /// Any frame type this build doesn't recognize. Forward-compatibility
     /// fallback: an unrecognized "type" tag deserializes into this variant
     /// instead of failing the whole read, so a stream isn't torn down just
@@ -800,6 +840,65 @@ mod tests {
         let json = r#"{"type":"sync_resync_request","foo":"bar"}"#;
         let f: Frame = serde_json::from_str(json).unwrap();
         assert!(matches!(f, Frame::Unknown));
+    }
+
+    // --- Relay frames (cli-multi-session-relay relay capability) -----------
+
+    #[test]
+    fn relay_hint_roundtrips_with_type_tag() {
+        let f = Frame::RelayHint { ticket: "relay-ticket-abc".into() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"type":"relay_hint","ticket":"relay-ticket-abc"}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::RelayHint { ticket } if ticket == "relay-ticket-abc"));
+    }
+
+    #[test]
+    fn a2ui_snapshot_roundtrips_with_type_tag() {
+        let f = Frame::A2uiSnapshot {
+            conversation: "cafebabe".into(),
+            surface: "dice-1".into(),
+            components: Some(serde_json::json!([{"id":"root","component":"Text"}])),
+            data_model: Some(serde_json::json!({"you":1})),
+            lamport: 3,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"a2ui_snapshot""#), "wrong type tag: {json}");
+        assert!(json.contains(r#""conversation":"cafebabe""#), "missing conversation: {json}");
+        assert!(json.contains(r#""surface":"dice-1""#), "missing surface: {json}");
+        assert!(json.contains(r#""lamport":3"#), "missing lamport: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::A2uiSnapshot { lamport: 3, .. }));
+    }
+
+    #[test]
+    fn a2ui_snapshot_tombstone_omits_components_and_data_model() {
+        let f = Frame::A2uiSnapshot {
+            conversation: "cafebabe".into(),
+            surface: "dice-1".into(),
+            components: None,
+            data_model: None,
+            lamport: 4,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("components"), "components should be absent (tombstone): {json}");
+        assert!(!json.contains("data_model"), "data_model should be absent: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::A2uiSnapshot { components: None, data_model: None, .. }));
+    }
+
+    #[test]
+    fn sync_a2ui_roundtrips_with_type_tag() {
+        let messages = vec![
+            serde_json::json!({"version":"v0.9.1","createSurface":{"surfaceId":"dice-1"}}),
+            serde_json::json!({"version":"v0.9.1","updateComponents":{"surfaceId":"dice-1","components":[]}}),
+        ];
+        let f = Frame::SyncA2ui { conversation: "cafebabe".into(), messages: messages.clone() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"sync_a2ui""#), "wrong type tag: {json}");
+        assert!(json.contains(r#""conversation":"cafebabe""#), "missing conversation: {json}");
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Frame::SyncA2ui { messages: m, .. } if m.len() == 2));
     }
 
     #[test]

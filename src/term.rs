@@ -41,6 +41,30 @@
 //! a *new* client presenting an invite as a stranger still opts into
 //! persistence on its very first stream. See the `leading_frame` resolution
 //! in `term_session` below.
+//!
+//! ## Host-created sessions (`azula run` handoff / `azula terminal`)
+//!
+//! [`spawn_host_shell_session`] registers a session the *local* process
+//! spawned itself — before any client has ever connected — for `azula run`'s
+//! failure handoff and `azula terminal`'s hosting path (both build their own
+//! dedicated `TermHandler` the way `azula serve` does, in
+//! `cli::run_cmd`/`cli::terminal_cmd`). Such a session has no creating peer
+//! yet, so it is registered `invite_gated` with no owner: per
+//! `azula-docs/openspec/changes/cli-multi-session-relay/specs/terminal/spec.md`'s
+//! "Invite-Authorized Session Attach", the first peer to attach — by
+//! presenting the connect block's invite (any peer the accept gate has
+//! registered via a verified invite is, by construction, the only possible
+//! redeemer of *this* process's one minted invite — see
+//! `find_owned_session`) — claims ownership from then on, exactly like an
+//! ordinarily client-created session. `TermHandler::with_default_session`
+//! points a fresh client's `TermAttach{session: None}` (every real client's
+//! very first attach — nothing has told it the internal session id yet) at
+//! such a session instead of spinning up a redundant empty one.
+//!
+//! Sessions created reactively by a client's own first `TermAttach` (the
+//! pre-existing [`create_persistent_session`] path, still what `azula serve`
+//! uses day to day) are unaffected: they keep today's strict owner-only
+//! binding.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -112,6 +136,12 @@ pub struct TermHandler {
     /// `TermAttach` handshake is still honored, but the PTY never outlives
     /// its bi-stream (same as the legacy path, just with the new frames).
     session_ttl: Option<Duration>,
+    /// A locally host-created session (see the module docs' "Host-created
+    /// sessions" section) that a fresh client's `TermAttach{session: None}`
+    /// should resolve to instead of creating a redundant new one. `None`
+    /// (the default, and always the case for `azula serve`) leaves `None`
+    /// resolution exactly as it was: a brand new session every time.
+    default_session: Option<String>,
 }
 
 impl TermHandler {
@@ -128,7 +158,19 @@ impl TermHandler {
             name_override,
             description_override,
             session_ttl,
+            default_session: None,
         }
+    }
+
+    /// Builder: point a fresh client's `TermAttach{session: None}` at
+    /// `session_id` (from [`spawn_host_shell_session`]) instead of minting a
+    /// brand new session — see the module docs' "Host-created sessions".
+    /// Used by `azula run`'s failure handoff and `azula terminal`'s hosting
+    /// path; `azula serve`'s `TermHandler::new` is unaffected (this is
+    /// strictly additive).
+    pub fn with_default_session(mut self, session_id: String) -> Self {
+        self.default_session = Some(session_id);
+        self
     }
 }
 
@@ -141,6 +183,7 @@ impl ProtocolHandler for TermHandler {
             self.name_override.clone(),
             self.description_override.clone(),
             self.session_ttl,
+            self.default_session.clone(),
         )
         .await
         .map_err(|e| AcceptError::from_boxed(e.into()))
@@ -154,6 +197,7 @@ async fn handle(
     name_override: Option<String>,
     description_override: Option<String>,
     session_ttl: Option<Duration>,
+    default_session: Option<String>,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
     let remote = remote_id.to_string();
@@ -208,8 +252,11 @@ async fn handle(
         profile_sent = true;
 
         let remote = remote.clone();
+        let default_session = default_session.clone();
         tokio::spawn(async move {
-            if let Err(e) = term_session(send, reader, first_frame, remote.clone(), remote_id, profile, session_ttl).await {
+            if let Err(e) =
+                term_session(send, reader, first_frame, remote.clone(), remote_id, profile, session_ttl, default_session).await
+            {
                 warn!(%remote, error = %e, "term: session error");
             }
         });
@@ -372,10 +419,18 @@ enum SessionEvent {
 /// come and go via [`bind_attachment`].
 struct Session {
     id: String,
-    /// Only the peer that created a session may reattach to it; anyone else
-    /// asking for this id silently gets a brand new session instead (see
-    /// `persistent_session`).
-    owner: EndpointId,
+    /// The peer that may reattach to this session. `None` only for a
+    /// host-created session (see the module docs' "Host-created sessions")
+    /// before its first attach; every client-created session sets this
+    /// immediately (`create_persistent_session`). See [`find_owned_session`]
+    /// for the full authorization rule, including `invite_gated`'s
+    /// relaxation and how an unset owner gets claimed.
+    owner: StdMutex<Option<EndpointId>>,
+    /// Whether a peer that redeemed a valid invite against this process (but
+    /// isn't the owner) may also attach — see [`find_owned_session`]. Always
+    /// `true` for a host-created session, `false` for the ordinary
+    /// client-created path (today's exact owner-only behavior, unchanged).
+    invite_gated: bool,
     /// PTY stdin, shared by whichever bi-stream is currently attached.
     in_tx: mpsc::Sender<Vec<u8>>,
     master: StdMutex<Box<dyn MasterPty + Send>>,
@@ -394,6 +449,26 @@ struct Session {
     /// than `--session-ttl`.
     detached_at: StdMutex<Option<Instant>>,
     killer: StdMutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// The PTY child's pid, kept for the SIGKILL escalation in
+    /// [`sigkill_process_group`] — `killer` alone is signal-based (SIGHUP on
+    /// unix) and an interactive login shell can survive it, leaving the PTY
+    /// reader thread parked forever.
+    child_pid: Option<u32>,
+}
+
+/// Escalate past [`ChildKiller::kill`]'s polite signal: SIGKILL the child's
+/// whole process group (the PTY child is spawned as its session leader, so
+/// this also takes down anything it spawned), then the pid itself in case the
+/// group id and pid ever diverge. Callers invoke `killer.kill()` first; this
+/// runs after, and a stale pid is harmless (kill of a reaped pid just fails).
+fn sigkill_process_group(child_pid: Option<u32>) {
+    if let Some(pid) = child_pid {
+        // SAFETY: plain kill(2) calls on a numeric pid; no memory involved.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
 }
 
 /// Process-wide persistent-session registry. Module-private and deliberately
@@ -410,12 +485,44 @@ fn new_session_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-/// Look up a session by id, but only if `owner` is the peer that created it.
-/// A wrong-owner or missing id both come back `None` — the caller can't tell
-/// the difference, which is the point (no probing which ids exist).
-fn find_owned_session(id: &str, owner: EndpointId) -> Option<Arc<Session>> {
-    let map = sessions().lock().unwrap();
-    map.get(id).filter(|s| s.owner == owner).cloned()
+/// Look up a session by id, authorizing `requester` per the terminal spec's
+/// "Invite-Authorized Session Attach": the creating/claimed owner, or — for
+/// an `invite_gated` session — any peer that has itself been admitted via a
+/// verified invite against this process. That second check is
+/// `registry::find_by_node_id(&requester).is_some()`: `accept_gate::
+/// gate_stranger` only ever calls `registry::add` for a stranger on the
+/// *verified-invite* path (never for an `--allow-legacy` fallback, and never
+/// re-run for an already-known peer) — see `handle`'s gating call site — so a
+/// hit there is exactly "this peer has redeemed a valid invite issued by
+/// this node id." A host-created session's process mints exactly one such
+/// invite (`spawn_host_shell_session`'s caller), so that's unambiguously
+/// *this* session's invite.
+///
+/// A missing id, a wrong-owner id on a non-`invite_gated` session, and an
+/// `invite_gated` session whose requester never redeemed an invite all come
+/// back `None` alike — the caller can't tell the difference, which is the
+/// point (no probing which ids exist). On the first successful
+/// invite-authorized attach to an unclaimed (host-created) session, claims
+/// it for `requester` so it behaves like an ordinarily owned session from
+/// then on.
+fn find_owned_session(id: &str, requester: EndpointId) -> Option<Arc<Session>> {
+    let session = sessions().lock().unwrap().get(id).cloned()?;
+
+    let is_owner = *session.owner.lock().unwrap() == Some(requester);
+    if is_owner {
+        return Some(session);
+    }
+
+    if session.invite_gated && registry::find_by_node_id(&requester).is_some() {
+        let mut owner = session.owner.lock().unwrap();
+        if owner.is_none() {
+            *owner = Some(requester);
+        }
+        drop(owner);
+        return Some(session);
+    }
+
+    None
 }
 
 /// Kill every registered session's shell and empty the registry.
@@ -435,6 +542,7 @@ pub fn kill_all_sessions() {
     let map = std::mem::take(&mut *sessions().lock().unwrap());
     for session in map.into_values() {
         let _ = session.killer.lock().unwrap().kill();
+        sigkill_process_group(session.child_pid);
     }
 }
 
@@ -444,11 +552,16 @@ pub fn kill_all_sessions() {
 /// needs to unblock its *own* session's PTY-reader thread before returning
 /// (see `kill_all_sessions`'s doc comment) must not reach for the blunt
 /// kill-everything version — that would also kill a session a *different*,
-/// concurrently running test still needs.
+/// concurrently running test still needs. `pub(crate)` (still test-only) so
+/// `cli::run_cmd`'s and `cli::terminal_cmd`'s own test modules — which spawn
+/// host-created sessions sharing this same process-wide registry — can clean
+/// up their own session without disturbing a concurrently running test
+/// elsewhere in the suite.
 #[cfg(test)]
-fn kill_session(id: &str) {
+pub(crate) fn kill_session(id: &str) {
     if let Some(session) = sessions().lock().unwrap().remove(id) {
         let _ = session.killer.lock().unwrap().kill();
+        sigkill_process_group(session.child_pid);
     }
 }
 
@@ -483,6 +596,7 @@ fn reap_expired_sessions(ttl: Duration) {
     let mut map = sessions().lock().unwrap();
     for s in expired {
         let _ = s.killer.lock().unwrap().kill();
+        sigkill_process_group(s.child_pid);
         map.remove(&s.id);
         info!(session = %s.id, "term: session TTL expired; reaped");
     }
@@ -492,50 +606,77 @@ fn reap_expired_sessions(ttl: Duration) {
 // PTY spawning: shared by the legacy path and persistent sessions.
 // ---------------------------------------------------------------------------
 
-/// A freshly spawned PTY shell, not yet wired into either the legacy bridge
-/// or a `Session`.
-struct SpawnedPty {
-    master: Box<dyn MasterPty + Send>,
-    in_tx: mpsc::Sender<Vec<u8>>,
-    out_rx: mpsc::Receiver<Vec<u8>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
-    /// Resolves once the PTY hits EOF (shell exited) *and* the child has been
-    /// reaped, yielding its exit code when available. `out_rx` closing and
-    /// this handle resolving happen together (the reader thread's own
+/// The PTY size the legacy ephemeral path and a client-created persistent
+/// session both spawn with — unchanged from before `spawn_pty_process`
+/// generalized `spawn_pty_shell` to take an explicit size (a real client
+/// resizes it immediately via `Frame::Resize`; a host-created session, which
+/// has no client yet, may pass a more useful starting size of its own).
+const LEGACY_PTY_SIZE: PtySize = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+
+/// A freshly spawned PTY process, not yet wired into either the legacy
+/// bridge or a `Session`. `pub(crate)` so `cli::run_cmd` can spawn the
+/// wrapped command's own PTY with the same machinery (see
+/// `spawn_pty_process`).
+pub(crate) struct SpawnedPty {
+    pub(crate) master: Box<dyn MasterPty + Send>,
+    pub(crate) in_tx: mpsc::Sender<Vec<u8>>,
+    pub(crate) out_rx: mpsc::Receiver<Vec<u8>>,
+    pub(crate) killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The child's pid for [`sigkill_process_group`] escalation.
+    pub(crate) child_pid: Option<u32>,
+    /// Resolves once the PTY hits EOF (process exited) *and* the child has
+    /// been reaped, yielding its exit code when available. `out_rx` closing
+    /// and this handle resolving happen together (the reader thread's own
     /// `out_tx` isn't dropped until after it calls `child.wait()`).
-    reader_task: tokio::task::JoinHandle<Option<i32>>,
-    writer_task: tokio::task::JoinHandle<()>,
+    pub(crate) reader_task: tokio::task::JoinHandle<Option<i32>>,
+    pub(crate) writer_task: tokio::task::JoinHandle<()>,
 }
 
-/// Open a PTY and spawn the user's shell into it — identical setup for both
-/// the legacy ephemeral path and a new persistent session; only what happens
-/// to the returned handles afterward differs.
-fn spawn_pty_shell() -> Result<SpawnedPty> {
+/// Open a PTY and spawn a process into it — shared by the legacy ephemeral
+/// path, persistent sessions (client- and host-created), and `azula run`'s
+/// wrapped-command execution (`cli::run_cmd`). `argv` is the command to run
+/// (program + args); `None` means `$SHELL -l` (a login shell when falling
+/// back to `/bin/sh`, harmless otherwise) — today's exact shell-spawning
+/// behavior. `size` is the PTY's starting size; callers that don't yet know
+/// a real client's viewport (the shell-spawning paths) pass
+/// [`LEGACY_PTY_SIZE`] and rely on the client's first `Frame::Resize`.
+pub(crate) fn spawn_pty_process(argv: Option<&[String]>, size: PtySize) -> Result<SpawnedPty> {
     let pty_system = NativePtySystem::default();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("opening PTY")?;
+    let pair = pty_system.openpty(size).context("opening PTY")?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut cmd = CommandBuilder::new(&shell);
-    // A login shell when using the fallback /bin/sh; harmless otherwise.
-    cmd.arg("-l");
+    let mut cmd = match argv {
+        Some([program, rest @ ..]) => {
+            let mut cmd = CommandBuilder::new(program);
+            cmd.args(rest);
+            cmd
+        }
+        Some([]) | None => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let mut cmd = CommandBuilder::new(&shell);
+            cmd.arg("-l");
+            cmd
+        }
+    };
     cmd.env("TERM", "xterm-256color");
+    // portable-pty defaults an unset cwd to $HOME (terminal-emulator
+    // convention). azula's contract is the opposite: the wrapped command,
+    // handoff shell, and hosted sessions all run in the INVOKING process's
+    // cwd (the terminal spec's "same working directory", and what the
+    // legacy path's `Frame::Profile` description already announces).
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
 
     let mut child = pair
         .slave
         .spawn_command(cmd)
-        .context("spawning shell in PTY")?;
+        .context("spawning process in PTY")?;
     // Drop the slave; the master keeps the PTY alive. Keep the master itself so we
     // can resize it when the client reports its viewport size.
     drop(pair.slave);
     let master = pair.master;
     let killer = child.clone_killer();
+    let child_pid = child.process_id();
 
     // Blocking reader + writer handles for the PTY master.
     let mut pty_reader = master
@@ -545,9 +686,16 @@ fn spawn_pty_shell() -> Result<SpawnedPty> {
         .take_writer()
         .context("taking PTY writer")?;
 
-    // PTY output -> async channel, fed by a blocking thread.
+    // PTY output -> async channel, fed by a DETACHED std thread — deliberately
+    // not `spawn_blocking`: the tokio runtime joins its blocking pool on drop,
+    // so a PTY thread parked in a blocking read (shell still alive) would
+    // wedge runtime teardown; a panicking test or early-return path must never
+    // hang the process. Detached threads die with the process; the oneshot
+    // bridges preserve the awaitable JoinHandle-shaped API for
+    // `session_core` and the legacy teardown.
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let reader_task = tokio::task::spawn_blocking(move || {
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
+    std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match pty_reader.read(&mut buf) {
@@ -564,12 +712,15 @@ fn spawn_pty_shell() -> Result<SpawnedPty> {
         // exit code for persistent sessions' `Frame::TermExit` (the legacy
         // path ignores this — it kills the child from the outside, at which
         // point this same wait() call reaps it just the same).
-        child.wait().ok().map(|s| s.exit_code() as i32)
+        let _ = exit_tx.send(child.wait().ok().map(|s| s.exit_code() as i32));
     });
+    let reader_task = tokio::spawn(async move { exit_rx.await.ok().flatten() });
 
-    // PTY input <- async channel, drained by a blocking thread.
+    // PTY input <- async channel, drained by a detached std thread (same
+    // rationale as the reader above).
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
-    let writer_task = tokio::task::spawn_blocking(move || {
+    let (writer_done_tx, writer_done_rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
         let mut in_rx = in_rx;
         while let Some(bytes) = in_rx.blocking_recv() {
             if pty_writer.write_all(&bytes).is_err() {
@@ -577,9 +728,13 @@ fn spawn_pty_shell() -> Result<SpawnedPty> {
             }
             let _ = pty_writer.flush();
         }
+        let _ = writer_done_tx.send(());
+    });
+    let writer_task = tokio::spawn(async move {
+        let _ = writer_done_rx.await;
     });
 
-    Ok(SpawnedPty { master, in_tx, out_rx, killer, reader_task, writer_task })
+    Ok(SpawnedPty { master, in_tx, out_rx, killer, child_pid, reader_task, writer_task })
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +777,7 @@ async fn read_bounded_frame(
 /// whether this stream opts into a persistent session (`Frame::TermAttach`)
 /// or gets the legacy ephemeral behavior (anything else, including nothing
 /// within the timeout).
+#[allow(clippy::too_many_arguments)]
 async fn term_session(
     send: SendStream,
     mut reader: BufReader<RecvStream>,
@@ -630,6 +786,7 @@ async fn term_session(
     remote_id: EndpointId,
     profile: ProfileAnnounce,
     session_ttl: Option<Duration>,
+    default_session: Option<String>,
 ) -> Result<()> {
     let mut send = send;
 
@@ -698,10 +855,10 @@ async fn term_session(
     };
 
     if let Some(Frame::TermAttach { session }) = leading_frame {
-        return persistent_session(send, reader, session, remote, remote_id, session_ttl).await;
+        return persistent_session(send, reader, session, remote, remote_id, session_ttl, default_session).await;
     }
 
-    let pty = spawn_pty_shell().context("spawning shell")?;
+    let pty = spawn_pty_process(None, LEGACY_PTY_SIZE).context("spawning shell")?;
     legacy_bridge(send, reader, leading_frame, remote, pty).await
 }
 
@@ -795,6 +952,7 @@ async fn legacy_bridge(
     // child shell, and stop the reader thread.
     drop(pty.in_tx);
     let _ = pty.killer.kill();
+    sigkill_process_group(pty.child_pid);
     pty.reader_task.abort();
     pty.writer_task.abort();
     let _ = send.finish();
@@ -806,11 +964,14 @@ async fn legacy_bridge(
 // Persistent-session path.
 // ---------------------------------------------------------------------------
 
-/// Resolve a `TermAttach { session }`: reattach if `session` names an
-/// existing session owned by `remote_id`, else create a brand new one
-/// (`resumed: false`) — this covers both "no id given" (a fresh session was
-/// requested) and "id given but not found / owned by someone else" (silently
-/// falls back rather than leaking which ids exist).
+/// Resolve a `TermAttach { session }`: reattach if `session` (or, absent
+/// that, `default_session` — see `TermHandler::with_default_session`) names
+/// an existing session this peer is authorized for per
+/// [`find_owned_session`], else create a brand new one (`resumed: false`) —
+/// this covers "no id given and no default" (a fresh session was requested),
+/// "id given but not found / not authorized" (silently falls back rather
+/// than leaking which ids exist), and "no id given but a default exists and
+/// this peer isn't authorized for it" (same silent fallback).
 async fn persistent_session(
     send: SendStream,
     reader: BufReader<RecvStream>,
@@ -818,13 +979,56 @@ async fn persistent_session(
     remote: String,
     remote_id: EndpointId,
     session_ttl: Option<Duration>,
+    default_session: Option<String>,
 ) -> Result<()> {
-    if let Some(id) = requested.as_deref() {
+    let target = requested.or(default_session);
+    if let Some(id) = target.as_deref() {
         if let Some(session) = find_owned_session(id, remote_id) {
             return attach_to_session(send, reader, session, remote, session_ttl).await;
         }
     }
     create_persistent_session(send, reader, remote, remote_id, session_ttl).await
+}
+
+/// Register a freshly spawned PTY as a new `Session` in [`SESSIONS`] and
+/// start its [`session_core`] task. Shared by the client-triggered path
+/// ([`create_persistent_session`], owner known immediately, never
+/// invite-gated — today's exact behavior) and the host-initiated path
+/// ([`spawn_host_shell_session`], no owner yet, always invite-gated — see the
+/// module docs' "Host-created sessions"). `preamble`, if non-empty, seeds the
+/// ring *before* the session is registered or `session_core` starts
+/// consuming `pty.out_rx`, so there's no race with the process's own first
+/// output — used by `azula run`'s failure handoff to carry the wrapped
+/// command's captured output into the handoff session's replay. Bytes need
+/// not be valid UTF-8 on their own (unlike `session_core`'s own pushes,
+/// which are always pre-validated): `attach_to_session`'s replay already
+/// decodes the ring with `String::from_utf8_lossy`, so a stray non-UTF-8 byte
+/// in captured CI output degrades to a replacement character rather than
+/// breaking anything.
+fn register_new_session(pty: SpawnedPty, owner: Option<EndpointId>, invite_gated: bool, preamble: &[u8]) -> Arc<Session> {
+    let id = new_session_id();
+    let mut ring = SessionRing::new();
+    if !preamble.is_empty() {
+        ring.push(preamble);
+    }
+    let session = Arc::new(Session {
+        id: id.clone(),
+        owner: StdMutex::new(owner),
+        invite_gated,
+        in_tx: pty.in_tx,
+        master: StdMutex::new(pty.master),
+        ring: StdMutex::new(ring),
+        current_attach: StdMutex::new(None),
+        attach_changed: watch::channel(()).0,
+        generation: AtomicU64::new(0),
+        detached_at: StdMutex::new(None),
+        killer: StdMutex::new(pty.killer),
+        child_pid: pty.child_pid,
+    });
+
+    sessions().lock().unwrap().insert(id.clone(), session.clone());
+    tokio::spawn(session_core(session.clone(), pty.out_rx, pty.reader_task));
+    session
 }
 
 /// Spawn a brand new PTY, register it as a new `Session`, and attach this
@@ -838,7 +1042,7 @@ async fn create_persistent_session(
 ) -> Result<()> {
     let mut send = send;
 
-    let pty = match spawn_pty_shell() {
+    let pty = match spawn_pty_process(None, LEGACY_PTY_SIZE) {
         Ok(p) => p,
         Err(e) => {
             warn!(%remote, error = %e, "term: failed to spawn PTY for persistent session");
@@ -847,22 +1051,8 @@ async fn create_persistent_session(
         }
     };
 
-    let id = new_session_id();
-    let session = Arc::new(Session {
-        id: id.clone(),
-        owner: remote_id,
-        in_tx: pty.in_tx,
-        master: StdMutex::new(pty.master),
-        ring: StdMutex::new(SessionRing::new()),
-        current_attach: StdMutex::new(None),
-        attach_changed: watch::channel(()).0,
-        generation: AtomicU64::new(0),
-        detached_at: StdMutex::new(None),
-        killer: StdMutex::new(pty.killer),
-    });
-
-    sessions().lock().unwrap().insert(id.clone(), session.clone());
-    tokio::spawn(session_core(session.clone(), pty.out_rx, pty.reader_task));
+    let session = register_new_session(pty, Some(remote_id), false, &[]);
+    let id = session.id.clone();
 
     if write_frame(&mut send, &Frame::TermSession { session: id.clone(), resumed: false }).await.is_err() {
         debug!(%remote, session = %id, "term: failed to send term_session frame");
@@ -872,6 +1062,32 @@ async fn create_persistent_session(
     }
 
     bind_attachment(send, reader, session, remote, session_ttl).await
+}
+
+// ---------------------------------------------------------------------------
+// Host-created sessions (`azula run` / `azula terminal`) — see the module
+// docs' "Host-created sessions" section.
+// ---------------------------------------------------------------------------
+
+/// Spawn `argv` (or `$SHELL -l` when `None`) in a PTY and register it as a
+/// persistent, `invite_gated` session with no owner yet, seeding its ring
+/// with `preamble` if given. Returns the new session's id — pair it with
+/// [`TermHandler::with_default_session`] so a fresh client's
+/// `TermAttach{session: None}` finds it, and with [`session_is_alive`] to
+/// detect when its process exits. `size` matches the caller's own PTY (or a
+/// sane default) since there's no client to resize it yet.
+pub fn spawn_host_shell_session(argv: Option<&[String]>, size: PtySize, preamble: &[u8]) -> Result<String> {
+    let pty = spawn_pty_process(argv, size).context("spawning the host session's process")?;
+    let session = register_new_session(pty, None, true, preamble);
+    Ok(session.id.clone())
+}
+
+/// Whether a session with this id is still registered — `false` once its
+/// process has exited and [`session_core`] has reaped it from [`SESSIONS`].
+/// Lets a host process (`azula run`'s failure handoff) poll for "has the
+/// handoff session ended" without its own exit-notification channel.
+pub fn session_is_alive(id: &str) -> bool {
+    sessions().lock().unwrap().contains_key(id)
 }
 
 /// Reattach to an existing, owned session: acknowledge with
@@ -1027,6 +1243,8 @@ async fn bind_attachment(
             // path on stream end — kill the shell instead of leaving it
             // around with no TTL reaper to ever clean it up.
             let _ = session.killer.lock().unwrap().kill();
+            sigkill_process_group(session.child_pid);
+        sigkill_process_group(session.child_pid);
             sessions().lock().unwrap().remove(&session.id);
             debug!(%remote, session = %session.id, "term: --session-ttl 0; killed on detach");
         }
@@ -1936,5 +2154,185 @@ mod tests {
         client_ep.close().await;
 
         std::env::remove_var("AZULA_REGISTRY_DIR");
+    }
+
+    // -----------------------------------------------------------------------
+    // Host-created sessions / invite-authorized attach (cli-multi-session-relay
+    // phase 3, terminal spec "Invite-Authorized Session Attach").
+    // -----------------------------------------------------------------------
+
+    /// A session `spawn_host_shell_session` registers has no owner yet and is
+    /// `invite_gated` — a fast, white-box check of the registration itself
+    /// (no networking), independent of the end-to-end attach tests below.
+    #[tokio::test]
+    async fn host_created_session_starts_unowned_and_invite_gated() {
+        let id = super::spawn_host_shell_session(
+            None,
+            portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+            b"",
+        )
+        .expect("spawn host session");
+
+        {
+            let map = super::sessions().lock().unwrap();
+            let session = map.get(&id).expect("session registered");
+            assert!(session.owner.lock().unwrap().is_none(), "a host-created session starts with no owner");
+            assert!(session.invite_gated, "a host-created session must be invite_gated");
+        }
+
+        super::kill_session(&id);
+    }
+
+    /// Full wire-level exercise of the terminal spec's "Invite-Authorized
+    /// Session Attach" requirement, mirroring `term_two_sessions_over_one_connection`'s
+    /// in-process iroh pairing style: a client that redeems the session's own
+    /// invite resumes the held (host-created) session — with its preamble
+    /// replayed and without creating it first — claims ownership on doing so,
+    /// a later reconnect from the SAME peer resumes via plain owner match
+    /// (no invite needed a second time), and an unrelated third peer with
+    /// neither owner status nor the invite silently gets a fresh session.
+    #[tokio::test]
+    async fn invite_redeemer_resumes_host_session_and_unrelated_peer_gets_fresh() {
+        use crate::registry;
+
+        // Holds ENV_TEST_LOCK for the whole body — mutates the process-global
+        // AZULA_REGISTRY_DIR/AZULA_INVITES_DIR, same convention as
+        // `known_peer_hello_then_term_attach_still_resumes` /
+        // `accept_gate::valid_invite_admits_with_no_replay`.
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let base = std::env::temp_dir()
+            .join(format!("azula-term-test-{}", std::process::id()))
+            .join("invite_authorized_host_session");
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("AZULA_REGISTRY_DIR", base.join("registry"));
+        std::env::set_var("AZULA_INVITES_DIR", base.join("invites"));
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
+            .await
+            .expect("server bind");
+        let server_addr = server_ep.addr();
+        let server_id = server_ep.id();
+
+        // Host-created session, seeded with a preamble — mirrors `azula run`'s
+        // failure handoff carrying the wrapped command's captured output.
+        let session_id = super::spawn_host_shell_session(
+            None,
+            portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+            b"AZULA_HOST_PREAMBLE_MARKER\n",
+        )
+        .expect("spawn host session");
+
+        let router = Router::builder(server_ep)
+            .accept(
+                TERM_ALPN,
+                TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(3600)))
+                    .with_default_session(session_id.clone()),
+            )
+            .spawn();
+
+        // Mint an invite for the server's own node id — exactly what
+        // `azula run`/`azula terminal`'s connect block hands out.
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(server_addr.clone()).to_string();
+        let (payload, _) =
+            crate::invite::mint(&ticket_str, crate::invite::Expiry::Never, false, false, None, &server_secret)
+                .expect("mint invite");
+        let token = payload.encode();
+
+        // ── The invite redeemer: a fresh peer, never the "creator", presents
+        // the invite and asks for `session: None` — must resume the held
+        // session, not get a fresh one. ─────────────────────────────────────
+        let redeemer_secret = iroh::SecretKey::generate();
+        let redeemer_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(redeemer_secret.clone())
+            .bind()
+            .await
+            .expect("redeemer bind");
+        {
+            let conn = redeemer_ep.connect(server_addr.clone(), TERM_ALPN).await.expect("redeemer connect");
+            let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+            write_frame(&mut send, &Frame::Hello { name: "redeemer".into(), invite: Some(token.clone()), cert: None })
+                .await
+                .expect("write hello");
+            write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write attach");
+
+            let mut reader = BufReader::new(recv);
+            let (id, resumed) = read_until(&mut reader, |f| match f {
+                Frame::TermSession { session, resumed } => Some((session.clone(), *resumed)),
+                _ => None,
+            })
+            .await
+            .expect("expected term_session for the invite redeemer");
+            assert_eq!(id, session_id, "the invite redeemer must resume the held (host-created) session");
+            assert!(resumed, "resuming the held session must be marked resumed");
+
+            let replayed = read_until(&mut reader, |f| match f {
+                Frame::Term { line } if line.contains("AZULA_HOST_PREAMBLE_MARKER") => Some(()),
+                _ => None,
+            })
+            .await;
+            assert!(replayed.is_some(), "expected the preamble to be replayed to the redeemer");
+
+            let _ = send.finish();
+            conn.close(0u32.into(), b"done");
+        }
+        redeemer_ep.close().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // ── The same redeemer reconnects from a NEW connection (same key) —
+        // now resumes via plain owner match, no invite needed a second time.
+        // ────────────────────────────────────────────────────────────────────
+        let redeemer_ep2 = Endpoint::builder(presets::Minimal)
+            .secret_key(redeemer_secret)
+            .bind()
+            .await
+            .expect("redeemer2 bind");
+        {
+            let conn = redeemer_ep2.connect(server_addr.clone(), TERM_ALPN).await.expect("redeemer2 connect");
+            let (mut send, recv) = conn.open_bi().await.expect("open_bi 2");
+            write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write attach 2");
+            let mut reader = BufReader::new(recv);
+            let (id, resumed) = read_until(&mut reader, |f| match f {
+                Frame::TermSession { session, resumed } => Some((session.clone(), *resumed)),
+                _ => None,
+            })
+            .await
+            .expect("expected term_session on the owner's reconnect");
+            assert_eq!(id, session_id, "the now-owning redeemer must still resume the held session without the invite");
+            assert!(resumed);
+            let _ = send.finish();
+            conn.close(0u32.into(), b"done");
+        }
+        redeemer_ep2.close().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // ── An unrelated third peer — no invite, not the owner — silently
+        // gets a FRESH session instead of the held one. ─────────────────────
+        let stranger_ep = Endpoint::bind(presets::Minimal).await.expect("stranger bind");
+        let stranger_conn = stranger_ep.connect(server_addr, TERM_ALPN).await.expect("stranger connect");
+        let (mut send3, recv3) = stranger_conn.open_bi().await.expect("open_bi 3");
+        write_frame(&mut send3, &Frame::TermAttach { session: None }).await.expect("write attach 3");
+        let mut reader3 = BufReader::new(recv3);
+        let (id3, resumed3) = read_until(&mut reader3, |f| match f {
+            Frame::TermSession { session, resumed } => Some((session.clone(), *resumed)),
+            _ => None,
+        })
+        .await
+        .expect("expected term_session for the stranger too");
+        assert_ne!(id3, session_id, "an unrelated peer must never resume the held session");
+        assert!(!resumed3);
+
+        let _ = send3.finish();
+        stranger_conn.close(0u32.into(), b"done");
+        stranger_ep.close().await;
+
+        super::kill_session(&session_id);
+        super::kill_session(&id3);
+        let _ = router.shutdown().await;
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        std::env::remove_var("AZULA_INVITES_DIR");
     }
 }

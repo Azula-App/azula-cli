@@ -59,3 +59,7 @@ rmcp = { version = "1.8", default-features = false, features = [
     "transport-streamable-http-server",
 ] }
 gethostname = "1.1.0"
+# cli-multi-session-relay phase 3 (`azula terminal attach`'s raw-mode client,
+# `azula terminal kill`'s SIGTERM, local PTY sizing): already a transitive
+# dep via portable-pty, promoted to direct since we call it ourselves.
+libc = "0.2"

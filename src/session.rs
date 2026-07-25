@@ -192,9 +192,7 @@ mod tests {
     use super::*;
 
     /// Serializes tests that mutate the process-global `AZULA_SESSIONS_DIR`
-    /// env var — mirrors `registry::ENV_TEST_LOCK`.
-    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// env var — guarded by the shared `registry::ENV_TEST_LOCK`.
     fn isolated_sessions_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("azula-session-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -204,7 +202,7 @@ mod tests {
 
     #[test]
     fn named_session_key_persists_across_two_resolves() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let dir = isolated_sessions_dir("persist");
 
         let first = SessionKey::resolve(Some("blackjack")).expect("resolves");
@@ -224,7 +222,7 @@ mod tests {
 
     #[test]
     fn distinct_named_sessions_get_distinct_keys() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let _dir = isolated_sessions_dir("distinct");
 
         let cli = SessionKey::resolve(Some("cli")).expect("resolves");
@@ -236,7 +234,7 @@ mod tests {
 
     #[test]
     fn env_var_selects_a_named_session_when_no_explicit_name() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let dir = isolated_sessions_dir("env_named");
         std::env::set_var("AZULA_SESSION", "from-env");
 
@@ -251,7 +249,7 @@ mod tests {
 
     #[test]
     fn no_name_and_no_env_is_ephemeral() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let _dir = isolated_sessions_dir("ephemeral_mode");
         std::env::remove_var("AZULA_SESSION"); // in case another test leaked it
 
@@ -268,7 +266,7 @@ mod tests {
         // running test (e.g. `env_var_selects_a_named_session_when_no_explicit_name`)
         // having it set at this exact moment, which would make `resolve(None)`
         // pick the named branch instead of ephemeral.
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         std::env::remove_var("AZULA_SESSION");
 
         let resolved = SessionKey::resolve(None).expect("resolves");
@@ -281,7 +279,7 @@ mod tests {
 
     #[test]
     fn two_ephemeral_sessions_get_distinct_keys_and_names() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         std::env::remove_var("AZULA_SESSION");
 
         let a = SessionKey::resolve(None).expect("resolves");

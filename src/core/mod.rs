@@ -18,6 +18,7 @@
 //! deleting its key file).
 
 pub mod device;
+pub mod relay_a2ui;
 pub mod state;
 pub mod status;
 pub mod watch;
@@ -55,6 +56,12 @@ const A2UI_CATALOG_URL: &str = "https://a2ui.org/specification/v0_9_1/catalogs/b
 
 /// Monotonic counter for auto-generated A2UI surface ids (`ui-<time>-<n>`).
 static SURFACE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Per-process monotonic sequence stamped on outgoing `Frame::A2uiSnapshot`s
+/// (relay capability) — lets the relay ignore a stale, out-of-order snapshot
+/// for a surface. Unrelated to the account-sync log's own `lamport` concept;
+/// this one only orders one session's snapshots for one relay.
+static A2UI_SNAPSHOT_LAMPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -140,6 +147,28 @@ pub struct SessionCore {
     /// The machine identity, read from disk only (never created here) —
     /// `None` in a headless environment.
     pub machine_secret: Option<SecretKey>,
+    /// Cached connections to the identity's relay, keyed by relay ticket —
+    /// deliberately a *separate* map from `devices` so dialing the relay
+    /// never marks the phone device itself as connected (relay spec /
+    /// design.md D6's delivery chain: "The relay connection may be cached
+    /// like device connections but MUST NOT mark the phone device as
+    /// connected"). See [`Self::ensure_relay`].
+    relay_conns: DeviceMap,
+    /// Retained full A2UI surface state per `(device_name, surface_id)` —
+    /// what this session last rendered or coalesced, kept so an offline
+    /// `update_ui` can build a full-surface snapshot for the relay from only
+    /// a pointer delta (relay spec: "A session that can't reach the phone
+    /// SHALL coalesce its render_ui/update_ui/delete_ui calls into
+    /// full-surface snapshots"). See [`Self::render_ui_outcome`].
+    surface_state: Arc<AsyncMutex<HashMap<(String, String), SurfaceState>>>,
+}
+
+/// A session's retained copy of one A2UI surface — see
+/// [`SessionCore::surface_state`]'s doc comment.
+#[derive(Clone, Debug)]
+struct SurfaceState {
+    components: serde_json::Value,
+    data_model: serde_json::Value,
 }
 
 impl SessionCore {
@@ -156,7 +185,17 @@ impl SessionCore {
         session_cert: String,
         machine_secret: Option<SecretKey>,
     ) -> Self {
-        SessionCore { endpoint, devices, label, ticket, own_name, session_cert, machine_secret }
+        SessionCore {
+            endpoint,
+            devices,
+            label,
+            ticket,
+            own_name,
+            session_cert,
+            machine_secret,
+            relay_conns: Arc::new(AsyncMutex::new(HashMap::new())),
+            surface_state: Arc::new(AsyncMutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -307,6 +346,8 @@ pub async fn establish(
             own_name,
             session_cert,
             machine_secret,
+            relay_conns: Arc::new(AsyncMutex::new(HashMap::new())),
+            surface_state: Arc::new(AsyncMutex::new(HashMap::new())),
         },
         session,
         router: iroh_router,
@@ -585,11 +626,13 @@ impl SessionCore {
     }
 
     /// Send a text message to a device — appears as a streamed
-    /// azula-assistant reply in the app. Queues via the offline mailbox
-    /// (same delivery chain either the MCP tool or a CLI verb uses) when the
-    /// device can't be reached right now.
+    /// azula-assistant reply in the app. Delivery chain (relay spec /
+    /// design.md D6): direct to the device first; the identity's relay
+    /// second, when a relay hint is known (delivered there as a `Chat`
+    /// frame, appended by the relay as an `agent_in` log entry); the local
+    /// per-device JSONL mailbox last, only when no relay hint is known.
     pub async fn send_message(&self, device_name: &str, text: String) -> Result<SendOutcome, CoreError> {
-        let queue = |text: String| mailbox::enqueue(device_name, &[
+        let queue_local = |text: String| mailbox::enqueue(device_name, &[
             Frame::thinking(true),
             Frame::token(text),
             Frame::token_done(),
@@ -599,7 +642,10 @@ impl SessionCore {
         let conn = match self.ensure_device(device_name).await {
             Ok(c) => c,
             Err(_) => {
-                queue(text);
+                if let Some(outcome) = self.try_deliver_via_relay(device_name, &text).await {
+                    return outcome;
+                }
+                queue_local(text);
                 return Ok(SendOutcome::Queued);
             }
         };
@@ -607,7 +653,10 @@ impl SessionCore {
         let mut send_guard = conn.send.lock().await;
         let Some(send) = send_guard.as_mut() else {
             drop(send_guard);
-            queue(text);
+            if let Some(outcome) = self.try_deliver_via_relay(device_name, &text).await {
+                return outcome;
+            }
+            queue_local(text);
             return Ok(SendOutcome::Queued);
         };
 
@@ -615,6 +664,50 @@ impl SessionCore {
             write_frame(send, &frame).await.map_err(|e| CoreError::Transport(e.to_string()))?;
         }
         Ok(SendOutcome::Sent)
+    }
+
+    /// Delivery-chain step 2 (relay spec / design.md D6): if `device_name`
+    /// has a known relay ticket, dial it (LLM ALPN, this session's own
+    /// `Hello{cert}`) and deliver `text` as a `Chat` frame — the relay
+    /// appends it as an `agent_in` entry keyed by this session's public key,
+    /// so the phone picks it up on its next sync (live-pushed if a sync
+    /// connection is already open). Returns `None` when no relay is known,
+    /// or the relay itself couldn't be reached/written to either — either
+    /// way the caller falls through to the local JSONL mailbox (step 3);
+    /// `Some(Ok(SendOutcome::Queued))` on a successful relay hand-off.
+    async fn try_deliver_via_relay(&self, device_name: &str, text: &str) -> Option<Result<SendOutcome, CoreError>> {
+        let ticket = registry::relay_for(device_name)?;
+        let conn = self.ensure_relay(&ticket).await.ok()?;
+        let mut send_guard = conn.send.lock().await;
+        let send = send_guard.as_mut()?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        match write_frame(send, &Frame::Chat { text: text.to_string(), id: Some(id) }).await {
+            Ok(()) => Some(Ok(SendOutcome::Queued)),
+            Err(_) => None,
+        }
+    }
+
+    /// Ensure a cached connection to the identity's relay at `ticket`,
+    /// dialing it (LLM ALPN, presenting this session's own `Hello{cert}`) if
+    /// not already connected. Cached in [`Self::relay_conns`] — never
+    /// [`Self::devices`] — so this never marks the phone device itself as
+    /// connected.
+    async fn ensure_relay(&self, ticket: &str) -> Result<device::DeviceConn, CoreError> {
+        let needs_dial = {
+            let guard = self.relay_conns.lock().await;
+            !matches!(guard.get(ticket), Some(c) if c.connected)
+        };
+        if needs_dial {
+            device::connect_device(
+                &self.endpoint, ticket, ticket, &self.relay_conns, &self.own_name, None, Some(&self.session_cert),
+            )
+            .await;
+        }
+        let guard = self.relay_conns.lock().await;
+        match guard.get(ticket) {
+            Some(c) if c.connected => Ok(c.clone()),
+            _ => Err(CoreError::Operational("relay is not reachable".to_string())),
+        }
     }
 
     /// Send a local file to a device as an inline attachment. Unlike
@@ -730,11 +823,16 @@ impl SessionCore {
     }
 
     /// Send a peer-to-peer chat message to another bridge session (not an
-    /// app device), enforcing `max_turns`.
+    /// app device), enforcing `max_turns`. Same relay-then-local-mailbox
+    /// fallback chain as [`Self::send_message`] when the target is
+    /// unreachable.
     pub async fn say(&self, device_name: &str, text: String, done: Option<bool>, max_turns: u64) -> Result<SayOutcome, CoreError> {
         let conn = match self.ensure_device(device_name).await {
             Ok(c) => c,
             Err(_) => {
+                if let Some(outcome) = self.try_deliver_via_relay(device_name, &text).await {
+                    return outcome.map(|_| SayOutcome::Queued);
+                }
                 mailbox::enqueue(device_name, &[Frame::Chat { text: text.clone(), id: None }]);
                 return Ok(SayOutcome::Queued);
             }
@@ -759,6 +857,9 @@ impl SessionCore {
         {
             let mut send_guard = conn.send.lock().await;
             let Some(send) = send_guard.as_mut() else {
+                if let Some(outcome) = self.try_deliver_via_relay(device_name, &text).await {
+                    return outcome.map(|_| SayOutcome::Queued);
+                }
                 mailbox::enqueue(device_name, &[Frame::Chat { text: text.clone(), id: None }]);
                 return Ok(SayOutcome::Queued);
             };
@@ -791,7 +892,11 @@ impl SessionCore {
     /// component tree client-side (cli-surface spec: "Invalid component
     /// trees SHALL be rejected client-side with the same root-component
     /// validation the MCP tool applies" — nothing is sent on failure) before
-    /// dialing or writing anything. Returns the surface id used.
+    /// dialing or writing anything. Returns the surface id used. Thin
+    /// wrapper over [`Self::render_ui_outcome`], discarding whether it went
+    /// out live or was coalesced to the relay — kept with this exact
+    /// signature since `cli::ui::render` (outside this phase's file
+    /// ownership) calls it and only needs the surface id.
     pub async fn render_ui(
         &self,
         device_name: &str,
@@ -799,6 +904,22 @@ impl SessionCore {
         data_model: Option<serde_json::Value>,
         surface_id: Option<String>,
     ) -> Result<String, CoreError> {
+        self.render_ui_outcome(device_name, components, data_model, surface_id).await.map(|(id, _)| id)
+    }
+
+    /// As [`Self::render_ui`], but also reports whether the surface went out
+    /// live (`SendOutcome::Sent`) or was coalesced into a full-surface
+    /// snapshot delivered to the relay (`SendOutcome::Queued`) because the
+    /// device was unreachable but a relay hint is known (mcp-bridge spec:
+    /// "render_ui to an offline device with a relay"). With no relay known,
+    /// behaves exactly as before: an immediate error, nothing sent.
+    pub async fn render_ui_outcome(
+        &self,
+        device_name: &str,
+        components: serde_json::Value,
+        data_model: Option<serde_json::Value>,
+        surface_id: Option<String>,
+    ) -> Result<(String, SendOutcome), CoreError> {
         validate_a2ui_components(&components)?;
 
         let surface_id = surface_id.unwrap_or_else(|| {
@@ -813,43 +934,203 @@ impl SessionCore {
             format!("ui-{t}-{n}")
         });
 
-        let conn = self.ensure_device(device_name).await?;
-
-        self.send_a2ui_frame(&conn, serde_json::json!({
-            "version": "v0.9.1",
-            "createSurface": { "surfaceId": surface_id, "catalogId": A2UI_CATALOG_URL }
-        })).await?;
-        self.send_a2ui_frame(&conn, serde_json::json!({
-            "version": "v0.9.1",
-            "updateComponents": { "surfaceId": surface_id, "components": components }
-        })).await?;
-        if let Some(dm) = data_model {
-            self.send_a2ui_frame(&conn, serde_json::json!({
-                "version": "v0.9.1",
-                "updateDataModel": { "surfaceId": surface_id, "path": "", "value": dm }
-            })).await?;
+        match self.ensure_device(device_name).await {
+            Ok(conn) => {
+                self.send_a2ui_frame(&conn, serde_json::json!({
+                    "version": "v0.9.1",
+                    "createSurface": { "surfaceId": surface_id, "catalogId": A2UI_CATALOG_URL }
+                })).await?;
+                self.send_a2ui_frame(&conn, serde_json::json!({
+                    "version": "v0.9.1",
+                    "updateComponents": { "surfaceId": surface_id, "components": components }
+                })).await?;
+                if let Some(dm) = &data_model {
+                    self.send_a2ui_frame(&conn, serde_json::json!({
+                        "version": "v0.9.1",
+                        "updateDataModel": { "surfaceId": surface_id, "path": "", "value": dm }
+                    })).await?;
+                }
+                self.retain_surface_state(device_name, &surface_id, components, data_model).await;
+                Ok((surface_id, SendOutcome::Sent))
+            }
+            Err(unreachable_err) => {
+                let Some(ticket) = registry::relay_for(device_name) else { return Err(unreachable_err) };
+                self.retain_surface_state(device_name, &surface_id, components.clone(), data_model.clone()).await;
+                self.send_snapshot_to_relay(device_name, &ticket, &surface_id, Some(components), data_model).await?;
+                Ok((surface_id, SendOutcome::Queued))
+            }
         }
-
-        Ok(surface_id)
     }
 
     /// Update the data model of a rendered A2UI surface at an RFC 6901
-    /// JSON pointer (`""` replaces the whole model).
+    /// JSON pointer (`""` replaces the whole model). Thin wrapper over
+    /// [`Self::update_ui_outcome`] — see [`Self::render_ui`]'s doc for why.
     pub async fn update_ui(&self, device_name: &str, surface_id: &str, path: &str, value: serde_json::Value) -> Result<(), CoreError> {
-        let conn = self.ensure_device(device_name).await?;
-        self.send_a2ui_frame(&conn, serde_json::json!({
-            "version": "v0.9.1",
-            "updateDataModel": { "surfaceId": surface_id, "path": path, "value": value }
-        })).await
+        self.update_ui_outcome(device_name, surface_id, path, value).await.map(|_| ())
     }
 
-    /// Remove an A2UI surface from a device.
+    /// As [`Self::update_ui`], but also reports live-vs-queued (see
+    /// [`Self::render_ui_outcome`]). Offline-with-relay coalescing only
+    /// works when this session already holds the surface's full state
+    /// (rendered earlier in this session, live or via a prior coalesce) —
+    /// relay spec: "`update_ui` against an offline phone therefore works
+    /// iff the session holds the full surface". With no retained state, this
+    /// surfaces the original unreachable error even if a relay is known,
+    /// since a valid full-surface snapshot can't be built from a bare
+    /// pointer delta.
+    pub async fn update_ui_outcome(
+        &self,
+        device_name: &str,
+        surface_id: &str,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Result<SendOutcome, CoreError> {
+        match self.ensure_device(device_name).await {
+            Ok(conn) => {
+                self.send_a2ui_frame(&conn, serde_json::json!({
+                    "version": "v0.9.1",
+                    "updateDataModel": { "surfaceId": surface_id, "path": path, "value": value }
+                })).await?;
+                // Keep the retained cache fresh even on the live path, so a
+                // *later* update_ui in the same session can still coalesce
+                // if the device goes offline mid-session.
+                self.apply_data_model_pointer(device_name, surface_id, path, &value).await;
+                Ok(SendOutcome::Sent)
+            }
+            Err(unreachable_err) => {
+                let Some(ticket) = registry::relay_for(device_name) else { return Err(unreachable_err) };
+                let Some((components, data_model)) =
+                    self.apply_data_model_pointer(device_name, surface_id, path, &value).await
+                else {
+                    return Err(unreachable_err);
+                };
+                self.send_snapshot_to_relay(device_name, &ticket, surface_id, Some(components), Some(data_model)).await?;
+                Ok(SendOutcome::Queued)
+            }
+        }
+    }
+
+    /// Remove an A2UI surface from a device. Thin wrapper over
+    /// [`Self::delete_ui_outcome`] — see [`Self::render_ui`]'s doc for why.
     pub async fn delete_ui(&self, device_name: &str, surface_id: &str) -> Result<(), CoreError> {
-        let conn = self.ensure_device(device_name).await?;
-        self.send_a2ui_frame(&conn, serde_json::json!({
-            "version": "v0.9.1",
-            "deleteSurface": { "surfaceId": surface_id }
-        })).await
+        self.delete_ui_outcome(device_name, surface_id).await.map(|_| ())
+    }
+
+    /// As [`Self::delete_ui`], but also reports live-vs-queued (see
+    /// [`Self::render_ui_outcome`]). Unlike `update_ui`, deleting needs no
+    /// retained state — the tombstone carries no components — so it always
+    /// coalesces to the relay when a relay hint is known, regardless of
+    /// whether this session ever rendered the surface itself.
+    pub async fn delete_ui_outcome(&self, device_name: &str, surface_id: &str) -> Result<SendOutcome, CoreError> {
+        match self.ensure_device(device_name).await {
+            Ok(conn) => {
+                self.send_a2ui_frame(&conn, serde_json::json!({
+                    "version": "v0.9.1",
+                    "deleteSurface": { "surfaceId": surface_id }
+                })).await?;
+                self.surface_state.lock().await.remove(&(device_name.to_string(), surface_id.to_string()));
+                Ok(SendOutcome::Sent)
+            }
+            Err(unreachable_err) => {
+                let Some(ticket) = registry::relay_for(device_name) else { return Err(unreachable_err) };
+                self.surface_state.lock().await.remove(&(device_name.to_string(), surface_id.to_string()));
+                self.send_snapshot_to_relay(device_name, &ticket, surface_id, None, None).await?;
+                Ok(SendOutcome::Queued)
+            }
+        }
+    }
+
+    /// Overwrite this session's retained copy of `(device_name, surface_id)`
+    /// with a freshly rendered full state — see [`Self::surface_state`]'s
+    /// doc comment. `data_model: None` leaves any previously retained data
+    /// model as-is (matches `render_ui`'s "no data model" meaning "nothing
+    /// to set", not "clear it").
+    async fn retain_surface_state(
+        &self,
+        device_name: &str,
+        surface_id: &str,
+        components: serde_json::Value,
+        data_model: Option<serde_json::Value>,
+    ) {
+        let mut guard = self.surface_state.lock().await;
+        let entry = guard
+            .entry((device_name.to_string(), surface_id.to_string()))
+            .or_insert_with(|| SurfaceState { components: serde_json::Value::Null, data_model: serde_json::Value::Null });
+        entry.components = components;
+        if let Some(dm) = data_model {
+            entry.data_model = dm;
+        }
+    }
+
+    /// Apply an RFC 6901 pointer update to this session's retained copy of a
+    /// surface's data model (if this session has one — i.e. it rendered or
+    /// previously coalesced this surface), returning the resulting full
+    /// `(components, data_model)` pair, or `None` if nothing is retained for
+    /// `(device_name, surface_id)`. `path == ""` replaces the whole model
+    /// with `value`, matching the live path's own convention.
+    async fn apply_data_model_pointer(
+        &self,
+        device_name: &str,
+        surface_id: &str,
+        path: &str,
+        value: &serde_json::Value,
+    ) -> Option<(serde_json::Value, serde_json::Value)> {
+        let mut guard = self.surface_state.lock().await;
+        let state = guard.get_mut(&(device_name.to_string(), surface_id.to_string()))?;
+        if path.is_empty() {
+            state.data_model = value.clone();
+        } else {
+            set_at_json_pointer(&mut state.data_model, path, value.clone());
+        }
+        Some((state.components.clone(), state.data_model.clone()))
+    }
+
+    /// Deliver one coalesced A2UI snapshot to the identity's relay
+    /// (`Frame::A2uiSnapshot`) — the relay spec's "session that can't reach
+    /// the phone SHALL coalesce ... into full-surface snapshots delivered to
+    /// the relay". Enforces the 256 KiB per-surface cap client-side first
+    /// (design.md D6/task 4.5: "the session checks the 256 KiB cap BEFORE
+    /// sending and errors the tool call locally"), so an oversized snapshot
+    /// never reaches the wire at all.
+    async fn send_snapshot_to_relay(
+        &self,
+        device_name: &str,
+        ticket: &str,
+        surface_id: &str,
+        components: Option<serde_json::Value>,
+        data_model: Option<serde_json::Value>,
+    ) -> Result<(), CoreError> {
+        let size = serde_json::to_vec(&components).map(|v| v.len()).unwrap_or(0)
+            + serde_json::to_vec(&data_model).map(|v| v.len()).unwrap_or(0);
+        if size > relay_a2ui::MAX_SNAPSHOT_BYTES {
+            return Err(CoreError::Usage(format!(
+                "surface '{surface_id}' snapshot is {size} bytes, exceeds the {} byte (256 KiB) relay cap",
+                relay_a2ui::MAX_SNAPSHOT_BYTES
+            )));
+        }
+
+        let conn = self.ensure_relay(ticket).await.map_err(|_| {
+            CoreError::Operational(format!("device '{device_name}' is unreachable and its relay is also unreachable"))
+        })?;
+        let lamport = A2UI_SNAPSHOT_LAMPORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut send_guard = conn.send.lock().await;
+        let Some(send) = send_guard.as_mut() else {
+            return Err(CoreError::Operational(format!(
+                "device '{device_name}' is unreachable and its relay is also unreachable"
+            )));
+        };
+        write_frame(
+            send,
+            &Frame::A2uiSnapshot {
+                conversation: self.endpoint.id().to_string(),
+                surface: surface_id.to_string(),
+                components,
+                data_model,
+                lamport,
+            },
+        )
+        .await
+        .map_err(|e| CoreError::Transport(e.to_string()))
     }
 
     /// Disconnect from a device (drop its live stream), optionally removing
@@ -903,4 +1184,246 @@ pub fn validate_a2ui_components(components: &serde_json::Value) -> Result<(), Co
         ));
     }
     Ok(())
+}
+
+/// Set `value` at RFC 6901 pointer `path` (e.g. `/dice/you`) within `root`,
+/// creating intermediate JSON objects as needed (JSON-Patch-style "add"
+/// semantics) — used by [`SessionCore::apply_data_model_pointer`] to build a
+/// full data model offline, where (unlike the live path) nothing on the
+/// other end applies the pointer for us. `path` must be non-empty (the
+/// caller handles `""` — "replace the whole model" — itself); object keys
+/// only (array-index tokens are treated as literal object keys, a reasonable
+/// degrade for the object-shaped data models the A2UI catalog's bindings
+/// use, rather than a panic).
+fn set_at_json_pointer(root: &mut serde_json::Value, path: &str, value: serde_json::Value) {
+    let tokens: Vec<String> =
+        path.split('/').skip(1).map(|t| t.replace("~1", "/").replace("~0", "~")).collect();
+    let Some((last, ancestors)) = tokens.split_last() else {
+        *root = value;
+        return;
+    };
+
+    let mut cursor = root;
+    for token in ancestors {
+        if !cursor.is_object() {
+            *cursor = serde_json::Value::Object(serde_json::Map::new());
+        }
+        cursor = cursor
+            .as_object_mut()
+            .expect("just ensured this is an object")
+            .entry(token.clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    }
+    if !cursor.is_object() {
+        *cursor = serde_json::Value::Object(serde_json::Map::new());
+    }
+    cursor.as_object_mut().expect("just ensured this is an object").insert(last.clone(), value);
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::set_at_json_pointer;
+
+    #[test]
+    fn sets_a_top_level_key() {
+        let mut root = serde_json::json!({});
+        set_at_json_pointer(&mut root, "/you", serde_json::json!(6));
+        assert_eq!(root, serde_json::json!({"you": 6}));
+    }
+
+    #[test]
+    fn creates_intermediate_objects() {
+        let mut root = serde_json::json!({});
+        set_at_json_pointer(&mut root, "/dice/you", serde_json::json!(6));
+        assert_eq!(root, serde_json::json!({"dice": {"you": 6}}));
+    }
+
+    #[test]
+    fn overwrites_an_existing_value_in_place() {
+        let mut root = serde_json::json!({"dice": {"you": 3, "them": 5}});
+        set_at_json_pointer(&mut root, "/dice/you", serde_json::json!(6));
+        assert_eq!(root, serde_json::json!({"dice": {"you": 6, "them": 5}}));
+    }
+
+    #[test]
+    fn decodes_tilde_escapes() {
+        let mut root = serde_json::json!({});
+        set_at_json_pointer(&mut root, "/a~1b/c~0d", serde_json::json!(1));
+        assert_eq!(root, serde_json::json!({"a/b": {"c~d": 1}}));
+    }
+}
+
+/// `SessionCore`'s delivery-chain and relay-coalescing behavior (task 4.7).
+/// Uses real iroh endpoints on localhost (not duplexes) since `send_message`/
+/// `render_ui`'s relay path dials out via `device::connect_device`, the same
+/// production code path `establish` uses.
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use iroh::endpoint::presets;
+    use iroh::{Endpoint, SecretKey};
+    use iroh_tickets::endpoint::EndpointTicket;
+
+    fn seed(start: u8) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = start.wrapping_add(i as u8);
+        }
+        s
+    }
+
+    /// Set the trio of env-var overrides these tests need (registry, mailbox,
+    /// relay A2UI store) at a fresh isolated directory, holding
+    /// `registry::ENV_TEST_LOCK` for the caller's whole test body (same
+    /// convention as every other module's env-var-mutating tests).
+    fn isolate(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("azula-core-relay-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", dir.join("registry"));
+        std::env::set_var("AZULA_MAILBOX_DIR", dir.join("mailbox"));
+        std::env::set_var("AZULA_RELAY_A2UI_DIR", dir.join("relay-a2ui"));
+        dir
+    }
+
+    fn unisolate() {
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        std::env::remove_var("AZULA_MAILBOX_DIR");
+        std::env::remove_var("AZULA_RELAY_A2UI_DIR");
+    }
+
+    async fn bare_core(machine_secret: Option<SecretKey>, session_cert: String) -> SessionCore {
+        let ep = Endpoint::builder(presets::Minimal).bind().await.expect("bind session endpoint");
+        SessionCore::from_parts(
+            Arc::new(ep),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            "test".to_string(),
+            "session-ticket".to_string(),
+            "session".to_string(),
+            session_cert,
+            machine_secret,
+        )
+    }
+
+    /// A real relay endpoint serving `mailbox_role::RelayLlmHandler`,
+    /// admitting sessions whose cert chains to `machine_root`. Returns its
+    /// dial ticket, its `LogStore` (to assert what landed as `agent_in`),
+    /// and its `RelayA2uiStore` (to assert A2UI snapshots).
+    async fn spawn_fake_relay(
+        name: &str,
+        machine_root: iroh::PublicKey,
+    ) -> (String, crate::sync::LogStore, relay_a2ui::RelayA2uiStore, iroh::PublicKey) {
+        let relay_ep = Endpoint::builder(presets::Minimal).bind().await.expect("bind relay endpoint");
+        let relay_ticket = EndpointTicket::new(relay_ep.addr()).to_string();
+        let relay_device_secret = SecretKey::generate();
+        let relay_device_pk = relay_device_secret.public();
+        let store = crate::sync::LogStore::open(
+            std::env::temp_dir().join(format!("azula-core-relay-test-store-{}-{name}", std::process::id())),
+            machine_root,
+        )
+        .expect("open relay log store");
+        let a2ui_store = relay_a2ui::RelayA2uiStore::open(
+            std::env::temp_dir().join(format!("azula-core-relay-test-a2ui-{}-{name}", std::process::id())),
+            machine_root,
+        )
+        .expect("open relay a2ui store");
+        let known_roots = Arc::new(AsyncMutex::new(vec![machine_root]));
+        let handler = crate::mailbox_role::RelayLlmHandler::new(
+            Arc::new(relay_device_secret),
+            store.clone(),
+            a2ui_store.clone(),
+            known_roots,
+        );
+        let _router = Router::builder(relay_ep).accept(LLM_ALPN, handler).spawn();
+        // Leak the router so it keeps serving for the test's lifetime — a
+        // background test process, not something that needs clean shutdown.
+        std::mem::forget(_router);
+        (relay_ticket, store, a2ui_store, relay_device_pk)
+    }
+
+    #[tokio::test]
+    async fn send_message_falls_back_to_local_mailbox_when_no_relay_is_known() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        isolate("no_relay");
+
+        let core = bare_core(None, "azd-fake-session-cert".to_string()).await;
+        let outcome = core.send_message("ghost-device", "hi there".to_string()).await.unwrap();
+        assert!(matches!(outcome, SendOutcome::Queued));
+        assert!(!mailbox::load("ghost-device").is_empty(), "must have queued locally");
+
+        unisolate();
+    }
+
+    #[tokio::test]
+    async fn send_message_prefers_relay_over_local_mailbox_when_a_relay_hint_is_known() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        isolate("prefers_relay");
+
+        let machine = SecretKey::from_bytes(&seed(0x70));
+        let (relay_ticket, relay_store, _a2ui, relay_device_pk) =
+            spawn_fake_relay("prefers_relay", machine.public()).await;
+
+        let session_ep = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let session_cert =
+            certs::mint_session_cert(&machine, session_ep.id(), certs::DEFAULT_SESSION_EXPIRY).encode();
+        let core = SessionCore::from_parts(
+            Arc::new(session_ep.clone()),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            "test".to_string(),
+            "session-ticket".to_string(),
+            "session".to_string(),
+            session_cert,
+            Some(machine.clone()),
+        );
+
+        registry::set_relay("phone", &relay_ticket).unwrap();
+
+        let outcome = core.send_message("phone", "hello from claude".to_string()).await.unwrap();
+        assert!(matches!(outcome, SendOutcome::Queued));
+
+        // Wait for the relay to fold the Chat frame into an agent_in entry.
+        let entries = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let entries = relay_store.read_from(&relay_device_pk, 0).await.unwrap();
+                if !entries.is_empty() {
+                    return entries;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for agent_in to land on the relay");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, crate::eventlog::Kind::AgentIn);
+        let body: crate::eventlog::AgentInBody = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body.conversation, session_ep.id().to_string(), "conversation keyed by the session's own pk");
+        assert_eq!(body.text, "hello from claude");
+
+        assert!(
+            mailbox::load("phone").is_empty(),
+            "must NOT have fallen back to the local mailbox once the relay took it"
+        );
+
+        unisolate();
+    }
+
+    #[tokio::test]
+    async fn oversized_a2ui_snapshot_is_rejected_client_side_before_any_relay_dial() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        isolate("oversized");
+
+        let core = bare_core(None, "azd-fake-session-cert".to_string()).await;
+        // An unresolvable relay ticket -- if the cap check didn't run first,
+        // this would hang/fail on a dial attempt instead of erroring fast.
+        registry::set_relay("phone", "not-a-real-ticket").unwrap();
+
+        let huge = serde_json::json!({"id": "root", "text": "x".repeat(relay_a2ui::MAX_SNAPSHOT_BYTES + 1)});
+        let err = core.render_ui("phone", serde_json::json!([huge]), None, Some("dice-1".to_string())).await.unwrap_err();
+        assert!(matches!(err, CoreError::Usage(_)));
+        assert!(err.to_string().contains("256 KiB"), "{err}");
+
+        unisolate();
+    }
 }

@@ -1,7 +1,14 @@
-//! The `mailbox` role: `azula mailbox` binds a linked identity's chat, sync,
-//! and link ALPNs, and durably serves store-and-forward plus bootstrap sync
-//! for the identity, per `specs/account-sync/spec.md`'s "Mailbox Role Stores
-//! and Forwards" and "New Device Bootstrap Replays the Logs" requirements.
+//! The `relay` role (`azula relay`; `azula mailbox` is now an alias — relay
+//! spec: "Relay Subsumes the Mailbox Role"): binds a linked identity's chat,
+//! LLM, sync, and link ALPNs, and durably serves store-and-forward plus
+//! bootstrap sync for the identity, per `specs/account-sync/spec.md`'s
+//! "Mailbox Role Stores and Forwards" and "New Device Bootstrap Replays the
+//! Logs" requirements, plus `specs/relay/spec.md`'s agent-chat and A2UI
+//! snapshot capabilities. The module/file name and its "mailbox" internals
+//! (`log_store_dir`, `CHAT_ALPN`, `ChatHandler`, …) are kept as-is
+//! (cli-multi-session-relay task 4.1: "keep file/module names... to limit
+//! churn") — only user-facing strings (the CLI command, banner, log lines)
+//! say "relay".
 //!
 //! Deliberately independent of `mailbox.rs` (the CLI bridge's existing
 //! per-device JSONL mailbox for bridge tooling, which the spec says stays
@@ -10,16 +17,27 @@
 //! `mailbox.rs`.
 //!
 //! Layout, innermost-out:
-//!   - [`run_chat_session`] — the testable core: gates a peer's first
-//!     stream (`accept_gate::gate_peer`, certs + legacy invites) and folds
-//!     every `Frame::Chat` into a `message_in` log entry
+//!   - [`run_chat_session`] — the testable core for [`CHAT_ALPN`]: gates a
+//!     peer's first stream (`accept_gate::gate_peer`, certs + legacy
+//!     invites) and folds every `Frame::Chat` into a `message_in` log entry
 //!     (`sync::LogStore::append_own`).
 //!   - [`ChatHandler`] — thin iroh `ProtocolHandler` wiring on top, exactly
 //!     the `sync.rs`/`link.rs` pattern.
-//!   - [`run`] — the `azula mailbox` command: load the linked identity,
-//!     bind its node key, and serve [`CHAT_ALPN`] + `sync::SYNC_ALPN` +
-//!     `link::LINK_ALPN` (via `link::RootlessLinkHandler` — this device
-//!     holds no root secret) until Ctrl-C.
+//!   - [`run_llm_session`] — the testable core for [`crate::mcp::LLM_ALPN`]
+//!     (relay spec: "Relay Carries Agent Chat" / "Relay Holds A2UI Snapshots
+//!     Outside the Log"): admits a session by its `azd…` session cert
+//!     chaining to a known machine contact (no invite path on this ALPN),
+//!     then folds `Frame::Chat` into `agent_in` log entries and
+//!     `Frame::A2uiSnapshot` into [`crate::core::relay_a2ui::RelayA2uiStore`].
+//!   - [`RelayLlmHandler`] — thin iroh wiring on top, mirroring
+//!     [`ChatHandler`].
+//!   - [`run`] — the `azula relay` command (also `azula mailbox`, unchanged
+//!     call site in `cli/legacy.rs`): load the linked identity, bind its
+//!     node key, and serve [`CHAT_ALPN`] + [`crate::mcp::LLM_ALPN`] +
+//!     `sync::SYNC_ALPN` (with a [`crate::sync::PreSyncAckHook`] replaying
+//!     pending A2UI snapshots) + `link::LINK_ALPN` (via
+//!     `link::RootlessLinkHandler` — this device holds no root secret)
+//!     until Ctrl-C.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -36,11 +54,11 @@ use tracing::{info, warn};
 
 use crate::accept_gate::{gate_peer, CertGate, GatePeerOutcome};
 use crate::certs::{DeviceCert, Revocation};
-use crate::eventlog::Kind;
+use crate::eventlog::{AgentInBody, Kind};
 use crate::link::{RootlessLinkHandler, LINK_ALPN};
 use crate::linked_identity::{self, NODE_IDENTITY_NAME};
 use crate::proto::{read_frame, write_frame, Frame, IdentityBundle};
-use crate::sync::{LogStore, SyncHandler, SYNC_ALPN};
+use crate::sync::{LogStore, PreSyncAckHook, SyncHandler, SYNC_ALPN};
 use crate::{endpoint, identity};
 
 /// ALPN identifier for the identity's peer-chat protocol (matches
@@ -245,6 +263,17 @@ impl ChatHandler {
             allow_legacy,
         }
     }
+
+    /// Share this handler's live known-roots set — a root a certified peer
+    /// pins here (`run_chat_session`'s `gate_peer` call) becomes visible to
+    /// whatever else holds this handle too. `azula relay`'s `run` hands the
+    /// same handle to [`RelayLlmHandler`] so a contact recognized on one
+    /// ALPN is recognized on the other (task 4.3: "derive [the LLM ALPN
+    /// admission gate's known-contacts set] from the same fold/contact
+    /// source `mailbox_role`'s chat gate uses").
+    pub fn known_roots_handle(&self) -> Arc<AsyncMutex<Vec<PublicKey>>> {
+        self.known_roots.clone()
+    }
 }
 
 impl std::fmt::Debug for ChatHandler {
@@ -279,6 +308,158 @@ impl ProtocolHandler for ChatHandler {
 }
 
 // ---------------------------------------------------------------------------
+// LLM-ALPN admission (relay spec: "Relay Carries Agent Chat") — testable core
+// ---------------------------------------------------------------------------
+
+/// 15 s cap on waiting for a connecting session's first frame — mirrors
+/// `accept_gate`'s `STRANGER_HELLO_TIMEOUT` (that constant is private to
+/// that module, so this is its own copy rather than an export).
+const LLM_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Admit a session dialing in on the LLM ALPN and, once admitted, fold its
+/// `Chat`/`A2uiSnapshot` frames — relay spec's "Relay Carries Agent Chat" and
+/// "Relay Holds A2UI Snapshots Outside the Log": the relay SHALL admit a
+/// session "by the same certificate gate the phone applies (session cert
+/// chaining to a machine root that is a known contact of the identity)".
+///
+/// Admission (task 4.3, all of which must hold): the first frame is
+/// `Hello{cert}`; the cert decodes and `certs::verify_session_cert` passes
+/// against `remote_node_id` (signature, [`FLAG_SESSION`](crate::certs::FLAG_SESSION),
+/// unexpired, `device_pk == remote_node_id`); and `cert.root_pk` is already
+/// in `known_roots` — the *same* live set [`ChatHandler`]'s `gate_peer` call
+/// maintains (see [`ChatHandler::known_roots_handle`]), so a machine root
+/// pinned as a contact via ordinary peer chat is recognized here too, and
+/// vice versa. Anything else closes the connection outright — this ALPN has
+/// no invite fallback (unlike [`run_chat_session`]'s stranger path): a
+/// process without a valid session cert chaining to a known machine contact
+/// is simply not admitted (relay spec: "Uncertified stranger refused by the
+/// relay").
+///
+/// Once admitted, `conversation` for both folded kinds is the *session's*
+/// public key hex (`cert.device_pk`, which — per `verify_session_cert` —
+/// already equals `remote_node_id`): `Frame::Chat{text,id}` appends an
+/// `agent_in` entry on `device_secret`'s own log (`from_name` from the
+/// `Hello`, when non-empty), and `Frame::A2uiSnapshot` writes into
+/// `a2ui_store` (its own `conversation` field is deliberately ignored here —
+/// the connection's already-authenticated cert is the only trustworthy
+/// source for that key, never a client-declared one). Any other frame is
+/// ignored; this ALPN carries agent chat and A2UI snapshots only.
+pub async fn run_llm_session<R, W>(
+    reader: R,
+    _writer: W,
+    remote_node_id: EndpointId,
+    device_secret: &SecretKey,
+    store: &LogStore,
+    a2ui_store: &crate::core::relay_a2ui::RelayA2uiStore,
+    known_roots: &AsyncMutex<Vec<PublicKey>>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+
+    let first = match tokio::time::timeout(LLM_HELLO_TIMEOUT, read_frame(&mut reader)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            info!(%remote_node_id, "relay: session's first frame timed out; closing");
+            return Ok(());
+        }
+    };
+    let Ok(Some(Frame::Hello { name, cert: Some(cert_str), .. })) = first else {
+        info!(%remote_node_id, "relay: session presented no cert; closing (no invite fallback on this ALPN)");
+        return Ok(());
+    };
+    let Ok(cert) = DeviceCert::decode(&cert_str) else {
+        info!(%remote_node_id, "relay: session's cert did not decode; closing");
+        return Ok(());
+    };
+    if let Err(e) = crate::certs::verify_session_cert(&cert, remote_node_id) {
+        info!(%remote_node_id, error = %e, "relay: session cert failed verification; closing");
+        return Ok(());
+    }
+    {
+        let roots = known_roots.lock().await;
+        if !roots.contains(&cert.root_pk) {
+            info!(%remote_node_id, root_pk = %cert.root_pk, "relay: session's root is not a known contact; closing");
+            return Ok(());
+        }
+    }
+
+    let conversation = cert.device_pk.to_string();
+    let from_name = if name.trim().is_empty() { None } else { Some(name) };
+    info!(%remote_node_id, %conversation, "relay: session admitted on the LLM ALPN");
+
+    loop {
+        match read_frame(&mut reader).await {
+            Ok(Some(Frame::Chat { text, id })) => {
+                let body = AgentInBody { conversation: conversation.clone(), text, id, from_name: from_name.clone() };
+                match serde_json::to_string(&body) {
+                    Ok(body_json) => {
+                        if let Err(e) = store.append_own(device_secret, Kind::AgentIn, body_json).await {
+                            warn!(error = %e, "relay: failed to append agent_in");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "relay: failed to serialize agent_in body"),
+                }
+            }
+            Ok(Some(Frame::A2uiSnapshot { surface, components, data_model, lamport, .. })) => {
+                if let Err(e) = a2ui_store.put(&conversation, &surface, components, data_model, lamport).await {
+                    warn!(%surface, error = %e, "relay: dropped oversized A2UI snapshot");
+                }
+            }
+            Ok(Some(_)) => {} // this ALPN carries agent chat + A2UI snapshots only
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                warn!(error = %e, "relay: llm stream read error");
+                return Ok(());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// iroh wiring — thin: all protocol logic lives in `run_llm_session`.
+// ---------------------------------------------------------------------------
+
+/// iroh `ProtocolHandler` for [`crate::mcp::LLM_ALPN`]: accepts a dialed-in
+/// bi stream and hands it straight to [`run_llm_session`].
+#[derive(Clone)]
+pub struct RelayLlmHandler {
+    device_secret: Arc<SecretKey>,
+    store: LogStore,
+    a2ui_store: crate::core::relay_a2ui::RelayA2uiStore,
+    known_roots: Arc<AsyncMutex<Vec<PublicKey>>>,
+}
+
+impl RelayLlmHandler {
+    pub fn new(
+        device_secret: Arc<SecretKey>,
+        store: LogStore,
+        a2ui_store: crate::core::relay_a2ui::RelayA2uiStore,
+        known_roots: Arc<AsyncMutex<Vec<PublicKey>>>,
+    ) -> Self {
+        Self { device_secret, store, a2ui_store, known_roots }
+    }
+}
+
+impl std::fmt::Debug for RelayLlmHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayLlmHandler").field("device_pk", &self.device_secret.public()).finish()
+    }
+}
+
+impl ProtocolHandler for RelayLlmHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let remote_id = connection.remote_id();
+        let (send, recv) = connection.accept_bi().await.map_err(|e| AcceptError::from_boxed(e.into()))?;
+        run_llm_session(recv, send, remote_id, &self.device_secret, &self.store, &self.a2ui_store, &self.known_roots)
+            .await
+            .map_err(|e| AcceptError::from_boxed(e.into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `azula mailbox` command
 // ---------------------------------------------------------------------------
 
@@ -301,18 +482,22 @@ pub fn log_store_dir() -> Option<PathBuf> {
     }
 }
 
-/// Run `azula mailbox`: load the identity linked via `azula link`, bind its
-/// node key, and serve the chat/sync/link ALPNs until Ctrl-C.
+/// Run `azula relay`: load the identity linked via `azula link`, bind its
+/// node key, and serve the chat/LLM/sync/link ALPNs until Ctrl-C. relay
+/// spec: "Relay Subsumes the Mailbox Role" — `azula mailbox` (`cli/legacy.rs`'s
+/// `cmd_mailbox`) calls this exact function too, unchanged, so both commands
+/// get identical behavior; kept named `mailbox_role::run` (not renamed) to
+/// limit churn to files outside this phase's ownership.
 pub async fn run(allow_legacy: bool) -> Result<()> {
     let linked = linked_identity::load()
-        .context("no linked identity found -- run `azula link [--mailbox]` first")?;
-    let cert = DeviceCert::decode(&linked.cert).context("mailbox: stored certificate is corrupt")?;
-    cert.verify().context("mailbox: stored certificate no longer verifies")?;
+        .context("no linked identity found -- run `azula link [--relay]` first")?;
+    let cert = DeviceCert::decode(&linked.cert).context("relay: stored certificate is corrupt")?;
+    cert.verify().context("relay: stored certificate no longer verifies")?;
 
     let revocations = verified_revocations_from_bundle(&linked.bundle);
     anyhow::ensure!(
         !cert.is_revoked_by(&revocations),
-        "mailbox: this device's own certificate has been revoked; re-link with `azula link`"
+        "relay: this device's own certificate has been revoked; re-link with `azula link`"
     );
     let known_roots = known_roots_from_bundle(&linked.bundle);
 
@@ -320,15 +505,22 @@ pub async fn run(allow_legacy: bool) -> Result<()> {
     let node_id = endpoint.id();
     anyhow::ensure!(
         cert.binds_to_connection(node_id),
-        "mailbox: stored certificate's device key does not match this device's node id -- re-link with `azula link`"
+        "relay: stored certificate's device key does not match this device's node id -- re-link with `azula link`"
     );
 
-    let dir = log_store_dir().context("cannot resolve mailbox log directory ($HOME unset)")?;
+    let dir = log_store_dir().context("cannot resolve relay log directory ($HOME unset)")?;
     // multi-device-identity task 4.6: namespace by the identity's root pk,
     // already known from the stored, just-verified certificate -- never a
     // placeholder. See `sync::LogStore::open`'s doc comment.
     let store = LogStore::open(dir, cert.root_pk)?;
     let device_secret = Arc::new(identity::load_or_create_secret(NODE_IDENTITY_NAME));
+
+    // relay spec: "Relay Holds A2UI Snapshots Outside the Log" -- a bounded
+    // side store, namespaced by the same root pk, deliberately never fed
+    // into `store` (the hash-chained identity log).
+    let a2ui_dir = crate::core::relay_a2ui::default_store_dir()
+        .context("cannot resolve relay A2UI store directory ($HOME unset)")?;
+    let a2ui_store = crate::core::relay_a2ui::RelayA2uiStore::open(a2ui_dir, cert.root_pk)?;
 
     let banner = vec![
         "  Paste this code into the linked app to reconnect it here:".to_string(),
@@ -339,31 +531,56 @@ pub async fn run(allow_legacy: bool) -> Result<()> {
         String::new(),
         "  Serving ALPNs:".to_string(),
         format!("    {}  peer chat (store-and-forward)", String::from_utf8_lossy(CHAT_ALPN)),
+        format!("    {}  agent chat + A2UI snapshots (relay)", String::from_utf8_lossy(crate::mcp::LLM_ALPN)),
         format!("    {}  identity log sync (bootstrap source)", String::from_utf8_lossy(SYNC_ALPN)),
         format!(
             "    {}  link (always declines -- this device holds no root secret)",
             String::from_utf8_lossy(LINK_ALPN)
         ),
     ];
-    endpoint::print_banner("azula mailbox", &banner);
+    endpoint::print_banner("azula relay", &banner);
 
     let chat_handler = ChatHandler::new(
-        device_secret,
+        device_secret.clone(),
         linked.cert.clone(),
         store.clone(),
         known_roots,
         revocations.clone(),
         allow_legacy,
     );
-    let sync_handler = SyncHandler::new(cert, revocations, store);
+    // task 4.3: the LLM ALPN's admission gate shares ChatHandler's live
+    // known-roots set, so a contact pinned via one ALPN is recognized by
+    // the other.
+    let known_roots_shared = chat_handler.known_roots_handle();
+    let llm_handler = RelayLlmHandler::new(device_secret, store.clone(), a2ui_store.clone(), known_roots_shared);
+
+    // relay spec: "A2UI Snapshot Replay on Reconnect" -- after streaming a
+    // sync session's catch-up gap but before this side's SyncAck (see
+    // `sync::PreSyncAckHook`'s doc for why not after: the phone's bounded
+    // catch-up mode stops listening the instant the ack arrives), replay
+    // whatever pending A2UI snapshots that device hasn't seen yet, one
+    // `SyncA2ui` frame per conversation with pending messages.
+    let a2ui_store_for_hook = a2ui_store.clone();
+    let pre_ack_hook: PreSyncAckHook = Arc::new(move |peer_device_pk: PublicKey| {
+        let a2ui_store = a2ui_store_for_hook.clone();
+        Box::pin(async move {
+            let by_conversation = a2ui_store.drain_pending_messages_for_device(&peer_device_pk.to_string()).await;
+            by_conversation
+                .into_iter()
+                .map(|(conversation, messages)| Frame::SyncA2ui { conversation, messages })
+                .collect()
+        })
+    });
+    let sync_handler = SyncHandler::new(cert, revocations, store).with_pre_ack_hook(pre_ack_hook);
 
     let router = Router::builder(endpoint)
         .accept(CHAT_ALPN, chat_handler)
+        .accept(crate::mcp::LLM_ALPN, llm_handler)
         .accept(SYNC_ALPN, sync_handler)
         .accept(LINK_ALPN, RootlessLinkHandler)
         .spawn();
 
-    info!("mailbox serving — press Ctrl-C to stop");
+    info!("relay serving — press Ctrl-C to stop");
     tokio::signal::ctrl_c().await?;
     info!("shutting down…");
     router.shutdown().await?;
@@ -893,5 +1110,389 @@ mod tests {
                 store_mailbox.read_from(&device.public(), 0).await.unwrap()
             );
         }
+    }
+
+    // --- run_llm_session (task 4.3: relay's LLM-ALPN admission gate) -------
+
+    fn session_cert(machine: &SecretKey, session: &SecretKey) -> DeviceCert {
+        crate::certs::mint_session_cert(machine, session.public(), crate::certs::DEFAULT_SESSION_EXPIRY)
+    }
+
+    #[tokio::test]
+    async fn llm_session_admits_a_valid_session_cert_and_folds_chat_to_agent_in() {
+        let machine = SecretKey::from_bytes(&seed(0x50));
+        let session = SecretKey::from_bytes(&seed(0x51));
+        let relay_device = SecretKey::from_bytes(&seed(0x52));
+        let cert = session_cert(&machine, &session);
+
+        let store = LogStore::open(test_dir("llm_admit"), machine.public()).unwrap();
+        let a2ui_store =
+            crate::core::relay_a2ui::RelayA2uiStore::open(test_dir("llm_admit_a2ui"), machine.public()).unwrap();
+        let known_roots = AsyncMutex::new(vec![machine.public()]);
+
+        let (mut other_writer, _other_reader, my_reader, my_writer) = wire_pair();
+        write_frame(&mut other_writer, &Frame::Hello { name: "Claude".into(), invite: None, cert: Some(cert.encode()) })
+            .await
+            .unwrap();
+        write_frame(&mut other_writer, &Frame::Chat { text: "hello from claude".into(), id: Some("abc123".into()) })
+            .await
+            .unwrap();
+        drop(other_writer);
+
+        run_llm_session(my_reader, my_writer, session.public(), &relay_device, &store, &a2ui_store, &known_roots)
+            .await
+            .unwrap();
+
+        let entries = store.read_from(&relay_device.public(), 0).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Kind::AgentIn);
+        let body: AgentInBody = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body.conversation, session.public().to_string(), "conversation keyed by the SESSION's own pk");
+        assert_eq!(body.text, "hello from claude");
+        assert_eq!(body.id.as_deref(), Some("abc123"));
+        assert_eq!(body.from_name.as_deref(), Some("Claude"));
+    }
+
+    #[tokio::test]
+    async fn llm_session_closes_a_session_whose_root_is_not_a_known_contact() {
+        let machine = SecretKey::from_bytes(&seed(0x53));
+        let session = SecretKey::from_bytes(&seed(0x54));
+        let relay_device = SecretKey::from_bytes(&seed(0x55));
+        let cert = session_cert(&machine, &session);
+
+        let store = LogStore::open(test_dir("llm_unknown_root"), machine.public()).unwrap();
+        let a2ui_store =
+            crate::core::relay_a2ui::RelayA2uiStore::open(test_dir("llm_unknown_root_a2ui"), machine.public())
+                .unwrap();
+        let known_roots = AsyncMutex::new(Vec::new()); // machine.public() is NOT a known contact
+
+        let (mut other_writer, _other_reader, my_reader, my_writer) = wire_pair();
+        write_frame(&mut other_writer, &Frame::Hello { name: "Claude".into(), invite: None, cert: Some(cert.encode()) })
+            .await
+            .unwrap();
+        write_frame(&mut other_writer, &Frame::Chat { text: "should not land".into(), id: None }).await.unwrap();
+        drop(other_writer);
+
+        run_llm_session(my_reader, my_writer, session.public(), &relay_device, &store, &a2ui_store, &known_roots)
+            .await
+            .unwrap();
+
+        assert!(
+            store.read_from(&relay_device.public(), 0).await.unwrap().is_empty(),
+            "an uncertified stranger (unknown root) must not be admitted -- relay spec's 'falls through to the ordinary invite path' has no invite concept on this ALPN, so closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_session_closes_a_connection_with_no_cert() {
+        let machine = SecretKey::from_bytes(&seed(0x56));
+        let session = SecretKey::from_bytes(&seed(0x57));
+        let relay_device = SecretKey::from_bytes(&seed(0x58));
+
+        let store = LogStore::open(test_dir("llm_no_cert"), machine.public()).unwrap();
+        let a2ui_store =
+            crate::core::relay_a2ui::RelayA2uiStore::open(test_dir("llm_no_cert_a2ui"), machine.public()).unwrap();
+        let known_roots = AsyncMutex::new(vec![machine.public()]);
+
+        let (mut other_writer, _other_reader, my_reader, my_writer) = wire_pair();
+        write_frame(&mut other_writer, &Frame::Hello { name: "Claude".into(), invite: None, cert: None }).await.unwrap();
+        write_frame(&mut other_writer, &Frame::Chat { text: "should not land".into(), id: None }).await.unwrap();
+        drop(other_writer);
+
+        run_llm_session(my_reader, my_writer, session.public(), &relay_device, &store, &a2ui_store, &known_roots)
+            .await
+            .unwrap();
+
+        assert!(store.read_from(&relay_device.public(), 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn llm_session_stores_a2ui_snapshot_keyed_by_the_authenticated_session_not_the_client_claim() {
+        let machine = SecretKey::from_bytes(&seed(0x59));
+        let session = SecretKey::from_bytes(&seed(0x5a));
+        let relay_device = SecretKey::from_bytes(&seed(0x5b));
+        let cert = session_cert(&machine, &session);
+
+        let store = LogStore::open(test_dir("llm_a2ui"), machine.public()).unwrap();
+        let a2ui_store =
+            crate::core::relay_a2ui::RelayA2uiStore::open(test_dir("llm_a2ui_snap"), machine.public()).unwrap();
+        let known_roots = AsyncMutex::new(vec![machine.public()]);
+
+        let (mut other_writer, _other_reader, my_reader, my_writer) = wire_pair();
+        write_frame(&mut other_writer, &Frame::Hello { name: "Claude".into(), invite: None, cert: Some(cert.encode()) })
+            .await
+            .unwrap();
+        write_frame(
+            &mut other_writer,
+            &Frame::A2uiSnapshot {
+                conversation: "ignored-client-claim".into(),
+                surface: "dice-1".into(),
+                components: Some(serde_json::json!([{"id":"root"}])),
+                data_model: None,
+                lamport: 1,
+            },
+        )
+        .await
+        .unwrap();
+        drop(other_writer);
+
+        run_llm_session(my_reader, my_writer, session.public(), &relay_device, &store, &a2ui_store, &known_roots)
+            .await
+            .unwrap();
+
+        let pending = a2ui_store.drain_pending_messages_for_device("some-phone").await;
+        let conversation_key = session.public().to_string();
+        assert!(
+            pending.contains_key(&conversation_key),
+            "must be stored under the SESSION's own authenticated pk, not the client-claimed conversation field; got keys: {:?}",
+            pending.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(pending[&conversation_key].len(), 2, "createSurface + updateComponents");
+    }
+
+    // --- Headline 4.7 scenario: relay-carried agent chat converges to the ---
+    // --- phone purely via sync, exactly like `message_in`/mailbox already --
+    // --- does for peer chat.                                              --
+
+    /// relay spec's "Laptop asleep, message still delivered" / account-sync
+    /// spec's "Relayed agent message folds into the session conversation": a
+    /// session delivers `Chat` to the relay's LLM ALPN while the phone is
+    /// offline (it never appears in this test at all during delivery); the
+    /// phone later syncs with the relay and receives the resulting
+    /// `agent_in` entry, keyed by the session's own public key.
+    #[tokio::test]
+    async fn session_delivers_chat_to_relay_and_phone_receives_agent_in_via_sync() {
+        let machine = SecretKey::from_bytes(&seed(0x60));
+        let session = SecretKey::from_bytes(&seed(0x61));
+        let relay_device = SecretKey::from_bytes(&seed(0x62));
+        let phone_device = SecretKey::from_bytes(&seed(0x63));
+        let cert = session_cert(&machine, &session);
+        let cert_relay = make_cert(&machine, &relay_device, "relay");
+        let cert_phone = make_cert(&machine, &phone_device, "phone");
+
+        let relay_store = LogStore::open(test_dir("convergence_relay"), machine.public()).unwrap();
+        let a2ui_store =
+            crate::core::relay_a2ui::RelayA2uiStore::open(test_dir("convergence_relay_a2ui"), machine.public())
+                .unwrap();
+        let known_roots = AsyncMutex::new(vec![machine.public()]);
+
+        // Step 1: the session delivers a Chat frame to the relay's LLM-ALPN
+        // admission path. The phone is never touched here at all -- it's
+        // simply not part of this delivery.
+        let (mut other_writer, _other_reader, my_reader, my_writer) = wire_pair();
+        write_frame(&mut other_writer, &Frame::Hello { name: "Claude".into(), invite: None, cert: Some(cert.encode()) })
+            .await
+            .unwrap();
+        write_frame(&mut other_writer, &Frame::Chat { text: "build failed, please look".into(), id: Some("retry-id-1".into()) })
+            .await
+            .unwrap();
+        drop(other_writer);
+        run_llm_session(my_reader, my_writer, session.public(), &relay_device, &relay_store, &a2ui_store, &known_roots)
+            .await
+            .unwrap();
+
+        // Step 2: the phone, having been offline this whole time, syncs with
+        // the relay and picks up the agent_in entry the relay logged.
+        let phone_store = LogStore::open(test_dir("convergence_phone"), machine.public()).unwrap();
+        sync_until_converged(&cert_phone, &phone_store, &cert_relay, &relay_store).await;
+
+        let entries = phone_store.read_from(&relay_device.public(), 0).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Kind::AgentIn);
+        let body: AgentInBody = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body.conversation, session.public().to_string(), "keyed by the SESSION's public key");
+        assert_eq!(body.text, "build failed, please look");
+        assert_eq!(body.id.as_deref(), Some("retry-id-1"));
+        assert_eq!(body.from_name.as_deref(), Some("Claude"));
+        // Exact entry bytes decode: a byte round trip through the same
+        // base64 codec the wire uses.
+        assert_eq!(crate::eventlog::LogEntry::from_base64(&entries[0].to_base64()).unwrap(), entries[0]);
+    }
+
+    // --- A2UI snapshot replay on reconnect (task 4.6/4.7) -------------------
+
+    /// Drive the "phone" side of one sync round manually rather than via
+    /// `sync::run_session` (which only understands `SyncEntries`/`SyncAck`
+    /// and deliberately ignores anything else, per its own doc comment) so
+    /// this test can also capture `SyncA2ui` frames. Stops listening the
+    /// instant `SyncAck` arrives -- mirrors the Kotlin receive loop's bounded
+    /// `untilAck` catch-up cutoff the coordinator flagged, which is exactly
+    /// why the relay's `PreSyncAckHook` fires *before* the ack, not after.
+    async fn run_phone_side_capturing_sync_a2ui<R, W>(
+        reader: R,
+        mut writer: W,
+        my_cert: &DeviceCert,
+        store: &LogStore,
+    ) -> Vec<Frame>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut reader = BufReader::new(reader);
+        write_frame(&mut writer, &Frame::SyncHello { cert: my_cert.encode() }).await.unwrap();
+        match read_frame(&mut reader).await.unwrap() {
+            Some(Frame::SyncHello { .. }) => {}
+            other => panic!("expected SyncHello, got {other:?}"),
+        }
+        let my_vector = store.vector().await;
+        write_frame(&mut writer, &Frame::SyncVector { vector: my_vector }).await.unwrap();
+        match read_frame(&mut reader).await.unwrap() {
+            Some(Frame::SyncVector { .. }) => {}
+            other => panic!("expected SyncVector, got {other:?}"),
+        }
+
+        let mut captured = Vec::new();
+        loop {
+            match read_frame(&mut reader).await.unwrap() {
+                Some(Frame::SyncEntries { entries }) => {
+                    for b64 in entries {
+                        let entry = crate::eventlog::LogEntry::from_base64(&b64).unwrap();
+                        let _ = store.append(entry).await;
+                    }
+                }
+                Some(f @ Frame::SyncA2ui { .. }) => captured.push(f),
+                Some(Frame::SyncAck { .. }) => break,
+                Some(other) => panic!("unexpected frame: {other:?}"),
+                None => break,
+            }
+        }
+        captured
+    }
+
+    /// Builds the same `PreSyncAckHook` `azula relay`'s `run` wires up:
+    /// drain `a2ui_store`'s pending messages for the syncing peer, one
+    /// `SyncA2ui` frame per conversation.
+    fn a2ui_replay_hook(a2ui_store: crate::core::relay_a2ui::RelayA2uiStore) -> PreSyncAckHook {
+        Arc::new(move |peer_device_pk: PublicKey| {
+            let store = a2ui_store.clone();
+            Box::pin(async move {
+                store
+                    .drain_pending_messages_for_device(&peer_device_pk.to_string())
+                    .await
+                    .into_iter()
+                    .map(|(conversation, messages)| Frame::SyncA2ui { conversation, messages })
+                    .collect()
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn replay_after_sync_delivers_pending_once_and_not_again_to_the_same_device() {
+        let machine = SecretKey::from_bytes(&seed(0x64));
+        let phone_device = SecretKey::from_bytes(&seed(0x65));
+        let phone_device_pk = phone_device.public();
+        let relay_device = SecretKey::from_bytes(&seed(0x66));
+        let cert_relay = make_cert(&machine, &relay_device, "relay");
+        let cert_phone = make_cert(&machine, &phone_device, "phone");
+
+        let relay_store = LogStore::open(test_dir("replay_relay_store"), machine.public()).unwrap();
+        let phone_store = LogStore::open(test_dir("replay_phone_store"), machine.public()).unwrap();
+        let a2ui_store =
+            crate::core::relay_a2ui::RelayA2uiStore::open(test_dir("replay_a2ui"), machine.public()).unwrap();
+        a2ui_store.put("conv1", "dice-1", Some(serde_json::json!([{"id":"root"}])), None, 1).await.unwrap();
+        let hook = a2ui_replay_hook(a2ui_store.clone());
+
+        // First sync: the phone must receive the one pending SyncA2ui frame.
+        let (a_end, b_end) = tokio::io::duplex(1 << 16);
+        let (relay_reader, relay_writer) = tokio::io::split(a_end);
+        let (phone_reader, phone_writer) = tokio::io::split(b_end);
+        let cert_relay_owned = cert_relay.clone();
+        let store_owned = relay_store.clone();
+        let hook_owned = hook.clone();
+        let relay_task = tokio::spawn(async move {
+            crate::sync::run_session_with_hook(
+                relay_reader, relay_writer, &cert_relay_owned, &[], phone_device_pk, store_owned, Some(hook_owned),
+            )
+            .await
+        });
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_phone_side_capturing_sync_a2ui(phone_reader, phone_writer, &cert_phone, &phone_store),
+        )
+        .await
+        .expect("timed out waiting for the first sync round to reach SyncAck");
+        relay_task.abort();
+
+        assert_eq!(received.len(), 1, "one SyncA2ui frame for the one pending conversation");
+        match &received[0] {
+            Frame::SyncA2ui { conversation, messages } => {
+                assert_eq!(conversation, "conv1");
+                assert_eq!(messages.len(), 2, "createSurface + updateComponents");
+            }
+            other => panic!("expected SyncA2ui, got {other:?}"),
+        }
+
+        // Second sync from the SAME device: the snapshot hasn't changed, so
+        // nothing should replay again.
+        let (a_end2, b_end2) = tokio::io::duplex(1 << 16);
+        let (relay_reader2, relay_writer2) = tokio::io::split(a_end2);
+        let (phone_reader2, phone_writer2) = tokio::io::split(b_end2);
+        let cert_relay_owned2 = cert_relay.clone();
+        let store_owned2 = relay_store.clone();
+        let relay_task2 = tokio::spawn(async move {
+            crate::sync::run_session_with_hook(
+                relay_reader2, relay_writer2, &cert_relay_owned2, &[], phone_device_pk, store_owned2, Some(hook),
+            )
+            .await
+        });
+        let received2 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_phone_side_capturing_sync_a2ui(phone_reader2, phone_writer2, &cert_phone, &phone_store),
+        )
+        .await
+        .expect("timed out waiting for the second sync round to reach SyncAck");
+        relay_task2.abort();
+
+        assert!(received2.is_empty(), "already-delivered snapshot must not replay again to the same device");
+    }
+
+    #[tokio::test]
+    async fn replay_after_sync_redelivers_once_the_snapshot_changes_again() {
+        let machine = SecretKey::from_bytes(&seed(0x67));
+        let phone_device = SecretKey::from_bytes(&seed(0x68));
+        let phone_device_pk = phone_device.public();
+        let relay_device = SecretKey::from_bytes(&seed(0x69));
+        let cert_relay = make_cert(&machine, &relay_device, "relay");
+        let cert_phone = make_cert(&machine, &phone_device, "phone");
+
+        let relay_store = LogStore::open(test_dir("redeliver_relay_store"), machine.public()).unwrap();
+        let phone_store = LogStore::open(test_dir("redeliver_phone_store"), machine.public()).unwrap();
+        let a2ui_store =
+            crate::core::relay_a2ui::RelayA2uiStore::open(test_dir("redeliver_a2ui"), machine.public()).unwrap();
+        a2ui_store.put("conv1", "dice-1", Some(serde_json::json!([{"id":"root"}])), None, 1).await.unwrap();
+        let hook = a2ui_replay_hook(a2ui_store.clone());
+
+        let run_one_round = |hook: PreSyncAckHook| {
+            let cert_relay = cert_relay.clone();
+            let relay_store = relay_store.clone();
+            let cert_phone = &cert_phone;
+            let phone_store = &phone_store;
+            async move {
+                let (a_end, b_end) = tokio::io::duplex(1 << 16);
+                let (relay_reader, relay_writer) = tokio::io::split(a_end);
+                let (phone_reader, phone_writer) = tokio::io::split(b_end);
+                let relay_task = tokio::spawn(async move {
+                    crate::sync::run_session_with_hook(
+                        relay_reader, relay_writer, &cert_relay, &[], phone_device_pk, relay_store, Some(hook),
+                    )
+                    .await
+                });
+                let received = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    run_phone_side_capturing_sync_a2ui(phone_reader, phone_writer, cert_phone, phone_store),
+                )
+                .await
+                .expect("timed out waiting for a sync round to reach SyncAck");
+                relay_task.abort();
+                received
+            }
+        };
+
+        assert_eq!(run_one_round(hook.clone()).await.len(), 1, "first sync delivers the pending snapshot");
+        assert!(run_one_round(hook.clone()).await.is_empty(), "second sync (unchanged) delivers nothing");
+
+        // The surface changes again -- a new lamport must redeliver.
+        a2ui_store.put("conv1", "dice-1", Some(serde_json::json!([{"id":"root","text":"v2"}])), None, 2).await.unwrap();
+        assert_eq!(run_one_round(hook).await.len(), 1, "a changed snapshot must replay again");
     }
 }

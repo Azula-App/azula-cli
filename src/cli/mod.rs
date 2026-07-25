@@ -7,17 +7,22 @@
 //! Every one-shot verb (`message`, `ui`, `file`, `watch`, `status`) is a thin
 //! clap layer over [`crate::core::SessionCore`] — the same core the MCP tool
 //! surface (`crate::bridge::tools::AzulaBridge`) uses ("CLI and MCP Share One
-//! Core"). `run`/`terminal`/`relay` are later phases (D5/D6) — not
-//! implemented yet; the `Command` enum below is organized so adding them is
-//! a pure addition, not a restructure.
+//! Core"). `run` (`run_cmd`) and `terminal` (`terminal_cmd`) are D5: they
+//! build their own dedicated `TermHandler`/`Router` the way `azula serve`
+//! does rather than going through `SessionCore` — see their module docs.
+//! `relay` (`relay_cmd`, D6) is likewise additive to the `Command` enum
+//! below.
 
 mod file;
 mod legacy;
 mod mcp_cmd;
+mod run_cmd;
+mod terminal_cmd;
 mod message;
 mod status_cmd;
 mod ui;
 mod watch_cmd;
+mod relay_cmd;
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -41,6 +46,15 @@ enum Command {
     /// `--http` (replaces `serve-mcp`).
     Mcp(mcp_cmd::McpArgs),
 
+    /// Run a command in a PTY, handing off to an interactive shell in the
+    /// same session on failure (or always/never) so a phone or `azula
+    /// terminal attach` can pick up where it left off.
+    Run(run_cmd::RunArgs),
+    /// Host, manage, or attach to persistent terminal sessions: bare `azula
+    /// terminal` hosts one inline; `new`/`list`/`kill` manage detached
+    /// background hosts; `attach <name|url>` is the CLI client.
+    Terminal(terminal_cmd::TerminalArgs),
+
     /// Send or receive chat-style messages with a device.
     Message(message::MessageArgs),
     /// Render, update, or delete an A2UI surface, or print the component catalog.
@@ -52,9 +66,12 @@ enum Command {
     /// Show machine identity, known devices, and local sessions.
     Status(status_cmd::StatusArgs),
 
-    // `run`, `terminal`, and `relay` (design.md D5/D6) are later phases —
-    // not implemented yet. Add them as new variants here when their phases
-    // land; nothing above needs to change to make room for them.
+    /// Serve the identity's always-on relay role: store-and-forward for
+    /// agent chat and A2UI snapshots when a session can't reach the phone
+    /// directly, plus the identity log sync/bootstrap role `azula mailbox`
+    /// (kept as an alias) has always served.
+    Relay(relay_cmd::RelayArgs),
+
     /// Pair a new device: save its ticket to the registry.
     Pair(legacy::PairArgs),
     /// List all registered devices and their registry source.
@@ -186,6 +203,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Mcp(args)) => mcp_cmd::run(args).await,
 
+        Some(Command::Run(args)) => std::process::exit(run_cmd::run(args).await),
+        Some(Command::Terminal(args)) => terminal_cmd::run(args).await,
+
         Some(Command::Message(args)) => match args.action {
             message::MessageAction::Send(a) => message::send(a).await,
             message::MessageAction::Recv(a) => message::recv(a).await,
@@ -201,6 +221,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         },
         Some(Command::Watch(args)) => watch_cmd::run(args).await,
         Some(Command::Status(args)) => status_cmd::run(args),
+        Some(Command::Relay(args)) => relay_cmd::cmd_relay(args).await,
 
         Some(Command::Pair(args)) => legacy::cmd_pair(args),
         Some(Command::Devices) => legacy::cmd_devices(),
@@ -218,7 +239,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::ServeMcp(args)) => mcp_cmd::run_serve_mcp_alias(args).await,
         Some(Command::Mailbox(args)) => {
-            print_deprecation_notice("mailbox", "azula mailbox (same behavior; a future `azula relay` will replace it)");
+            print_deprecation_notice("mailbox", "azula relay");
             legacy::cmd_mailbox(args).await
         }
 

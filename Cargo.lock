@@ -258,6 +258,7 @@ dependencies = [
  "indexmap",
  "iroh",
  "iroh-tickets",
+ "libc",
  "portable-pty",
  "qrcode",
  "rmcp",

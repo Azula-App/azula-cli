@@ -138,14 +138,11 @@ pub fn load_or_create_machine_secret() -> SecretKey {
 mod tests {
     use super::*;
 
-    /// Serializes tests in this module that mutate the process-global
-    /// `AZULA_KEY_DIR` env var — mirrors `registry::ENV_TEST_LOCK`. Needed now
-    /// that more than one test sets it (`cargo test`'s default parallelism
-    /// would otherwise let them race and read back each other's directory).
-    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Point `AZULA_KEY_DIR` at a fresh, empty per-test directory and return
-    /// it. Caller must hold `ENV_TEST_LOCK` for the duration of env mutation.
+    /// it. Tests that mutate this process-global env var hold the shared
+    /// `registry::ENV_TEST_LOCK` for the duration of the mutation (`cargo
+    /// test`'s default parallelism would otherwise let them race and read
+    /// back each other's directory).
     fn isolated_key_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("azula-identity-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -155,7 +152,7 @@ mod tests {
 
     #[test]
     fn distinct_identity_names_never_share_a_key() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let dir = isolated_key_dir("distinct_names");
 
         // Task 6.4: `azula link`'s identity (named "link") must be distinct
@@ -180,7 +177,7 @@ mod tests {
 
     #[test]
     fn bridge_key_adopted_as_machine_key_preserves_node_id() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let dir = isolated_key_dir("adopt_bridge");
 
         // Simulate a pre-existing install: only bridge.key on disk.
@@ -218,7 +215,7 @@ mod tests {
 
     #[test]
     fn no_machine_or_bridge_key_session_path_creates_nothing() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let dir = isolated_key_dir("headless");
 
         // Neither machine.key nor bridge.key exists — the headless case.
@@ -236,7 +233,7 @@ mod tests {
 
     #[test]
     fn load_or_create_machine_secret_creates_when_neither_exists() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let dir = isolated_key_dir("create_machine");
 
         assert!(load_machine_secret_if_exists().is_none());
@@ -257,7 +254,7 @@ mod tests {
 
     #[test]
     fn load_or_create_machine_secret_adopts_bridge_key_when_present() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let _dir = isolated_key_dir("create_or_adopt");
 
         let bridge_key = load_or_create_secret("bridge");

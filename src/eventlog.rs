@@ -67,6 +67,15 @@ pub enum Kind {
     DeviceRevoke,
     /// `{name?, description?}`
     ProfileUpdate,
+    /// `{conversation, text, id?, from_name?}` — relay-carried agent chat,
+    /// inbound to the identity (cli-multi-session-relay's relay capability:
+    /// a session delivered this to the relay while the phone was
+    /// unreachable). `conversation` is the SESSION's public key in hex, not
+    /// a contact root/node id like the peer-chat kinds above.
+    AgentIn,
+    /// `{conversation, text, id?}` — the identity's reply to an agent
+    /// conversation, keyed the same way as [`Kind::AgentIn`].
+    AgentOut,
     /// Any kind byte this build doesn't recognize.
     Unknown(u8),
 }
@@ -82,6 +91,8 @@ impl Kind {
             Kind::DeviceAdd => 0x06,
             Kind::DeviceRevoke => 0x07,
             Kind::ProfileUpdate => 0x08,
+            Kind::AgentIn => 0x09,
+            Kind::AgentOut => 0x0A,
             Kind::Unknown(b) => b,
         }
     }
@@ -96,9 +107,40 @@ impl Kind {
             0x06 => Kind::DeviceAdd,
             0x07 => Kind::DeviceRevoke,
             0x08 => Kind::ProfileUpdate,
+            0x09 => Kind::AgentIn,
+            0x0A => Kind::AgentOut,
             other => Kind::Unknown(other),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Agent kind bodies (cli-multi-session-relay relay capability)
+// ---------------------------------------------------------------------------
+
+/// Body of a [`Kind::AgentIn`] entry: `{"conversation":…,"text":…,"id":…,
+/// "from_name":…}`. `conversation` is the session's public key in hex (not a
+/// contact root/node id, unlike the peer-chat kinds). Field order and
+/// `skip_serializing_if` are pinned — the Kotlin decoder is byte-exact
+/// against this shape (see `eventlog::tests::cross_language_vector_agent_in_entry`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentInBody {
+    pub conversation: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
+}
+
+/// Body of a [`Kind::AgentOut`] entry: `{"conversation":…,"text":…,"id":…}`,
+/// keyed the same way as [`AgentInBody`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentOutBody {
+    pub conversation: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +585,8 @@ mod tests {
             (0x06, Kind::DeviceAdd),
             (0x07, Kind::DeviceRevoke),
             (0x08, Kind::ProfileUpdate),
+            (0x09, Kind::AgentIn),
+            (0x0A, Kind::AgentOut),
         ] {
             assert_eq!(Kind::from_byte(byte), kind);
             assert_eq!(kind.to_byte(), byte);
@@ -743,12 +787,34 @@ mod tests {
         };
         e3.sign(&secret);
 
-        let e1_b64 = "AQEXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk/1QAAAAAAAAABAAAAAAAAAAEAAAGLz+VoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKnsiY29udmVyc2F0aW9uIjoiY2FmZWJhYmUiLCJ0ZXh0IjoiaGVsbG8ifcGRps3rZKzaqY89ynl1jzSQHWo5uV7rH7c99fvWTKXitnG6toGFF22x7msZ8FfCOM5pI8np8hIEcoKU6zpD3g8=";
+        // task 4.2: the relay's agent_in kind, chained after e3 -- same
+        // device key, exact body pinned by the cli-multi-session-relay
+        // design (the Kotlin side pins the identical bytes for this entry).
+        let mut e4 = LogEntry {
+            version: VERSION,
+            kind: Kind::AgentIn,
+            device_pk: secret.public(),
+            seq: 4,
+            lamport: 4,
+            ts_ms: 1700000003000,
+            prev_hash: e3.hash(),
+            body: "{\"conversation\":\"cafebabe\",\"text\":\"hello from claude\",\"id\":\"00112233445566778899aabbccddeeff\",\"from_name\":\"Claude\"}".to_string(),
+            signature: [0u8; SIGNATURE_LEN],
+        };
+        e4.sign(&secret);
+
+        let e1_b64 ="AQEXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk/1QAAAAAAAAABAAAAAAAAAAEAAAGLz+VoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKnsiY29udmVyc2F0aW9uIjoiY2FmZWJhYmUiLCJ0ZXh0IjoiaGVsbG8ifcGRps3rZKzaqY89ynl1jzSQHWo5uV7rH7c99fvWTKXitnG6toGFF22x7msZ8FfCOM5pI8np8hIEcoKU6zpD3g8=";
         let e2_b64 = "AQEXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk/1QAAAAAAAAACAAAAAAAAAAIAAAGLz+Vr6JPE2ChDzHnzP1NBar+E+2Eot1hBahj0YSL63ueXvfF+AAAAMXsiY29udmVyc2F0aW9uIjoiY2FmZWJhYmUiLCJ0ZXh0IjoiaG93IGFyZSB5b3U/In3kE3/9rXJwLJWL1Pi6E0zhf0U/JhmcFx5J0XMo1c/TXIXHlESSlq7nv/F9a98bySkg0wbjfO6k4BXOKq7Q6ewC";
         let e3_b64 = "AQMXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk/1QAAAAAAAAADAAAAAAAAAAMAAAGLz+Vv0JKxBpleoFRawCUpkr1rwKJsTtMBX2QLTCs9/CIkuocSAAAALXsiY29udmVyc2F0aW9uIjoiY2FmZWJhYmUiLCJ1cF90b19sYW1wb3J0IjoyfYGB/vAipgFl+KPw+qRjJ1Ei+/BX2gcb7DBqCp5OY/i01eZnE4ixyjLEKCzwG2yZ+pcXpkoPcb6dv0gcpWRPAgE=";
         assert_eq!(e1.to_base64(), e1_b64);
         assert_eq!(e2.to_base64(), e2_b64);
         assert_eq!(e3.to_base64(), e3_b64);
+
+        // task 4.2 pinned vector: computed once here and recorded byte-for-byte
+        // in the change's design.md / this agent's report -- the Kotlin side
+        // decodes this exact literal and re-encodes it.
+        let e4_b64 = "AQkXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk/1QAAAAAAAAAEAAAAAAAAAAQAAAGLz+VzuGr8OX3ecU73ydjngR0PYI8/ydUIrXhzoBEurdhakwBLAAAAc3siY29udmVyc2F0aW9uIjoiY2FmZWJhYmUiLCJ0ZXh0IjoiaGVsbG8gZnJvbSBjbGF1ZGUiLCJpZCI6IjAwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmIiwiZnJvbV9uYW1lIjoiQ2xhdWRlIn23LV+7/fV81iMfv/PrprZt9lfbZZY/+OexSqyBPoqhHHt28rCquBnuNQOFpU2Sc1+epS98Fre41O87NDdm/ykP";
+        assert_eq!(e4.to_base64(), e4_b64);
 
         let h1_hex = "93c4d82843cc79f33f53416abf84fb6128b758416a18f46122fadee797bdf17e";
         let h2_hex = "92b106995ea0545ac0252992bd6bc0a26c4ed3015f640b4c2b3dfc2224ba8712";
@@ -757,18 +823,53 @@ mod tests {
         assert_eq!(data_encoding::HEXLOWER.encode(&e2.hash()), h2_hex);
         assert_eq!(data_encoding::HEXLOWER.encode(&e3.hash()), h3_hex);
 
+        let h4_hex = "522670c48faff21d9ff3558aa93aef34999ec625e5a1d322082a6ff6a6676433";
+        assert_eq!(data_encoding::HEXLOWER.encode(&e4.hash()), h4_hex);
+
         // Chain validates end to end via the same DeviceLogChain machinery the account-sync
         // fold depends on.
         let mut chain = DeviceLogChain::new(secret.public());
         chain.accept(&e1).expect("e1 accepts");
         chain.accept(&e2).expect("e2 accepts");
         chain.accept(&e3).expect("e3 accepts");
-        assert_eq!(chain.seq(), 3);
+        chain.accept(&e4).expect("e4 accepts");
+        assert_eq!(chain.seq(), 4);
 
         // Byte-identical round trip through base64 -- matches what Kotlin's
         // `CrossLanguageVectorTest` decodes and re-encodes on its side.
         assert_eq!(LogEntry::from_base64(e1_b64).unwrap(), e1);
         assert_eq!(LogEntry::from_base64(e2_b64).unwrap(), e2);
         assert_eq!(LogEntry::from_base64(e3_b64).unwrap(), e3);
+        assert_eq!(LogEntry::from_base64(e4_b64).unwrap(), e4);
+    }
+
+    #[test]
+    fn agent_body_field_order_and_optional_omission() {
+        let full = AgentInBody {
+            conversation: "cafebabe".to_string(),
+            text: "hello from claude".to_string(),
+            id: Some("00112233445566778899aabbccddeeff".to_string()),
+            from_name: Some("Claude".to_string()),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            json,
+            r#"{"conversation":"cafebabe","text":"hello from claude","id":"00112233445566778899aabbccddeeff","from_name":"Claude"}"#
+        );
+
+        let minimal = AgentInBody {
+            conversation: "cafebabe".to_string(),
+            text: "hi".to_string(),
+            id: None,
+            from_name: None,
+        };
+        let json = serde_json::to_string(&minimal).unwrap();
+        assert_eq!(json, r#"{"conversation":"cafebabe","text":"hi"}"#);
+        let back: AgentInBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, minimal);
+
+        let out = AgentOutBody { conversation: "cafebabe".to_string(), text: "hi".to_string(), id: None };
+        let json = serde_json::to_string(&out).unwrap();
+        assert_eq!(json, r#"{"conversation":"cafebabe","text":"hi"}"#);
     }
 }

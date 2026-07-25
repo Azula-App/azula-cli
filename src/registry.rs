@@ -215,3 +215,181 @@ pub fn remove(name: &str) -> Result<bool> {
     }
     Ok(removed)
 }
+
+// ---------------------------------------------------------------------------
+// Relay hints (relay spec: "Sessions SHALL learn the relay's ticket from a
+// relay hint the phone shares at machine pairing time, persisted per device
+// in the registry")
+// ---------------------------------------------------------------------------
+//
+// Deliberately a companion file (`relay-hints.json`) next to `devices.json`
+// rather than a new field on [`Device`] itself: several call sites outside
+// this phase's file ownership (`term.rs`, `accept_gate.rs`, `cli/legacy.rs`)
+// construct `Device { .. }` struct literals exhaustively, and Rust has no
+// notion of a "defaulted" struct-literal field short of touching every one of
+// those sites with `..Default::default()` — which this phase's ownership
+// boundary doesn't allow. This file shares `devices.json`'s project/global
+// precedence and directories, so "persisted per device in the registry"
+// still holds even though it's a sibling file rather than an extra key.
+
+#[derive(Serialize, Deserialize, Default)]
+struct RelayHintsFile {
+    #[serde(default)]
+    relays: std::collections::BTreeMap<String, String>,
+}
+
+/// The relay-hints sibling of a `devices.json` path (`project_path()`/
+/// `global_path()` — both already include the devices filename). Named off
+/// the devices file's own stem (`relay-hints.json` next to `devices.json`,
+/// `global-relay-hints.json` next to `global-devices.json`) rather than
+/// always `relay-hints.json`, so project and global stay distinct files even
+/// under `AZULA_REGISTRY_DIR` test overrides, where [`override_dir`] resolves
+/// both registries into the *same* directory and only their filenames differ.
+fn relay_hints_path(devices_json_path: &Path) -> PathBuf {
+    let stem = devices_json_path.file_stem().and_then(|s| s.to_str()).unwrap_or("devices");
+    let hints_name = if stem == "global-devices" { "global-relay-hints.json" } else { "relay-hints.json" };
+    match devices_json_path.parent() {
+        Some(parent) => parent.join(hints_name),
+        None => devices_json_path.with_file_name(hints_name),
+    }
+}
+
+fn read_relay_hints(path: &Path) -> std::collections::BTreeMap<String, String> {
+    let data = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Default::default(),
+    };
+    serde_json::from_str::<RelayHintsFile>(&data).map(|f| f.relays).unwrap_or_default()
+}
+
+/// The relay ticket learned for `device_name`, if any. Global then project,
+/// project wins on collision — the same merge precedence [`load`] uses.
+pub fn relay_for(device_name: &str) -> Option<String> {
+    let mut result = None;
+    if let Some(g) = global_path() {
+        if let Some(t) = read_relay_hints(&relay_hints_path(&g)).get(device_name) {
+            result = Some(t.clone());
+        }
+    }
+    if let Some(p) = project_path() {
+        if let Some(t) = read_relay_hints(&relay_hints_path(&p)).get(device_name) {
+            result = Some(t.clone());
+        }
+    }
+    result
+}
+
+/// Persist a relay hint for `device_name`. Writes to whichever registry
+/// directory (project checked first, then global) already holds that device,
+/// so the hint lands "in the same file the device came from"; falls back to
+/// the project registry's directory (same default [`add`] uses) if the
+/// device isn't registered in either yet.
+pub fn set_relay(device_name: &str, ticket: &str) -> Result<PathBuf> {
+    let candidate_bases: Vec<PathBuf> = [project_path(), global_path()].into_iter().flatten().collect();
+
+    let target = candidate_bases
+        .iter()
+        .find(|base| read_file(base).iter().any(|d| d.name == device_name))
+        .or_else(|| candidate_bases.first())
+        .context("registry: no project or global registry path available (is $HOME set?)")?
+        .clone();
+
+    let hints_path = relay_hints_path(&target);
+    let mut hints = read_relay_hints(&hints_path);
+    hints.insert(device_name.to_string(), ticket.to_string());
+
+    if let Some(parent) = hints_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create dirs {}", parent.display()))?;
+    }
+    let content = serde_json::to_string_pretty(&RelayHintsFile { relays: hints })?;
+    fs::write(&hints_path, content).with_context(|| format!("write {}", hints_path.display()))?;
+    Ok(hints_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn isolated_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("azula-registry-test-{}-{name}", std::process::id()))
+    }
+
+    /// A `devices.json` written before `relay-hints.json` existed (i.e. the
+    /// common case: no such file at all yet) still loads fine, and
+    /// `relay_for` degrades to `None` rather than erroring — the "existing
+    /// devices.json files load" requirement, reframed around the companion
+    /// file this phase uses instead of a new `Device` struct field (see
+    /// `set_relay`'s doc comment for why).
+    #[tokio::test]
+    async fn devices_load_unaffected_when_no_relay_hints_file_exists_yet() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let dir = isolated_dir("no_hints_file");
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        add(Device { name: "phone".into(), ticket: "tk".into(), added_at: None, invite: None }, false).unwrap();
+
+        let loaded = load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "phone");
+        assert_eq!(relay_for("phone"), None, "no relay hint recorded yet");
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_relay_then_relay_for_round_trips() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let dir = isolated_dir("round_trip");
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        add(Device { name: "phone".into(), ticket: "tk".into(), added_at: None, invite: None }, false).unwrap();
+        set_relay("phone", "relay-ticket-1").unwrap();
+        assert_eq!(relay_for("phone").as_deref(), Some("relay-ticket-1"));
+
+        // A second hint for the same device overwrites, not appends.
+        set_relay("phone", "relay-ticket-2").unwrap();
+        assert_eq!(relay_for("phone").as_deref(), Some("relay-ticket-2"));
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_relay_targets_the_global_registry_when_the_device_is_registered_there() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let dir = isolated_dir("global_target");
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        add(Device { name: "phone".into(), ticket: "tk".into(), added_at: None, invite: None }, true).unwrap();
+        set_relay("phone", "relay-ticket-g").unwrap();
+
+        assert_eq!(relay_for("phone").as_deref(), Some("relay-ticket-g"));
+        // Persisted next to `global-devices.json`, not `devices.json`.
+        let global_hints = relay_hints_path(&global_path().unwrap());
+        assert!(global_hints.exists());
+        let project_hints = relay_hints_path(&project_path().unwrap());
+        assert!(!project_hints.exists(), "must not have written the project-side hints file");
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_relay_for_an_unregistered_device_falls_back_to_the_project_registry() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let dir = isolated_dir("unregistered");
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        // No `add()` call at all -- the device isn't registered anywhere yet.
+        set_relay("ghost", "relay-ticket-x").unwrap();
+        assert_eq!(relay_for("ghost").as_deref(), Some("relay-ticket-x"));
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

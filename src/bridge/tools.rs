@@ -101,20 +101,20 @@ struct DisconnectArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
-struct RenderUiArgs {
+pub(super) struct RenderUiArgs {
     /// The device name to render the UI on.
-    device: String,
+    pub(super) device: String,
     /// A2UI basic-catalog components as a flat JSON array. Each element is an
     /// object with an `id` and a `component` type; exactly one must have
     /// `"id":"root"`. Components reference children by id (`child` / `children`),
     /// and props may be literals or `{"path":"/ptr"}` bindings into the data
     /// model. Buttons carry `{"action":{"event":{"name":...,"context":{...}}}}`.
-    components: serde_json::Value,
+    pub(super) components: serde_json::Value,
     /// Optional initial data model (a JSON object) backing the `{"path":...}` bindings.
-    data_model: Option<serde_json::Value>,
+    pub(super) data_model: Option<serde_json::Value>,
     /// Optional surface id. A unique one (`ui-<time>-<n>`) is generated if omitted;
     /// omit it to add a NEW card, or pass an existing id to replace that card.
-    surface_id: Option<String>,
+    pub(super) surface_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -356,32 +356,43 @@ impl AzulaBridge {
     /// overwritten at construction time (`AzulaBridge::new`) with the intro
     /// sentence plus the full `catalog::A2UI_CATALOG` prose — see that
     /// module for why this can't be assembled directly in the attribute.
-    #[tool(description = "Render an interactive A2UI surface in the azula app on a device. Returns the surfaceId (pass it to update_ui / delete_ui). See `azula ui catalog` for the full component catalog.")]
-    async fn render_ui(&self, Parameters(args): Parameters<RenderUiArgs>) -> Result<CallToolResult, ErrorData> {
-        match self.core.render_ui(&args.device, args.components, args.data_model, args.surface_id).await {
-            Ok(surface_id) => Ok(CallToolResult::success(vec![Content::text(format!(
+    #[tool(description = "Render an interactive A2UI surface in the azula app on a device. Returns the surfaceId (pass it to update_ui / delete_ui). If the device is offline but its relay is known, the surface is queued to the relay and replayed to the phone next sync instead of failing. See `azula ui catalog` for the full component catalog.")]
+    pub(super) async fn render_ui(&self, Parameters(args): Parameters<RenderUiArgs>) -> Result<CallToolResult, ErrorData> {
+        match self.core.render_ui_outcome(&args.device, args.components, args.data_model, args.surface_id).await {
+            Ok((surface_id, core::SendOutcome::Sent)) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "rendered surface '{surface_id}' on '{}'", args.device
+            ))])),
+            Ok((surface_id, core::SendOutcome::Queued)) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "surface '{surface_id}' queued for replay via relay to '{}' (offline)", args.device
             ))])),
             Err(e) => core_err_to_tool_result(e),
         }
     }
 
     /// Update the data model of a rendered A2UI surface.
-    #[tool(description = "Update the data model of an A2UI surface previously created with `render_ui`, at a JSON-pointer `path` (RFC 6901; \"\" replaces the whole model). Use this to react to a `ui-event` — e.g. set /dice/result after a roll, or push fresh data into a bound Text.")]
+    #[tool(description = "Update the data model of an A2UI surface previously created with `render_ui`, at a JSON-pointer `path` (RFC 6901; \"\" replaces the whole model). Use this to react to a `ui-event` — e.g. set /dice/result after a roll, or push fresh data into a bound Text. If the device is offline but its relay is known and this session rendered the surface, the update is coalesced into a full-surface snapshot queued to the relay instead of failing.")]
     async fn update_ui(&self, Parameters(args): Parameters<UpdateUiArgs>) -> Result<CallToolResult, ErrorData> {
-        match self.core.update_ui(&args.device, &args.surface_id, &args.path, args.value).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+        match self.core.update_ui_outcome(&args.device, &args.surface_id, &args.path, args.value).await {
+            Ok(core::SendOutcome::Sent) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "updated surface '{}' at '{}'", args.surface_id, args.path
+            ))])),
+            Ok(core::SendOutcome::Queued) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "surface '{}' update queued for replay via relay (offline)", args.surface_id
             ))])),
             Err(e) => core_err_to_tool_result(e),
         }
     }
 
     /// Remove an A2UI surface from a device.
-    #[tool(description = "Remove an A2UI surface from a device (it stops rendering/updating). Pass the surfaceId returned by `render_ui`.")]
+    #[tool(description = "Remove an A2UI surface from a device (it stops rendering/updating). Pass the surfaceId returned by `render_ui`. If the device is offline but its relay is known, the deletion is queued to the relay (as a tombstone) instead of failing.")]
     async fn delete_ui(&self, Parameters(args): Parameters<DeleteUiArgs>) -> Result<CallToolResult, ErrorData> {
-        match self.core.delete_ui(&args.device, &args.surface_id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!("deleted surface '{}'", args.surface_id))])),
+        match self.core.delete_ui_outcome(&args.device, &args.surface_id).await {
+            Ok(core::SendOutcome::Sent) => {
+                Ok(CallToolResult::success(vec![Content::text(format!("deleted surface '{}'", args.surface_id))]))
+            }
+            Ok(core::SendOutcome::Queued) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "surface '{}' deletion queued for replay via relay (offline)", args.surface_id
+            ))])),
             Err(e) => core_err_to_tool_result(e),
         }
     }

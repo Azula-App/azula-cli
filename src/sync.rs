@@ -422,13 +422,57 @@ pub enum SyncOutcome {
 /// revocation after sync". `transport_peer_id` is the connection's actual
 /// transport node id — the caller's job to obtain (e.g.
 /// `iroh::endpoint::Connection::remote_id()`).
+///
+/// Thin wrapper over [`run_session_with_hook`] with no pre-ack hook — every
+/// existing call site (including this module's own tests) keeps working
+/// unchanged; see that function's doc for the hook itself.
 pub async fn run_session<R, W>(
+    reader: R,
+    writer: W,
+    my_cert: &DeviceCert,
+    revocations: &[Revocation],
+    transport_peer_id: PublicKey,
+    store: LogStore,
+) -> Result<SyncOutcome>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    run_session_with_hook(reader, writer, my_cert, revocations, transport_peer_id, store, None).await
+}
+
+/// A callback run once per sync session, after this side has streamed the
+/// peer's catch-up gap entries but strictly *before* writing its own
+/// `SyncAck` — the relay's hook point for replaying pending `SyncA2ui`
+/// frames to a just-caught-up sibling (relay spec: "A2UI Snapshot Replay on
+/// Reconnect... after sync catch-up completes"; `mailbox_role.rs` is the
+/// only production caller). Takes the peer's verified certificate's
+/// `device_pk` and returns whatever extra frames to write on this same
+/// connection, in order, before the ack. Pinned *before* the ack rather than
+/// after (contrary to an earlier draft of this hook): the phone's bounded
+/// catch-up receive loop has an `untilAck` cutoff and stops listening the
+/// instant our `SyncAck` arrives, so anything sent after it would never be
+/// seen in that mode — sending it after the gap but before the ack is
+/// honored in both bounded catch-up and live-push modes. A minimal, surgical
+/// addition (design.md/task 4.6: "you MAY add a minimal optional
+/// callback/hook parameter to sync.rs — keep it surgical and default-None")
+/// — [`run_session`] and every existing call site are unaffected; only
+/// [`SyncHandler::with_pre_ack_hook`] opts in.
+pub type PreSyncAckHook = Arc<
+    dyn Fn(PublicKey) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Frame>> + Send>> + Send + Sync,
+>;
+
+/// As [`run_session`], but with an optional [`PreSyncAckHook`] invoked after
+/// the catch-up gap and before this side's `SyncAck` (see that type's doc
+/// for exactly when/why).
+pub async fn run_session_with_hook<R, W>(
     reader: R,
     mut writer: W,
     my_cert: &DeviceCert,
     revocations: &[Revocation],
     transport_peer_id: PublicKey,
     store: LogStore,
+    pre_ack_hook: Option<PreSyncAckHook>,
 ) -> Result<SyncOutcome>
 where
     R: AsyncRead + Unpin,
@@ -448,11 +492,11 @@ where
     // theirs. Any verification failure closes the connection with no
     // further writes at all — in particular, no SyncVector.
     write_frame(&mut writer, &Frame::SyncHello { cert: my_cert.encode() }).await?;
-    if let Err(reason) =
-        read_and_verify_hello(&mut reader, my_cert.root_pk, &live_revocations, transport_peer_id).await
-    {
-        return Ok(SyncOutcome::HelloRejected(reason));
-    }
+    let peer_cert =
+        match read_and_verify_hello(&mut reader, my_cert.root_pk, &live_revocations, transport_peer_id).await {
+            Ok(cert) => cert,
+            Err(reason) => return Ok(SyncOutcome::HelloRejected(reason)),
+        };
 
     // Step 2: both sides send their per-device high-water vector.
     let my_vector = store.vector().await;
@@ -470,8 +514,9 @@ where
     // connection, so no locking is needed between them beyond the shared
     // `LogStore`.
     let send_store = store.clone();
+    let peer_device_pk = peer_cert.device_pk;
     tokio::select! {
-        res = send_loop(writer, send_store, my_vector, peer_vector) => res?,
+        res = send_loop(writer, send_store, my_vector, peer_vector, peer_device_pk, pre_ack_hook) => res?,
         res = recv_loop(reader, store) => res?,
     }
     Ok(SyncOutcome::Closed)
@@ -515,15 +560,26 @@ async fn read_and_verify_hello<R: AsyncRead + Unpin>(
 }
 
 /// Ship the peer's gap (per device, ascending `seq`, batched to
-/// [`MAX_ENTRIES_PER_FRAME`]), then a `SyncAck`, then push whatever the
-/// local store gains afterward — no new vector exchange, ever (spec: "Live
-/// Push While Connected"). Runs until a write fails (the peer's side of the
+/// [`MAX_ENTRIES_PER_FRAME`]), then (if `pre_ack_hook` is set) whatever extra
+/// frames it returns for `peer_device_pk` — the relay's A2UI replay point
+/// (see [`PreSyncAckHook`]) — then a `SyncAck`, then push whatever the local
+/// store gains afterward — no new vector exchange, ever (spec: "Live Push
+/// While Connected"). Runs until a write fails (the peer's side of the
 /// connection closed).
+///
+/// The hook runs strictly *before* `SyncAck`, not after: the phone's bounded
+/// catch-up mode stops listening the instant our `SyncAck` arrives
+/// (`untilAck` cutoff on its receive loop), so anything sent afterward would
+/// never be seen in that mode. Sending it after the gap but before the ack
+/// is honored in both bounded catch-up and live-push modes.
+#[allow(clippy::too_many_arguments)]
 async fn send_loop<W>(
     mut writer: W,
     store: LogStore,
     my_vector: BTreeMap<String, u64>,
     peer_vector: BTreeMap<String, u64>,
+    peer_device_pk: PublicKey,
+    pre_ack_hook: Option<PreSyncAckHook>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -534,6 +590,12 @@ where
             continue;
         }
         send_gap(&mut writer, &store, device_hex, peer_seq).await?;
+    }
+
+    if let Some(hook) = &pre_ack_hook {
+        for frame in hook(peer_device_pk).await {
+            write_frame(&mut writer, &frame).await?;
+        }
     }
 
     write_frame(&mut writer, &Frame::SyncAck { vector: my_vector.clone() }).await?;
@@ -612,17 +674,40 @@ where
 // ---------------------------------------------------------------------------
 
 /// iroh `ProtocolHandler` for [`SYNC_ALPN`]: accepts a dialed-in bi stream
-/// and hands it straight to [`run_session`].
-#[derive(Clone, Debug)]
+/// and hands it straight to [`run_session_with_hook`].
+#[derive(Clone)]
 pub struct SyncHandler {
     my_cert: DeviceCert,
     revocations: Vec<Revocation>,
     store: LogStore,
+    /// Optional [`PreSyncAckHook`] — `None` for every caller except the
+    /// relay (`mailbox_role.rs`, via [`Self::with_pre_ack_hook`]). Not
+    /// derivable via `#[derive(Debug)]` (a boxed closure isn't `Debug`), so
+    /// `Debug` is implemented manually below, omitting this field.
+    pre_ack_hook: Option<PreSyncAckHook>,
 }
 
 impl SyncHandler {
     pub fn new(my_cert: DeviceCert, revocations: Vec<Revocation>, store: LogStore) -> Self {
-        Self { my_cert, revocations, store }
+        Self { my_cert, revocations, store, pre_ack_hook: None }
+    }
+
+    /// Opt this handler into a [`PreSyncAckHook`], run once per session
+    /// right before this side's `SyncAck` — the relay's A2UI replay point.
+    pub fn with_pre_ack_hook(mut self, hook: PreSyncAckHook) -> Self {
+        self.pre_ack_hook = Some(hook);
+        self
+    }
+}
+
+impl std::fmt::Debug for SyncHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncHandler")
+            .field("my_cert", &self.my_cert)
+            .field("revocations", &self.revocations)
+            .field("store", &self.store)
+            .field("pre_ack_hook", &self.pre_ack_hook.is_some())
+            .finish()
     }
 }
 
@@ -631,8 +716,16 @@ impl ProtocolHandler for SyncHandler {
         let transport_peer_id = connection.remote_id();
         let (send, recv) =
             connection.accept_bi().await.map_err(|e| AcceptError::from_boxed(e.into()))?;
-        match run_session(recv, send, &self.my_cert, &self.revocations, transport_peer_id, self.store.clone())
-            .await
+        match run_session_with_hook(
+            recv,
+            send,
+            &self.my_cert,
+            &self.revocations,
+            transport_peer_id,
+            self.store.clone(),
+            self.pre_ack_hook.clone(),
+        )
+        .await
         {
             Ok(SyncOutcome::HelloRejected(reason)) => {
                 info!(%reason, "sync: rejected peer's hello");
@@ -974,7 +1067,7 @@ mod tests {
         peer_vector.insert(device.public().to_string(), 3u64);
 
         let (writer, reader) = tokio::io::duplex(8192);
-        let handle = tokio::spawn(send_loop(writer, store.clone(), my_vector, peer_vector));
+        let handle = tokio::spawn(send_loop(writer, store.clone(), my_vector, peer_vector, device.public(), None));
 
         let mut r = BufReader::new(reader);
         let entries_frame = read_frame(&mut r).await.unwrap().expect("entries frame");
@@ -1003,7 +1096,7 @@ mod tests {
         let peer_vector = BTreeMap::new(); // peer has nothing yet
 
         let (writer, reader) = tokio::io::duplex(1 << 20);
-        let handle = tokio::spawn(send_loop(writer, store.clone(), my_vector, peer_vector));
+        let handle = tokio::spawn(send_loop(writer, store.clone(), my_vector, peer_vector, device.public(), None));
 
         let mut r = BufReader::new(reader);
         let mut all_entries: Vec<LogEntry> = Vec::new();
@@ -1039,7 +1132,7 @@ mod tests {
         let peer_vector = BTreeMap::new();
 
         let (writer, reader) = tokio::io::duplex(8192);
-        let handle = tokio::spawn(send_loop(writer, store.clone(), my_vector, peer_vector));
+        let handle = tokio::spawn(send_loop(writer, store.clone(), my_vector, peer_vector, device.public(), None));
 
         let mut r = BufReader::new(reader);
         let first = read_frame(&mut r).await.unwrap().expect("ack frame");

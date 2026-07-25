@@ -147,7 +147,8 @@ pub(crate) async fn connect_device(
             }
             let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
             let inbox_reader = inbox.clone();
-            tokio::spawn(async move { reader_loop(recv, inbox_reader).await });
+            let device_name_owned = name.to_string();
+            tokio::spawn(async move { reader_loop(recv, inbox_reader, device_name_owned).await });
 
             let mut guard = devices.lock().await;
             let conn = guard
@@ -169,8 +170,8 @@ pub(crate) async fn connect_device(
     }
 }
 
-async fn reader_loop(recv: RecvStream, inbox: Inbox) {
-    read_frames_into(BufReader::new(recv), inbox).await
+async fn reader_loop(recv: RecvStream, inbox: Inbox, device_name: String) {
+    read_frames_into(BufReader::new(recv), inbox, &device_name).await
 }
 
 /// State for one in-flight inbound file transfer, keyed by `FileBegin.id`.
@@ -264,9 +265,13 @@ fn push_frame(inbox: &Inbox, transfers: &mut Transfers, frame: Frame) {
 /// through verbatim; an A2UI action becomes a parseable `ui-event:` line so the
 /// LLM can react (match on surfaceId and respond with `update_ui`); file
 /// transfers are reassembled and surfaced once complete (see [`push_frame`]).
-/// Generic over the reader so the behavior is unit-testable over an in-memory pipe.
-pub(crate) async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(reader: BufReader<R>, inbox: Inbox) {
-    read_frames_into_with(reader, inbox, Transfers::new()).await
+/// A `Frame::RelayHint` (relay spec: the phone shares the identity's relay
+/// ticket "at machine pairing time") is parsed and persisted
+/// (`registry::set_relay`) rather than surfaced as an inbox line — `device_name`
+/// is the registry name this connection is filed under. Generic over the
+/// reader so the behavior is unit-testable over an in-memory pipe.
+pub(crate) async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(reader: BufReader<R>, inbox: Inbox, device_name: &str) {
+    read_frames_into_with(reader, inbox, Transfers::new(), device_name).await
 }
 
 /// As [`read_frames_into`], but seeded with an existing `transfers` map — used
@@ -276,9 +281,14 @@ async fn read_frames_into_with<R: tokio::io::AsyncRead + Unpin>(
     mut reader: BufReader<R>,
     inbox: Inbox,
     mut transfers: Transfers,
+    device_name: &str,
 ) {
     loop {
         match read_frame(&mut reader).await {
+            Ok(Some(Frame::RelayHint { ticket })) => match registry::set_relay(device_name, &ticket) {
+                Ok(path) => info!(device = %device_name, path = %path.display(), "core: learned relay hint"),
+                Err(e) => warn!(device = %device_name, error = %e, "core: failed to persist relay hint"),
+            },
             Ok(Some(frame)) => push_frame(&inbox, &mut transfers, frame),
             Ok(None) => break,
             Err(e) => {
@@ -598,6 +608,54 @@ async fn accept_incoming(
     info!(%peer_name, "bridge: peer registered");
 
     // Continue draining frames; reader already consumed the hello.
-    read_frames_into_with(reader, inbox, transfers).await;
+    read_frames_into_with(reader, inbox, transfers, &peer_name).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::write_frame;
+    use tokio::io::AsyncWriteExt;
+
+    /// relay spec: "Sessions SHALL learn the relay's ticket from a relay
+    /// hint the phone shares at machine pairing time, persisted per device
+    /// in the registry" — a `Frame::RelayHint` arriving on a device's stream
+    /// is parsed and persisted via `registry::set_relay`, not surfaced as an
+    /// inbox line, and a later real chat frame still reaches the inbox.
+    #[tokio::test]
+    async fn relay_hint_frame_persists_and_is_not_surfaced_to_the_inbox() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("azula-device-relay-hint-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        // The device must already be registered for `set_relay` to have a
+        // file to persist into (mirrors a real pairing: the device is
+        // registered before it ever sends a RelayHint).
+        registry::add(
+            Device { name: "phone".to_string(), ticket: "tk".to_string(), added_at: None, invite: None },
+            false,
+        )
+        .unwrap();
+
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let inbox_reader = inbox.clone();
+        let handle = tokio::spawn(async move {
+            read_frames_into(BufReader::new(reader), inbox_reader, "phone").await;
+        });
+
+        write_frame(&mut writer, &Frame::RelayHint { ticket: "relay-ticket-xyz".into() }).await.unwrap();
+        write_frame(&mut writer, &Frame::Chat { text: "hello".into(), id: None }).await.unwrap();
+        writer.shutdown().await.unwrap();
+        handle.await.unwrap();
+
+        let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+        assert_eq!(got, vec!["hello".to_string()], "the RelayHint must not be surfaced as an inbox line");
+        assert_eq!(registry::relay_for("phone").as_deref(), Some("relay-ticket-xyz"));
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

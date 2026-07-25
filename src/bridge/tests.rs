@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::Endpoint;
+use iroh::{Endpoint, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use rmcp::handler::server::wrapper::Parameters;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -22,7 +22,7 @@ use crate::proto::{read_frame, write_frame, Frame};
 use crate::registry::Device;
 
 use crate::core::device::{dial_device, match_known_device, read_frames_into, BridgeAcceptHandler, DeviceConn, DeviceMap, Inbox};
-use super::tools::{AzulaBridge, ConnectArgs, GetMessagesArgs, SayArgs, SendFileArgs, SendMessageArgs};
+use super::tools::{AzulaBridge, ConnectArgs, GetMessagesArgs, RenderUiArgs, SayArgs, SendFileArgs, SendMessageArgs};
 
 /// The reader surfaces user chat text verbatim and turns an A2UI action
 /// (sent by the app when a user taps a surface) into a `ui-event:` line the
@@ -33,7 +33,7 @@ async fn reader_surfaces_chat_and_ui_events() {
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let inbox_reader = inbox.clone();
     let handle = tokio::spawn(async move {
-        read_frames_into(BufReader::new(reader), inbox_reader).await;
+        read_frames_into(BufReader::new(reader), inbox_reader, "phone").await;
     });
 
     let chat = serde_json::to_string(&Frame::Chat { text: "hello".into(), id: None }).unwrap();
@@ -69,7 +69,7 @@ async fn reader_reassembles_incoming_file() {
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let inbox_reader = inbox.clone();
     let handle = tokio::spawn(async move {
-        read_frames_into(BufReader::new(reader), inbox_reader).await;
+        read_frames_into(BufReader::new(reader), inbox_reader, "phone").await;
     });
 
     let bytes = b"hello file bytes".to_vec(); // 16 bytes
@@ -120,7 +120,7 @@ async fn reader_rejects_oversize_incoming_file() {
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let inbox_reader = inbox.clone();
     let handle = tokio::spawn(async move {
-        read_frames_into(BufReader::new(reader), inbox_reader).await;
+        read_frames_into(BufReader::new(reader), inbox_reader, "phone").await;
     });
 
     let begin = Frame::FileBegin {
@@ -605,6 +605,75 @@ async fn offline_queue_then_flush() {
 
     // Clean up env var.
     std::env::remove_var("AZULA_MAILBOX_DIR");
+}
+
+/// mcp-bridge spec (MODIFIED "Live-Connection-Only Tools Fail Fast, Never
+/// Queue"): "render_ui to an offline device with a relay... the surface
+/// snapshot is delivered to the relay and the tool reports it as queued for
+/// replay." Spins up a real relay endpoint (`mailbox_role::RelayLlmHandler`)
+/// and asserts the `render_ui` MCP tool's response text reflects the
+/// queued-via-relay outcome rather than erroring, once a relay hint is known
+/// for an otherwise-unreachable device.
+#[tokio::test]
+async fn render_ui_to_an_offline_device_with_a_relay_reports_queued() {
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+    let dir = std::env::temp_dir().join(format!("azula-bridge-test-{}", std::process::id())).join("render_ui_relay");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("AZULA_REGISTRY_DIR", dir.join("registry"));
+    std::env::set_var("AZULA_MAILBOX_DIR", dir.join("mailbox"));
+    std::env::set_var("AZULA_RELAY_A2UI_DIR", dir.join("relay-a2ui"));
+
+    // A real relay endpoint admitting sessions certified by `machine`.
+    let machine = SecretKey::from_bytes(&[0x22u8; 32]);
+    let relay_ep = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+    let relay_ticket = EndpointTicket::new(relay_ep.addr()).to_string();
+    let relay_device_secret = SecretKey::generate();
+    let relay_store = crate::sync::LogStore::open(dir.join("relay-log"), machine.public()).unwrap();
+    let a2ui_store = crate::core::relay_a2ui::RelayA2uiStore::open(dir.join("relay-a2ui-store"), machine.public()).unwrap();
+    let known_roots = Arc::new(AsyncMutex::new(vec![machine.public()]));
+    let relay_handler = crate::mailbox_role::RelayLlmHandler::new(
+        Arc::new(relay_device_secret),
+        relay_store,
+        a2ui_store,
+        known_roots,
+    );
+    let _relay_router = Router::builder(relay_ep).accept(LLM_ALPN, relay_handler).spawn();
+
+    crate::registry::set_relay("phone", &relay_ticket).unwrap();
+
+    let session_ep = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+    let session_cert =
+        crate::certs::mint_session_cert(&machine, session_ep.id(), crate::certs::DEFAULT_SESSION_EXPIRY).encode();
+    let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+    let bridge = AzulaBridge::new(
+        Arc::new(session_ep),
+        devices,
+        "test".to_string(),
+        "session-ticket".to_string(),
+        "session".to_string(),
+        20,
+        true,
+        session_cert,
+        Some(machine),
+    );
+
+    let result = bridge
+        .render_ui(Parameters(RenderUiArgs {
+            device: "phone".to_string(),
+            components: serde_json::json!([{"id": "root", "component": "Text", "text": "hi"}]),
+            data_model: None,
+            surface_id: Some("dice-1".to_string()),
+        }))
+        .await
+        .unwrap();
+
+    assert!(!result.is_error.unwrap_or(false), "render_ui via relay should succeed: {result:?}");
+    let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.as_str())).collect::<Vec<_>>().join("");
+    assert!(text.contains("queued for replay via relay"), "expected queued-via-relay wording, got: {text}");
+
+    std::env::remove_var("AZULA_REGISTRY_DIR");
+    std::env::remove_var("AZULA_MAILBOX_DIR");
+    std::env::remove_var("AZULA_RELAY_A2UI_DIR");
 }
 
 // -----------------------------------------------------------------------
