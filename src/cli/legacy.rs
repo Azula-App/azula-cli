@@ -217,11 +217,40 @@ pub(super) fn cmd_pair(args: PairArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn cmd_devices() -> Result<()> {
+pub(super) fn cmd_devices(json: bool) -> Result<()> {
     let known = registry::load();
 
-    if known.is_empty() {
+    if known.is_empty() && !json {
         println!("No devices registered. Use `azula pair <URL>` to add one.");
+        return Ok(());
+    }
+
+    if json {
+        let global: Vec<String> = registry::global_path()
+            .map(|p| registry::read_file(&p).into_iter().map(|d| d.name).collect())
+            .unwrap_or_default();
+        let project: Vec<String> = registry::project_path()
+            .map(|p| registry::read_file(&p).into_iter().map(|d| d.name).collect())
+            .unwrap_or_default();
+        let rows: Vec<serde_json::Value> = known
+            .iter()
+            .map(|d| {
+                let source = if project.contains(&d.name) {
+                    "project"
+                } else if global.contains(&d.name) {
+                    "global"
+                } else {
+                    "?"
+                };
+                serde_json::json!({
+                    "name": d.name,
+                    "fingerprint": d.ticket.chars().take(8).collect::<String>(),
+                    "source": source,
+                    "relay": registry::relay_for(&d.name).is_some(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
         return Ok(());
     }
 

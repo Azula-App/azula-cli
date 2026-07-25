@@ -75,7 +75,12 @@ enum Command {
     /// Pair a new device: save its ticket to the registry.
     Pair(legacy::PairArgs),
     /// List all registered devices and their registry source.
-    Devices,
+    Devices {
+        /// Machine-readable output: a JSON array of
+        /// `{name,fingerprint,source,relay}`.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a QR code for a ticket, URL, or bare token.
     Qr(legacy::QrArgs),
     /// Mint a new invite (or, with `revoke`, delete a previously issued one).
@@ -224,7 +229,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Relay(args)) => relay_cmd::cmd_relay(args).await,
 
         Some(Command::Pair(args)) => legacy::cmd_pair(args),
-        Some(Command::Devices) => legacy::cmd_devices(),
+        Some(Command::Devices { json }) => legacy::cmd_devices(json),
         Some(Command::Qr(args)) => legacy::cmd_qr(args),
         Some(Command::Invite(args)) => match args.action {
             Some(legacy::InviteAction::Revoke(r)) => legacy::cmd_invite_revoke(r),
