@@ -48,7 +48,11 @@ pub fn print_invite_pairing(title: &str, encoded_invite: &str) {
     print_pairing_url(title, &invite_url(encoded_invite));
 }
 
-fn print_pairing_url(title: &str, url: &str) {
+/// Print a labelled pairing block for an already-fully-formed URL (as
+/// opposed to [`print_pairing`]/[`print_invite_pairing`], which build the URL
+/// from a ticket/encoded-invite themselves) — e.g. `SessionCore::pairing_url`'s
+/// return value, which is one or the other already resolved.
+pub fn print_pairing_url(title: &str, url: &str) {
     let qr = render_qr(url);
     println!();
     println!("  {title}");

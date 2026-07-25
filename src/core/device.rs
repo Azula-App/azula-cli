@@ -3,12 +3,17 @@
 //! connections, and reconnect-by-node-id matching.
 //!
 //! Both directions converge on the same [`DeviceMap`]: `connect_device` fills
-//! in an entry when the bridge dials out, and [`BridgeAcceptHandler`] fills in
-//! (or updates) an entry when a device dials in. Each entry's [`Inbox`] is fed
-//! by a background reader task for the lifetime of that connection. That
-//! reader also reassembles inbound `file_begin`/`file_chunk`/`file_end`
-//! sequences (see [`crate::filexfer`]), writing completed files to disk and
-//! surfacing a `[received file: ...]` text line into the inbox.
+//! in an entry when a [`super::SessionCore`] dials out, and
+//! [`BridgeAcceptHandler`] fills in (or updates) an entry when a device dials
+//! in. Each entry's [`Inbox`] is fed by a background reader task for the
+//! lifetime of that connection. That reader also reassembles inbound
+//! `file_begin`/`file_chunk`/`file_end` sequences (see [`crate::filexfer`]),
+//! writing completed files to disk and surfacing a `[received file: ...]`
+//! text line into the inbox.
+//!
+//! Moved here from the old `bridge::device` (cli-multi-session-relay phase 2)
+//! so both the MCP tool layer (`bridge::tools`) and the CLI verbs (`cli::*`)
+//! share one connection-management implementation via [`super::SessionCore`].
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -39,28 +44,33 @@ use super::state::write_state;
 // Types
 // ---------------------------------------------------------------------------
 
-pub(super) type Inbox = Arc<std::sync::Mutex<VecDeque<String>>>;
-type AppSend = Arc<AsyncMutex<Option<SendStream>>>;
+// `Inbox`/`DeviceConn`/`DeviceMap` are `pub` (not `pub(crate)`): they appear
+// in `SessionCore`'s own public fields/method signatures (`devices`,
+// `ensure_device`, `lookup_device`), so anything that can see `SessionCore`
+// must also be able to name these types. The dial/accept machinery below
+// stays `pub(crate)` — only used by `core::establish` and same-crate tests.
+pub type Inbox = Arc<std::sync::Mutex<VecDeque<String>>>;
+pub type AppSend = Arc<AsyncMutex<Option<SendStream>>>;
 
 /// Per-device live state.
 #[derive(Clone, Debug)]
-pub(super) struct DeviceConn {
-    pub(super) send: AppSend,
-    pub(super) inbox: Inbox,
-    pub(super) ticket: String,
+pub struct DeviceConn {
+    pub send: AppSend,
+    pub inbox: Inbox,
+    pub ticket: String,
     /// The encoded invite string (`"azi…"`) this device was paired with, if
     /// any — re-presented in `Hello` on every (re)dial per the invitations
     /// spec, until the issuer has accepted and this becomes a known peer.
-    pub(super) invite: Option<String>,
-    pub(super) connected: bool,
+    pub invite: Option<String>,
+    pub connected: bool,
     /// Turn counter for peer bridge conversations.
-    pub(super) turns: Arc<std::sync::atomic::AtomicU64>,
+    pub turns: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this conversation has been closed (turn limit or explicit done).
-    pub(super) closed: Arc<std::sync::atomic::AtomicBool>,
+    pub closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DeviceConn {
-    pub(super) fn new(ticket: String) -> Self {
+    pub fn new(ticket: String) -> Self {
         DeviceConn {
             send: Arc::new(AsyncMutex::new(None)),
             inbox: Arc::new(std::sync::Mutex::new(VecDeque::new())),
@@ -72,25 +82,25 @@ impl DeviceConn {
         }
     }
 
-    pub(super) fn with_invite(mut self, invite: Option<String>) -> Self {
+    pub fn with_invite(mut self, invite: Option<String>) -> Self {
         self.invite = invite;
         self
     }
 
     /// Reset conversation state (turns=0, closed=false) — call on (re)connect.
-    pub(super) fn reset_conversation(&self) {
+    pub fn reset_conversation(&self) {
         self.turns.store(0, Relaxed);
         self.closed.store(false, Relaxed);
     }
 }
 
-pub(super) type DeviceMap = Arc<AsyncMutex<HashMap<String, DeviceConn>>>;
+pub type DeviceMap = Arc<AsyncMutex<HashMap<String, DeviceConn>>>;
 
 // ---------------------------------------------------------------------------
 // iroh dial helper
 // ---------------------------------------------------------------------------
 
-pub(super) async fn dial_device(
+pub(crate) async fn dial_device(
     endpoint: &Endpoint,
     ticket_str: &str,
 ) -> Result<(SendStream, RecvStream)> {
@@ -109,7 +119,7 @@ pub(super) async fn dial_device(
 /// already trusts our machine root can auto-admit us without an invite at
 /// all, see `certs.rs`/design.md D1), then the `thinking(false)` handshake.
 /// Calls `reset_conversation()` on the DeviceConn.
-pub(super) async fn connect_device(
+pub(crate) async fn connect_device(
     endpoint: &Endpoint,
     name: &str,
     ticket: &str,
@@ -255,7 +265,7 @@ fn push_frame(inbox: &Inbox, transfers: &mut Transfers, frame: Frame) {
 /// LLM can react (match on surfaceId and respond with `update_ui`); file
 /// transfers are reassembled and surfaced once complete (see [`push_frame`]).
 /// Generic over the reader so the behavior is unit-testable over an in-memory pipe.
-pub(super) async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(reader: BufReader<R>, inbox: Inbox) {
+pub(crate) async fn read_frames_into<R: tokio::io::AsyncRead + Unpin>(reader: BufReader<R>, inbox: Inbox) {
     read_frames_into_with(reader, inbox, Transfers::new()).await
 }
 
@@ -302,7 +312,7 @@ async fn flush_mailbox(device: &str, send: &mut SendStream) -> Result<()> {
 /// device name if a ticket matches.
 ///
 /// This is a pure function (no I/O) so it is easily unit-tested.
-pub(super) fn match_known_device(
+pub(crate) fn match_known_device(
     remote_node_id: &EndpointId,
     map_devices: &HashMap<String, DeviceConn>,
     registry_devices: &[Device],
@@ -343,7 +353,7 @@ pub(super) fn match_known_device(
 /// iroh `ProtocolHandler` that accepts incoming azula app connections on
 /// `LLM_ALPN` and registers each as a device in the shared map.
 #[derive(Clone, Debug)]
-pub(super) struct BridgeAcceptHandler {
+pub(crate) struct BridgeAcceptHandler {
     devices: DeviceMap,
     bind: String,
     /// The name this bridge announces to apps that connect in (the conversation
@@ -365,7 +375,7 @@ pub(super) struct BridgeAcceptHandler {
 }
 
 impl BridgeAcceptHandler {
-    pub(super) fn new(
+    pub(crate) fn new(
         devices: DeviceMap,
         bind: String,
         own_name: String,

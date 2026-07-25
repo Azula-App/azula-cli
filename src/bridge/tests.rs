@@ -21,7 +21,7 @@ use crate::mcp::LLM_ALPN;
 use crate::proto::{read_frame, write_frame, Frame};
 use crate::registry::Device;
 
-use super::device::{dial_device, match_known_device, read_frames_into, BridgeAcceptHandler, DeviceConn, DeviceMap, Inbox};
+use crate::core::device::{dial_device, match_known_device, read_frames_into, BridgeAcceptHandler, DeviceConn, DeviceMap, Inbox};
 use super::tools::{AzulaBridge, ConnectArgs, GetMessagesArgs, SayArgs, SendFileArgs, SendMessageArgs};
 
 /// The reader surfaces user chat text verbatim and turns an A2UI action

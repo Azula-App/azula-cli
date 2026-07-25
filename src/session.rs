@@ -126,8 +126,10 @@ impl SessionKey {
 /// `~/.azula/sessions`, or the `AZULA_SESSIONS_DIR` override (tests /
 /// sandboxes, mirroring `registry::AZULA_REGISTRY_DIR`). Under `cfg(test)`
 /// this defaults to an isolated temp dir even without the env var, so the
-/// test suite never touches a developer's real `~/.azula/sessions`.
-fn sessions_dir() -> Result<PathBuf> {
+/// test suite never touches a developer's real `~/.azula/sessions`. Public
+/// so `core::status` can list named sessions from the same directory
+/// `SessionKey::named` writes to.
+pub fn sessions_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("AZULA_SESSIONS_DIR") {
         return Ok(PathBuf::from(dir));
     }

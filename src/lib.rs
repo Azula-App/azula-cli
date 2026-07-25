@@ -16,7 +16,10 @@
 pub mod accept_gate;
 pub mod bip39_wordlist;
 pub mod bridge;
+pub mod catalog;
 pub mod certs;
+pub mod cli;
+pub mod core;
 pub mod endpoint;
 pub mod eventlog;
 pub mod filexfer;
