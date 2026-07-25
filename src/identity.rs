@@ -6,7 +6,7 @@
 //! code — stays stable. Each server stores its raw 32-byte secret under
 //! `~/.azula/<name>.key` (`serve.key`, `bridge.key`, `blackjack.key`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use iroh::SecretKey;
 use tracing::{info, warn};
@@ -61,18 +61,102 @@ pub fn load_or_create_secret(name: &str) -> SecretKey {
     key
 }
 
+// ---------------------------------------------------------------------------
+// Machine identity (cli-multi-session-relay design.md D1)
+// ---------------------------------------------------------------------------
+//
+// `~/.azula/machine.key` is the stable per-machine root that signs session
+// certificates. On a machine that already ran `azula serve-mcp`/`azula mcp`
+// before per-session keys existed, `~/.azula/bridge.key` holds that identity
+// — it is adopted as-is (bytes copied to `machine.key`, `bridge.key` left in
+// place untouched) so the node id, and therefore every pairing the phone
+// already has with this machine, is unchanged.
+//
+// CRITICAL: session-establishment code paths (binding the per-process
+// session endpoint) must call `load_machine_secret_if_exists` — never
+// `load_or_create_machine_secret` — so a headless environment (no
+// `machine.key`, no `bridge.key` to adopt) never gets a machine identity
+// written to disk merely because a session started (the headless spec's "no
+// standing credential" requirement). Creation is reserved for explicit
+// pairing-side flows: minting an invite against the machine identity
+// (`azula invite --bridge`), the `start_pairing` tool / startup banner, or a
+// future `azula pair` context.
+
+/// Read a saved secret key's raw 32 bytes from `path`, if present and valid.
+fn read_secret_at(path: &Path) -> Option<SecretKey> {
+    let bytes = std::fs::read(path).ok()?;
+    let arr = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+    Some(SecretKey::from_bytes(&arr))
+}
+
+/// Load the machine identity if one already exists on disk — reading
+/// `~/.azula/machine.key`, or adopting `~/.azula/bridge.key` in place (D1's
+/// migration) when only that exists — **without creating anything new**.
+/// Returns `None` when neither file exists (or there's no resolvable key
+/// directory, e.g. `$HOME` unset outside tests): callers on a
+/// session-establishment path must treat that as "no machine identity here,"
+/// never as licence to create one (see the module-level note above).
+pub fn load_machine_secret_if_exists() -> Option<SecretKey> {
+    let machine_path = key_path("machine")?;
+    if let Some(key) = read_secret_at(&machine_path) {
+        info!(path = %machine_path.display(), "resuming machine identity");
+        return Some(key);
+    }
+
+    // No machine.key (or it was unreadable) — check bridge.key for adoption.
+    let bridge_path = key_path("bridge")?;
+    let key = read_secret_at(&bridge_path)?;
+
+    // Adopt: persist the same bytes under machine.key; bridge.key is left
+    // untouched so anything still reading it directly keeps working too.
+    if let Some(dir) = machine_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::write(&machine_path, key.to_bytes()) {
+        Ok(()) => info!(
+            path = %machine_path.display(),
+            bridge_path = %bridge_path.display(),
+            "adopted bridge.key as the machine identity (node id unchanged)"
+        ),
+        Err(e) => warn!(path = %machine_path.display(), error = %e, "could not persist adopted machine key"),
+    }
+    Some(key)
+}
+
+/// As [`load_machine_secret_if_exists`], but mints and persists a fresh
+/// machine key when neither `machine.key` nor `bridge.key` exists yet.
+/// Reserved for explicit pairing-side flows (see the module-level note
+/// above) — never call this from a session-establishment path.
+pub fn load_or_create_machine_secret() -> SecretKey {
+    if let Some(key) = load_machine_secret_if_exists() {
+        return key;
+    }
+    load_or_create_secret("machine")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Only this one test mutates `AZULA_KEY_DIR`, so it doesn't need the
-    // `ENV_TEST_LOCK` guard convention `registry.rs`/`accept_gate.rs` use for
-    // env vars touched by multiple concurrent tests.
-    #[test]
-    fn distinct_identity_names_never_share_a_key() {
-        let dir = std::env::temp_dir().join(format!("azula-identity-test-{}", std::process::id()));
+    /// Serializes tests in this module that mutate the process-global
+    /// `AZULA_KEY_DIR` env var — mirrors `registry::ENV_TEST_LOCK`. Needed now
+    /// that more than one test sets it (`cargo test`'s default parallelism
+    /// would otherwise let them race and read back each other's directory).
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point `AZULA_KEY_DIR` at a fresh, empty per-test directory and return
+    /// it. Caller must hold `ENV_TEST_LOCK` for the duration of env mutation.
+    fn isolated_key_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("azula-identity-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("AZULA_KEY_DIR", &dir);
+        dir
+    }
+
+    #[test]
+    fn distinct_identity_names_never_share_a_key() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolated_key_dir("distinct_names");
 
         // Task 6.4: `azula link`'s identity (named "link") must be distinct
         // from `serve`'s — the device-linking spec's "CLI Device Enrollment"
@@ -88,6 +172,101 @@ mod tests {
         // than minting a new one.
         let link_key_again = load_or_create_secret("link");
         assert_eq!(link_key.to_bytes(), link_key_again.to_bytes());
+
+        std::env::remove_var("AZULA_KEY_DIR");
+    }
+
+    // --- Machine identity (design.md D1) -----------------------------------
+
+    #[test]
+    fn bridge_key_adopted_as_machine_key_preserves_node_id() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolated_key_dir("adopt_bridge");
+
+        // Simulate a pre-existing install: only bridge.key on disk.
+        let bridge_key = load_or_create_secret("bridge");
+        assert!(dir.join("bridge.key").exists());
+        assert!(!dir.join("machine.key").exists());
+
+        let adopted = load_machine_secret_if_exists().expect("bridge.key should be adopted");
+        assert_eq!(
+            adopted.to_bytes(),
+            bridge_key.to_bytes(),
+            "adopted machine key must be byte-identical to bridge.key (same node id)"
+        );
+        assert_eq!(
+            adopted.public(),
+            bridge_key.public(),
+            "the node id (public key) must be unchanged by adoption"
+        );
+
+        // machine.key now exists on disk, with the same bytes; bridge.key is
+        // untouched (still present, still readable, same content).
+        assert!(dir.join("machine.key").exists());
+        let machine_bytes = std::fs::read(dir.join("machine.key")).unwrap();
+        assert_eq!(machine_bytes, bridge_key.to_bytes());
+        let bridge_bytes = std::fs::read(dir.join("bridge.key")).unwrap();
+        assert_eq!(bridge_bytes, bridge_key.to_bytes(), "bridge.key must be left in place, unchanged");
+
+        // A second call resumes the now-adopted machine.key (not bridge.key
+        // again) and still returns the same identity.
+        let resumed = load_machine_secret_if_exists().expect("machine.key now exists");
+        assert_eq!(resumed.to_bytes(), bridge_key.to_bytes());
+
+        std::env::remove_var("AZULA_KEY_DIR");
+    }
+
+    #[test]
+    fn no_machine_or_bridge_key_session_path_creates_nothing() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolated_key_dir("headless");
+
+        // Neither machine.key nor bridge.key exists — the headless case.
+        assert!(!dir.join("machine.key").exists());
+        assert!(!dir.join("bridge.key").exists());
+
+        // The session-establishment-safe accessor must return None and must
+        // not write anything: "no standing credential" in a headless env.
+        assert!(load_machine_secret_if_exists().is_none());
+        assert!(!dir.join("machine.key").exists(), "load_machine_secret_if_exists must never create machine.key");
+        assert!(!dir.join("bridge.key").exists());
+
+        std::env::remove_var("AZULA_KEY_DIR");
+    }
+
+    #[test]
+    fn load_or_create_machine_secret_creates_when_neither_exists() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolated_key_dir("create_machine");
+
+        assert!(load_machine_secret_if_exists().is_none());
+
+        let created = load_or_create_machine_secret();
+        assert!(dir.join("machine.key").exists());
+        assert!(!dir.join("bridge.key").exists(), "must not fabricate a bridge.key");
+
+        // Idempotent: calling again resumes the same identity rather than
+        // minting a fresh one.
+        let resumed = load_or_create_machine_secret();
+        assert_eq!(created.to_bytes(), resumed.to_bytes());
+        // And the read-only accessor now sees it too.
+        assert_eq!(load_machine_secret_if_exists().unwrap().to_bytes(), created.to_bytes());
+
+        std::env::remove_var("AZULA_KEY_DIR");
+    }
+
+    #[test]
+    fn load_or_create_machine_secret_adopts_bridge_key_when_present() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _dir = isolated_key_dir("create_or_adopt");
+
+        let bridge_key = load_or_create_secret("bridge");
+        let result = load_or_create_machine_secret();
+        assert_eq!(
+            result.to_bytes(),
+            bridge_key.to_bytes(),
+            "load_or_create_machine_secret must adopt an existing bridge.key rather than minting a fresh key"
+        );
 
         std::env::remove_var("AZULA_KEY_DIR");
     }

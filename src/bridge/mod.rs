@@ -50,19 +50,22 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::protocol::Router;
-use iroh::Endpoint;
+use iroh::{Endpoint, SecretKey};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::StreamableHttpService;
 use rmcp::ServiceExt;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::certs;
+use crate::identity;
 use crate::invite;
 use crate::link::parse_ticket;
 use crate::mailbox;
 use crate::mcp::LLM_ALPN;
 use crate::qr;
 use crate::registry;
+use crate::session::SessionKey;
 
 use device::{connect_device, BridgeAcceptHandler, DeviceMap};
 use state::write_state;
@@ -81,6 +84,21 @@ struct BridgeCore {
     bridge_ticket: String,
     own_name: String,
     _router: Router,
+    /// The per-process session identity bound to `endpoint` (design.md D2).
+    /// Held so an ephemeral session's on-disk key file isn't deleted (by its
+    /// Drop guard) while the bridge is still using it.
+    #[allow(dead_code)]
+    session: SessionKey,
+    /// This session's own `azd…` certificate — chained to the machine root
+    /// when one exists, self-certified otherwise (design.md D1/D3) —
+    /// re-presented in every `Hello` frame this bridge sends.
+    session_cert: String,
+    /// The machine identity, read from disk only (never created here) —
+    /// `None` in a headless environment. Used solely to mint pairing invites
+    /// against the machine identity (`mint_pairing_invite`); see
+    /// `identity::load_machine_secret_if_exists`'s docs for why a
+    /// session-establishment path like this one must never create one.
+    machine_secret: Option<SecretKey>,
 }
 
 /// Bind the endpoint, stand up the accept router, preload known devices (+ any
@@ -88,17 +106,38 @@ struct BridgeCore {
 /// a human tag written into the runtime state file (the HTTP bind, or "stdio").
 /// `allow_legacy` admits invite-less unknown strangers as unverified instead
 /// of closing the connection (see `BridgeAcceptHandler` / the invitations
-/// spec's transition policy).
+/// spec's transition policy). `session_name` is `--session`/`AZULA_SESSION`:
+/// `Some` selects a persistent named session key, `None` mints a fresh
+/// ephemeral one per process (design.md D2) — this is what binds the
+/// endpoint now, never the old shared "bridge" identity, so concurrent
+/// `azula mcp` processes never collide on one node id.
 async fn setup_bridge(
     label: &str,
     device_urls: Vec<String>,
     name: Option<String>,
     allow_legacy: bool,
+    session_name: Option<String>,
 ) -> Result<BridgeCore> {
-    // Reuse a persisted key so the bridge keeps a stable node id (and connect
-    // code) across restarts; the one endpoint serves both accept and dial.
-    let (raw_endpoint, bridge_ticket) = crate::endpoint::bind_server_endpoint("bridge").await?;
+    let session = SessionKey::resolve(session_name.as_deref())?;
+    let (raw_endpoint, bridge_ticket) = crate::endpoint::bind_endpoint_with_secret(session.secret.clone()).await?;
     let my_node_id = raw_endpoint.id();
+    info!(session = %session.display_name, mode = ?session.mode, node_id = %my_node_id, "bridge: session identity");
+
+    // D1: the machine identity, read-only — session establishment must never
+    // implicitly create `machine.key` (the headless spec's "no standing
+    // credential"). `None` here is the headless case: no machine to chain a
+    // session cert to, so the session self-certifies instead (D3).
+    let machine_secret = identity::load_machine_secret_if_exists();
+
+    // The session's own `azd…` cert, carried in every Hello frame this
+    // process sends: chained to the machine root when one exists, or
+    // self-certified (`root_pk == device_pk == session_pk`) in the headless
+    // case — same minting path either way (`certs::mint_session_cert`).
+    let session_cert = match &machine_secret {
+        Some(m) => certs::mint_session_cert(m, my_node_id, certs::DEFAULT_SESSION_EXPIRY),
+        None => certs::mint_self_certified_session(&session.secret, certs::DEFAULT_SESSION_EXPIRY),
+    }
+    .encode();
 
     let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
 
@@ -113,8 +152,14 @@ async fn setup_bridge(
 
     // Accept incoming azula app / peer-bridge connections (devices that scanned
     // the bridge's QR) and register them.
-    let accept_handler =
-        BridgeAcceptHandler::new(devices.clone(), label.to_string(), own_name.clone(), my_node_id, allow_legacy);
+    let accept_handler = BridgeAcceptHandler::new(
+        devices.clone(),
+        label.to_string(),
+        own_name.clone(),
+        my_node_id,
+        allow_legacy,
+        session_cert.clone(),
+    );
     let iroh_router = Router::builder(raw_endpoint)
         .accept(LLM_ALPN, accept_handler)
         .spawn();
@@ -155,13 +200,15 @@ async fn setup_bridge(
 
         let own_name_clone = own_name.clone();
         let label_owned = label.to_string();
+        let cert_owned = session_cert.clone();
         for (dev_name, ticket, invite) in entries {
             let ep = endpoint.clone();
             let devs = devices.clone();
             let label_str = label_owned.clone();
             let my_name = own_name_clone.clone();
+            let my_cert = cert_owned.clone();
             tokio::spawn(async move {
-                connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref()).await;
+                connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref(), Some(&my_cert)).await;
                 write_state(&label_str, &devs).await;
             });
         }
@@ -174,6 +221,7 @@ async fn setup_bridge(
         let devs = devices.clone();
         let label_owned = label.to_string();
         let my_name = own_name.clone();
+        let my_cert = session_cert.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(25)).await;
@@ -186,23 +234,24 @@ async fn setup_bridge(
                 };
                 for (dev_name, ticket, invite) in pending {
                     info!(device=%dev_name, "bridge: attempting redelivery of queued mail");
-                    connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref()).await;
+                    connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref(), Some(&my_cert)).await;
                     write_state(&label_owned, &devs).await;
                 }
             }
         });
     }
 
-    Ok(BridgeCore { endpoint, devices, bridge_ticket, own_name, _router: iroh_router })
+    Ok(BridgeCore { endpoint, devices, bridge_ticket, own_name, _router: iroh_router, session, session_cert, machine_secret })
 }
 
-/// Mint a signed 24h invite wrapping `ticket` (spec: "serve/serve-mcp mint a
-/// signed 24h invite for their startup pairing QR instead of printing the raw
-/// ticket"). Shared by the startup banner ([`startup_invite`]) and the
-/// `start_pairing` MCP tool (`tools.rs`), so both surfaces retire the raw
-/// ticket link the same way. A mint failure (e.g. `$HOME` unset) falls back
-/// to `None` so callers can fall back to the raw-ticket link.
-pub(super) fn mint_bridge_invite(ticket: &str, secret_key: &iroh::SecretKey) -> Option<String> {
+/// Mint a signed 24h invite wrapping `ticket`, signed by `secret_key` (spec:
+/// "serve/serve-mcp mint a signed 24h invite for their startup pairing QR
+/// instead of printing the raw ticket"). Shared by [`mint_pairing_invite`]
+/// (which decides *which* identity's ticket/key to pass) and — indirectly, by
+/// still being the raw building block — anything else that wants a plain
+/// self-signed invite. A mint failure (e.g. `$HOME` unset) falls back to
+/// `None` so callers can fall back to the raw-ticket link.
+pub(super) fn mint_bridge_invite(ticket: &str, secret_key: &SecretKey) -> Option<String> {
     let expiry = invite::Expiry::In(std::time::Duration::from_secs(24 * 60 * 60));
     match invite::mint(ticket, expiry, true, false, None, secret_key) {
         Ok((payload, _)) => Some(payload.encode()),
@@ -213,13 +262,50 @@ pub(super) fn mint_bridge_invite(ticket: &str, secret_key: &iroh::SecretKey) -> 
     }
 }
 
-/// Mint a signed 24h invite for the bridge's startup pairing QR.
-/// `legacy_ticket` skips minting (the `--legacy-ticket` escape hatch).
-fn startup_invite(core: &BridgeCore, legacy_ticket: bool) -> Option<String> {
+/// Mint the pairing invite shown by the startup banner and the
+/// `start_pairing` tool (design.md D1/D3): against the **machine** identity
+/// when one already exists on disk (`machine_secret.is_some()` — this
+/// function never creates one, matching `identity::load_machine_secret_if_exists`'s
+/// contract), or the session's own identity when it doesn't (the headless
+/// case, or a machine-identity bind failure).
+///
+/// Minting against the machine identity needs a dialable ticket for it, so
+/// this briefly binds a second endpoint under `machine_secret` purely to
+/// obtain one — the same "bind, mint, let it drop" shape `azula invite
+/// --bridge` (`cmd_invite_mint` in `main.rs`) already uses; the ticket is a
+/// pre-authorization for whenever the machine identity is next brought
+/// online with a router, not a promise that it's dialable right now (a
+/// dedicated `azula pair` context, design.md's open follow-up, is where that
+/// gets tightened up).
+pub(super) async fn mint_pairing_invite(
+    machine_secret: Option<&SecretKey>,
+    session_ticket: &str,
+    session_secret: &SecretKey,
+) -> Option<String> {
+    if let Some(machine_secret) = machine_secret {
+        match crate::endpoint::bind_endpoint_with_secret(machine_secret.clone()).await {
+            Ok((_ep, machine_ticket)) => {
+                if let Some(encoded) = mint_bridge_invite(&machine_ticket, machine_secret) {
+                    return Some(encoded);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "bridge: could not bind the machine identity for a pairing invite; falling back to the session identity");
+            }
+        }
+    }
+    mint_bridge_invite(session_ticket, session_secret)
+}
+
+/// Mint the bridge's startup pairing QR invite (against the machine identity
+/// when available, else the session's own — see [`mint_pairing_invite`]).
+/// `legacy_ticket` skips minting entirely (the `--legacy-ticket` escape
+/// hatch), returning the session's raw ticket link instead.
+async fn startup_invite(core: &BridgeCore, legacy_ticket: bool) -> Option<String> {
     if legacy_ticket {
         return None;
     }
-    mint_bridge_invite(&core.bridge_ticket, core.endpoint.secret_key())
+    mint_pairing_invite(core.machine_secret.as_ref(), &core.bridge_ticket, core.endpoint.secret_key()).await
 }
 
 pub async fn run(
@@ -229,8 +315,9 @@ pub async fn run(
     max_turns: u64,
     allow_legacy: bool,
     legacy_ticket: bool,
+    session_name: Option<String>,
 ) -> Result<()> {
-    let core = setup_bridge(&bind, device_urls, name, allow_legacy).await?;
+    let core = setup_bridge(&bind, device_urls, name, allow_legacy, session_name).await?;
 
     // MCP server over Streamable HTTP, mounted at /mcp.
     let ep_svc = core.endpoint.clone();
@@ -238,6 +325,8 @@ pub async fn run(
     let bind_svc = bind.clone();
     let ticket_svc = core.bridge_ticket.clone();
     let own_name_svc = core.own_name.clone();
+    let session_cert_svc = core.session_cert.clone();
+    let machine_secret_svc = core.machine_secret.clone();
     let service = StreamableHttpService::new(
         move || Ok(AzulaBridge::new(
             ep_svc.clone(),
@@ -247,6 +336,8 @@ pub async fn run(
             own_name_svc.clone(),
             max_turns,
             legacy_ticket,
+            session_cert_svc.clone(),
+            machine_secret_svc.clone(),
         )),
         Arc::new(LocalSessionManager::default()),
         Default::default(),
@@ -261,7 +352,7 @@ pub async fn run(
             "  Add this URL to an MCP-capable LLM client.".to_string(),
         ],
     );
-    match startup_invite(&core, legacy_ticket) {
+    match startup_invite(&core, legacy_ticket).await {
         Some(encoded) => qr::print_invite_pairing("Pair a device by scanning:", &encoded),
         None => qr::print_pairing("Pair a device by scanning:", &core.bridge_ticket),
     }
@@ -278,11 +369,12 @@ pub async fn run_stdio(
     max_turns: u64,
     allow_legacy: bool,
     legacy_ticket: bool,
+    session_name: Option<String>,
 ) -> Result<()> {
-    let core = setup_bridge("stdio", device_urls, name, allow_legacy).await?;
+    let core = setup_bridge("stdio", device_urls, name, allow_legacy, session_name).await?;
 
     eprintln!("azula MCP bridge (stdio) online as \"{}\"", core.own_name);
-    match startup_invite(&core, legacy_ticket) {
+    match startup_invite(&core, legacy_ticket).await {
         Some(encoded) => eprintln!("pairing URL: {}", qr::invite_url(&encoded)),
         None => eprintln!("pairing URL: {}", qr::pairing_url(&core.bridge_ticket)),
     }
@@ -296,6 +388,8 @@ pub async fn run_stdio(
         core.own_name.clone(),
         max_turns,
         legacy_ticket,
+        core.session_cert.clone(),
+        core.machine_secret.clone(),
     );
     // Serve over stdio; core stays alive (holds the accept router) until we stop.
     let running = bridge.serve(rmcp::transport::stdio()).await?;

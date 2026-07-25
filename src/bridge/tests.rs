@@ -168,16 +168,16 @@ async fn send_file_tool_delivers_over_iroh() {
     let bob_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
     let bind_placeholder = "127.0.0.1:0".to_string();
 
-    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true);
+    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true, "azd-test-cert-alice".to_string());
     let alice_router = Router::builder(alice_raw_ep).accept(LLM_ALPN, alice_accept).spawn();
-    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true);
+    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true, "azd-test-cert-bob".to_string());
     let bob_router = Router::builder(bob_raw_ep).accept(LLM_ALPN, bob_accept).spawn();
 
     let alice_ep = Arc::new(alice_router.endpoint().clone());
     let bob_ep = Arc::new(bob_router.endpoint().clone());
     let bob_ticket = EndpointTicket::new(bob_ep.addr()).to_string();
 
-    let alice = AzulaBridge::new(alice_ep.clone(), alice_devices.clone(), bind_placeholder.clone(), "alice-ticket".to_string(), "alice".to_string(), 20, true);
+    let alice = AzulaBridge::new(alice_ep.clone(), alice_devices.clone(), bind_placeholder.clone(), "alice-ticket".to_string(), "alice".to_string(), 20, true, "azd-test-cert-alice".to_string(), None);
 
     // Write a small "image" to send.
     let src_path = std::env::temp_dir()
@@ -255,12 +255,12 @@ async fn bridge_to_bridge_relay() {
     let bind_placeholder = "127.0.0.1:0".to_string();
 
     // Build iroh routers with accept handlers.
-    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true);
+    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true, "azd-test-cert-alice".to_string());
     let alice_router = Router::builder(alice_raw_ep)
         .accept(LLM_ALPN, alice_accept)
         .spawn();
 
-    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true);
+    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true, "azd-test-cert-bob".to_string());
     let bob_router = Router::builder(bob_raw_ep)
         .accept(LLM_ALPN, bob_accept)
         .spawn();
@@ -280,6 +280,8 @@ async fn bridge_to_bridge_relay() {
         "alice".to_string(),
         3,
         true,
+        "azd-test-cert-alice".to_string(),
+        None,
     );
     let bob = AzulaBridge::new(
         bob_ep.clone(),
@@ -289,6 +291,8 @@ async fn bridge_to_bridge_relay() {
         "bob".to_string(),
         3,
         true,
+        "azd-test-cert-bob".to_string(),
+        None,
     );
 
     // Alice connects to Bob.
@@ -526,6 +530,8 @@ async fn offline_queue_then_flush() {
         "alice".to_string(),
         20,
         true,
+        "azd-test-cert-alice".to_string(),
+        None,
     );
 
     // send_message to offline "phone" should queue, not error.
@@ -734,7 +740,7 @@ async fn reconnect_by_node_id_flushes_mailbox() {
     );
 
     // Stand up a bridge accept handler.
-    let bridge_accept = BridgeAcceptHandler::new(bridge_devices.clone(), bind_placeholder.clone(), "Claude".to_string(), bridge_raw_ep.id(), true);
+    let bridge_accept = BridgeAcceptHandler::new(bridge_devices.clone(), bind_placeholder.clone(), "Claude".to_string(), bridge_raw_ep.id(), true, "azd-test-cert-bridge".to_string());
     let bridge_router = Router::builder(bridge_raw_ep)
         .accept(LLM_ALPN, bridge_accept)
         .spawn();
@@ -859,6 +865,8 @@ async fn start_pairing_mints_invite_unless_legacy_ticket() {
         "bridge".to_string(),
         20,
         false,
+        "azd-test-cert-bridge".to_string(),
+        None,
     );
     let result = bridge.start_pairing().await.expect("start_pairing succeeds");
     let text = result.content.iter().filter_map(|c| c.as_text().map(|t| t.text.as_str())).collect::<Vec<_>>().join("\n");
@@ -877,6 +885,8 @@ async fn start_pairing_mints_invite_unless_legacy_ticket() {
         "bridge".to_string(),
         20,
         true,
+        "azd-test-cert-bridge".to_string(),
+        None,
     );
     let legacy_result = legacy_bridge.start_pairing().await.expect("start_pairing succeeds");
     let legacy_text = legacy_result

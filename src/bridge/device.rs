@@ -102,11 +102,13 @@ pub(super) async fn dial_device(
 }
 
 /// Dial and register a device in the map.  Returns whether it connected.
-/// Sends `Frame::Hello { name: own_name, invite }` as the very first frame
-/// (presenting `invite` — the encoded invite string, if this device was
-/// paired via one — so an unknown-to-the-peer dial can pass its accept
-/// gate), then the `thinking(false)` handshake.  Calls `reset_conversation()`
-/// on the DeviceConn.
+/// Sends `Frame::Hello { name: own_name, invite, cert }` as the very first
+/// frame (presenting `invite` — the encoded invite string, if this device
+/// was paired via one, so an unknown-to-the-peer dial can pass its accept
+/// gate — and `cert` — this session's own `azd…` certificate, so a peer that
+/// already trusts our machine root can auto-admit us without an invite at
+/// all, see `certs.rs`/design.md D1), then the `thinking(false)` handshake.
+/// Calls `reset_conversation()` on the DeviceConn.
 pub(super) async fn connect_device(
     endpoint: &Endpoint,
     name: &str,
@@ -114,11 +116,12 @@ pub(super) async fn connect_device(
     devices: &DeviceMap,
     own_name: &str,
     invite: Option<&str>,
+    cert: Option<&str>,
 ) -> bool {
     match dial_device(endpoint, ticket).await {
         Ok((mut send, recv)) => {
-            // Send hello so the peer can name us (and verify our invite, if any).
-            let hello = Frame::Hello { name: own_name.into(), invite: invite.map(String::from), cert: None };
+            // Send hello so the peer can name us (and verify our invite/cert, if any).
+            let hello = Frame::Hello { name: own_name.into(), invite: invite.map(String::from), cert: cert.map(String::from) };
             if let Err(e) = write_frame(&mut send, &hello).await {
                 warn!(device=%name, error=%e, "bridge: hello write failed");
                 return false;
@@ -353,6 +356,10 @@ pub(super) struct BridgeAcceptHandler {
     /// closing the connection (transition escape hatch; `--allow-legacy`,
     /// default on for one release per the invitations spec).
     allow_legacy: bool,
+    /// This session's own `azd…` certificate (design.md D1/D3), sent back to
+    /// an app that dials in so it can recognise our machine root on future
+    /// connections without an invite.
+    own_cert: String,
     /// Counter to assign monotonically-increasing names to scanned devices.
     scan_counter: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -364,6 +371,7 @@ impl BridgeAcceptHandler {
         own_name: String,
         my_node_id: EndpointId,
         allow_legacy: bool,
+        own_cert: String,
     ) -> Self {
         Self {
             devices,
@@ -371,6 +379,7 @@ impl BridgeAcceptHandler {
             own_name,
             my_node_id,
             allow_legacy,
+            own_cert,
             scan_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
@@ -386,6 +395,7 @@ impl ProtocolHandler for BridgeAcceptHandler {
             self.scan_counter.clone(),
             self.my_node_id,
             self.allow_legacy,
+            self.own_cert.clone(),
         )
         .await
         .map_err(|e| AcceptError::from_boxed(e.into()))
@@ -396,6 +406,7 @@ impl ProtocolHandler for BridgeAcceptHandler {
 /// dial, short enough that a silent connection doesn't tie up an accept slot.
 const STRANGER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_incoming(
     connection: Connection,
     devices: DeviceMap,
@@ -404,6 +415,7 @@ async fn accept_incoming(
     counter: Arc<std::sync::atomic::AtomicU32>,
     my_node_id: EndpointId,
     allow_legacy: bool,
+    own_cert: String,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
     let remote_id_str = remote_id.to_string();
@@ -535,7 +547,7 @@ async fn accept_incoming(
     // name (e.g. "Claude"); the app keeps the bridge's peer code as the subtitle.
     // Never to peer bridges. The LLM can refine the title later via `set_name`.
     if from_app {
-        let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone(), invite: None, cert: None }).await;
+        let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone(), invite: None, cert: Some(own_cert.clone()) }).await;
     }
 
     let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));

@@ -192,12 +192,20 @@ pub struct AzulaBridge {
     /// `start_pairing` returns the raw ticket link instead of minting an
     /// invite (`--legacy-ticket`, mirrors the startup banner's escape hatch).
     legacy_ticket: bool,
+    /// This session's own `azd…` certificate (design.md D1/D3), re-presented
+    /// in every `Hello` frame `connect`/`ensure_device` send when dialing out.
+    session_cert: String,
+    /// The machine identity, if one exists on disk — `None` in a headless
+    /// environment. `start_pairing` mints against this when present (see
+    /// `super::mint_pairing_invite`); never created here.
+    machine_secret: Option<iroh::SecretKey>,
     #[allow(dead_code)]
     tool_router: ToolRouter<AzulaBridge>,
 }
 
 #[tool_router]
 impl AzulaBridge {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         endpoint: Arc<Endpoint>,
         devices: DeviceMap,
@@ -206,6 +214,8 @@ impl AzulaBridge {
         own_name: String,
         max_turns: u64,
         legacy_ticket: bool,
+        session_cert: String,
+        machine_secret: Option<iroh::SecretKey>,
     ) -> Self {
         Self {
             endpoint,
@@ -215,6 +225,8 @@ impl AzulaBridge {
             own_name,
             max_turns,
             legacy_ticket,
+            session_cert,
+            machine_secret,
             tool_router: Self::tool_router(),
         }
     }
@@ -258,8 +270,8 @@ impl AzulaBridge {
             warn!(error=%e, "bridge: registry add failed; continuing");
         }
 
-        // Dial the device, presenting the invite (if any) in the hello.
-        let connected = connect_device(&self.endpoint, &name, &ticket, &self.devices, &self.own_name, invite_str.as_deref()).await;
+        // Dial the device, presenting the invite (if any) and our session cert in the hello.
+        let connected = connect_device(&self.endpoint, &name, &ticket, &self.devices, &self.own_name, invite_str.as_deref(), Some(&self.session_cert)).await;
 
         // If now connected, reset the conversation state.
         if connected {
@@ -725,14 +737,15 @@ data_model: {"name":""}"##)]
     /// Show the bridge's pairing URL and QR code so a user can scan and connect.
     #[tool(description = "Return the bridge's pairing URL and a Unicode QR code. The user scans the QR with their phone camera to open the azula app and connect to this bridge automatically. No arguments needed.")]
     pub(super) async fn start_pairing(&self) -> Result<CallToolResult, ErrorData> {
-        // Mint a signed 24h invite for the link/QR instead of the raw dial
-        // ticket, same rationale as the startup banner (`--legacy-ticket`
-        // opts back into the raw ticket, or minting can fail — e.g. $HOME
-        // unset — in which case fall back the same way).
+        // Mint against the machine identity when one exists (design.md
+        // D1/D3), else the session's own — same rationale as the startup
+        // banner (`--legacy-ticket` opts back into the raw ticket, or
+        // minting can fail — e.g. $HOME unset — in which case fall back the
+        // same way).
         let url = if self.legacy_ticket {
             qr::pairing_url(&self.pairing_ticket)
         } else {
-            match super::mint_bridge_invite(&self.pairing_ticket, self.endpoint.secret_key()) {
+            match super::mint_pairing_invite(self.machine_secret.as_ref(), &self.pairing_ticket, self.endpoint.secret_key()).await {
                 Some(encoded) => qr::invite_url(&encoded),
                 None => qr::pairing_url(&self.pairing_ticket),
             }
@@ -799,7 +812,7 @@ impl AzulaBridge {
                     .map(|d| (d.ticket, d.invite))
             });
             if let Some((t, invite)) = ticket_and_invite {
-                connect_device(&self.endpoint, device, &t, &self.devices, &self.own_name, invite.as_deref()).await;
+                connect_device(&self.endpoint, device, &t, &self.devices, &self.own_name, invite.as_deref(), Some(&self.session_cert)).await;
             }
         }
 

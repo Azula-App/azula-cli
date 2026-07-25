@@ -30,5 +30,6 @@ pub mod mcp;
 pub mod proto;
 pub mod qr;
 pub mod registry;
+pub mod session;
 pub mod sync;
 pub mod term;

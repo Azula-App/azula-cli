@@ -67,6 +67,8 @@
 //! equals `device_pk`) before treating a presented cert as identifying the
 //! peer on that connection.
 
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use iroh::{EndpointId, PublicKey, SecretKey, Signature};
 use sha2::{Digest, Sha256};
@@ -78,6 +80,18 @@ pub const FLAG_MAILBOX: u8 = 0x01;
 /// bit 1 of a certificate's `flags`: the device holds the bot role. Reserved
 /// — never set by this change (see `design.md`'s Non-Goals).
 pub const FLAG_BOT: u8 = 0x02;
+/// bit 2 of a certificate's `flags`: this is a **session** certificate
+/// (cli-multi-session-relay design.md D1), not a sibling-device enrollment.
+/// `root_pk` is a machine identity, `device_pk` is a per-process session key;
+/// holding one grants conversation access to peers paired with the machine —
+/// no sync participation, no log authorship, no link-granting authority (see
+/// the device-linking spec's "Session Certificate Kind" requirement).
+pub const FLAG_SESSION: u8 = 0x04;
+
+/// Default session certificate validity (design.md D1/D2): 7 days from
+/// mint time, overridable per session by callers that pass a different
+/// `expires` to [`mint_session_cert`].
+pub const DEFAULT_SESSION_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 const VERSION: u8 = 1;
 const SIGNATURE_LEN: usize = 64;
@@ -154,6 +168,12 @@ impl DeviceCert {
 
     pub fn is_bot(&self) -> bool {
         self.flags & FLAG_BOT != 0
+    }
+
+    /// True if this cert carries [`FLAG_SESSION`] — a per-process session
+    /// certificate rather than a sibling-device enrollment.
+    pub fn is_session(&self) -> bool {
+        self.flags & FLAG_SESSION != 0
     }
 
     /// Bytes covered by the signature: everything up to (not including) the
@@ -289,6 +309,73 @@ impl DeviceCert {
     pub fn binds_to_connection(&self, connection_node_id: EndpointId) -> bool {
         self.device_pk == connection_node_id
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session certificates (cli-multi-session-relay design.md D1/D3)
+// ---------------------------------------------------------------------------
+
+/// Mint a session certificate: `root_pk` = `machine_secret`'s public key,
+/// `device_pk` = `session_pk`, [`FLAG_SESSION`] set, signed by
+/// `machine_secret`, expiring `expires` from now (pass
+/// [`DEFAULT_SESSION_EXPIRY`] for the default 7 days). The session's display
+/// name lives in the app's `Profile` frame, not the cert, so `name` is left
+/// empty here.
+///
+/// Passing the session's own secret as `machine_secret` (so `root_pk ==
+/// device_pk == session_pk`) produces the self-certified shape a headless
+/// process uses when it has no machine identity to chain to — see
+/// [`mint_self_certified_session`], which does exactly that.
+pub fn mint_session_cert(machine_secret: &SecretKey, session_pk: PublicKey, expires: Duration) -> DeviceCert {
+    let issued_at = now_unix();
+    let expires_at = issued_at.saturating_add(expires.as_secs().min(u32::MAX as u64) as u32);
+    let mut cert = DeviceCert {
+        version: VERSION,
+        flags: FLAG_SESSION,
+        root_pk: machine_secret.public(),
+        device_pk: session_pk,
+        issued_at,
+        expires_at,
+        name: String::new(),
+        signature: [0u8; SIGNATURE_LEN],
+    };
+    cert.sign(machine_secret);
+    cert
+}
+
+/// Self-certify a headless session (device-linking spec's "Self-certified
+/// headless session" scenario): the session key doubles as its own root
+/// (`root_pk == device_pk == session_pk`), mirroring the app's
+/// upgrade-in-place self-cert shape. Same minting path as
+/// [`mint_session_cert`] — the session key just signs itself.
+pub fn mint_self_certified_session(session_secret: &SecretKey, expires: Duration) -> DeviceCert {
+    mint_session_cert(session_secret, session_secret.public(), expires)
+}
+
+/// Verify a decoded session certificate against `expected_transport_peer`
+/// (the live connection's transport node id), enforcing every check that's
+/// self-contained to the cert plus the connection:
+///
+/// 1. structural/signature validity against the cert's own embedded
+///    `root_pk`, and non-expiry ([`DeviceCert::verify`]);
+/// 2. [`FLAG_SESSION`] is set;
+/// 3. `device_pk == expected_transport_peer`.
+///
+/// Does **not** check that `root_pk` belongs to an already-paired machine
+/// contact, and does not check revocation — those require a registry the
+/// caller holds and this module doesn't; callers must additionally check
+/// `cert.root_pk` themselves (see the session-identity spec's "Phone
+/// Auto-Accepts Certified Sessions" requirement — all of these checks plus
+/// the registry check are required together).
+pub fn verify_session_cert(cert: &DeviceCert, expected_transport_peer: EndpointId) -> Result<()> {
+    cert.verify()?;
+    if !cert.is_session() {
+        bail!("session cert: FLAG_SESSION not set");
+    }
+    if !cert.binds_to_connection(expected_transport_peer) {
+        bail!("session cert: device_pk does not match the transport peer");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +818,77 @@ mod tests {
         };
         other.sign(&root);
         assert!(!cert.is_revoked_by(&[other]));
+    }
+
+    // --- Session certificates (design.md D1/D3) -----------------------------
+
+    #[test]
+    fn session_cert_mint_and_verify_happy_path() {
+        let machine = root_secret();
+        let session = device_secret();
+        let cert = mint_session_cert(&machine, session.public(), DEFAULT_SESSION_EXPIRY);
+
+        assert_eq!(cert.root_pk, machine.public());
+        assert_eq!(cert.device_pk, session.public());
+        assert!(cert.is_session());
+        assert!(!cert.is_mailbox());
+
+        verify_session_cert(&cert, session.public()).expect("valid session cert should verify");
+    }
+
+    #[test]
+    fn session_cert_expired_is_rejected() {
+        let machine = root_secret();
+        let session = device_secret();
+        let mut cert = mint_session_cert(&machine, session.public(), DEFAULT_SESSION_EXPIRY);
+        // Force expiry into the past and re-sign (mint_session_cert already
+        // signed with the future expiry — mutate + re-sign so the signature
+        // still matches the tampered expires_at).
+        cert.expires_at = 1;
+        cert.sign(&machine);
+
+        let err = verify_session_cert(&cert, session.public()).unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn session_cert_missing_flag_session_is_rejected() {
+        let machine = root_secret();
+        let session = device_secret();
+        // A cert that verifies fine (well-formed, signed, unexpired) but was
+        // never flagged as a session cert — e.g. a plain mailbox device cert.
+        let mut cert = mint_session_cert(&machine, session.public(), DEFAULT_SESSION_EXPIRY);
+        cert.flags = FLAG_MAILBOX;
+        cert.sign(&machine);
+
+        cert.verify().expect("cert is otherwise well-formed");
+        let err = verify_session_cert(&cert, session.public()).unwrap_err();
+        assert!(err.to_string().contains("FLAG_SESSION"), "{err}");
+    }
+
+    #[test]
+    fn session_cert_transport_binding_mismatch_is_rejected() {
+        let machine = root_secret();
+        let session = device_secret();
+        let other = device2_secret();
+        let cert = mint_session_cert(&machine, session.public(), DEFAULT_SESSION_EXPIRY);
+
+        // The cert itself is perfectly valid; it just isn't presented on a
+        // connection whose transport peer id matches device_pk.
+        let err = verify_session_cert(&cert, other.public()).unwrap_err();
+        assert!(err.to_string().contains("transport"), "{err}");
+    }
+
+    #[test]
+    fn self_certified_session_verifies() {
+        let session = device_secret();
+        let cert = mint_self_certified_session(&session, DEFAULT_SESSION_EXPIRY);
+
+        assert_eq!(cert.root_pk, session.public());
+        assert_eq!(cert.device_pk, session.public(), "self-cert: root_pk == device_pk == session_pk");
+        assert!(cert.is_session());
+
+        verify_session_cert(&cert, session.public()).expect("self-certified session cert should verify");
     }
 
     // --- Revocation --------------------------------------------------------

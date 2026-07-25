@@ -122,6 +122,13 @@ struct ServeMcpArgs {
     /// a signed 24h invite.
     #[arg(long = "legacy-ticket")]
     legacy_ticket: bool,
+
+    /// Use a persistent named session (key at `~/.azula/sessions/<name>.key`)
+    /// instead of a fresh ephemeral one for this process — repeated
+    /// invocations with the same name land in the same phone conversation.
+    /// Also settable via `AZULA_SESSION`.
+    #[arg(long, env = "AZULA_SESSION", value_name = "NAME")]
+    session: Option<String>,
 }
 
 /// Options for the `mcp` command (the stdio MCP↔iroh bridge).
@@ -151,6 +158,13 @@ struct McpArgs {
     /// minting a signed 24h invite.
     #[arg(long = "legacy-ticket")]
     legacy_ticket: bool,
+
+    /// Use a persistent named session (key at `~/.azula/sessions/<name>.key`)
+    /// instead of a fresh ephemeral one for this process — repeated
+    /// invocations with the same name land in the same phone conversation.
+    /// Also settable via `AZULA_SESSION`.
+    #[arg(long, env = "AZULA_SESSION", value_name = "NAME")]
+    session: Option<String>,
 }
 
 /// Options for `azula pair`.
@@ -313,6 +327,7 @@ async fn main() -> Result<()> {
                 args.max_turns,
                 args.allow_legacy,
                 args.legacy_ticket,
+                args.session,
             )
             .await
         }
@@ -323,6 +338,7 @@ async fn main() -> Result<()> {
                 args.max_turns,
                 args.allow_legacy,
                 args.legacy_ticket,
+                args.session,
             )
             .await
         }
@@ -438,15 +454,21 @@ fn parse_expiry(s: &str) -> Result<Expiry> {
 async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     let expiry = parse_expiry(&args.expires)?;
 
-    // `serve` (default) and `serve-mcp`/`mcp` (`--bridge`) persist separate
-    // node keys, so which identity this mints against determines which
-    // running process can ever accept it — a `serve` invite is dialable
-    // against a running (or about-to-run) `azula serve`; a `--bridge` invite
-    // against `serve-mcp`/`mcp`. Getting this wrong is the #1 way a minted
-    // invite mysteriously fails verification, so the identity is always
-    // printed alongside the result.
-    let identity_name = if args.bridge { "bridge" } else { "serve" };
-    let (endpoint, ticket) = endpoint::bind_server_endpoint(identity_name).await?;
+    // `serve` (default) persists its own node key; `--bridge` mints against
+    // the **machine** identity (`~/.azula/machine.key`, adopting an existing
+    // `bridge.key` in place — see `identity::load_or_create_machine_secret`)
+    // — the root that every `azula mcp`/`azula serve-mcp` session's cert
+    // chains to (cli-multi-session-relay design.md D1). This is one of the
+    // explicit pairing-side flows allowed to create a machine identity if
+    // none exists yet. Getting the identity wrong is the #1 way a minted
+    // invite mysteriously fails verification, so it's always printed
+    // alongside the result.
+    let identity_label = if args.bridge { "machine" } else { "serve" };
+    let (endpoint, ticket) = if args.bridge {
+        endpoint::bind_machine_endpoint().await?
+    } else {
+        endpoint::bind_server_endpoint("serve").await?
+    };
     let node_id = endpoint.id();
 
     let (payload, record) = invite::mint(
@@ -462,7 +484,7 @@ async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
 
     let node_id_str = node_id.to_string();
     println!(
-        "Minted invite {} for the {identity_name} identity (node {}…)",
+        "Minted invite {} for the {identity_label} identity (node {}…)",
         record.id,
         &node_id_str[..8.min(node_id_str.len())]
     );
@@ -472,7 +494,7 @@ async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     }
     println!("  signed: {}, single-use: {}", record.is_signed(), record.is_single_use());
     if args.bridge {
-        println!("  pairs with: azula serve-mcp / azula mcp (this same identity)");
+        println!("  pairs with: any azula mcp / azula serve-mcp session on this machine (sessions present a cert chained to this machine identity)");
     } else {
         println!("  pairs with: azula serve (this same identity); NOT serve-mcp/mcp — mint with --bridge for that");
     }

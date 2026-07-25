@@ -4,25 +4,40 @@
 
 use anyhow::Result;
 use iroh::endpoint::presets;
-use iroh::Endpoint;
+use iroh::{Endpoint, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use tracing::info;
 
 use crate::identity;
 
-/// Bind an iroh endpoint reusing the persisted secret key for `identity_name`,
-/// wait for it to come online, and return it along with its connect ticket.
-/// This is the "load_or_create_secret → bind → online → ticket" sequence every
-/// server command needs before standing up its own ALPN handlers.
-pub async fn bind_server_endpoint(identity_name: &str) -> Result<(Endpoint, String)> {
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(identity::load_or_create_secret(identity_name))
-        .bind()
-        .await?;
+/// Bind an iroh endpoint with an explicit secret key, wait for it to come
+/// online, and return it along with its connect ticket. This is the
+/// "bind → online → ticket" sequence every server command needs before
+/// standing up its own ALPN handlers; [`bind_server_endpoint`] and
+/// [`bind_machine_endpoint`] are thin wrappers that resolve `secret` from a
+/// persisted identity first.
+pub async fn bind_endpoint_with_secret(secret: SecretKey) -> Result<(Endpoint, String)> {
+    let endpoint = Endpoint::builder(presets::N0).secret_key(secret).bind().await?;
     info!("bringing endpoint online…");
     endpoint.online().await;
     let ticket = EndpointTicket::new(endpoint.addr()).to_string();
     Ok((endpoint, ticket))
+}
+
+/// Bind an iroh endpoint reusing the persisted secret key for `identity_name`,
+/// wait for it to come online, and return it along with its connect ticket.
+pub async fn bind_server_endpoint(identity_name: &str) -> Result<(Endpoint, String)> {
+    bind_endpoint_with_secret(identity::load_or_create_secret(identity_name)).await
+}
+
+/// As [`bind_server_endpoint`], but for the machine identity
+/// (`~/.azula/machine.key`, adopting `bridge.key` in place if that's all that
+/// exists — see `identity::load_or_create_machine_secret`). Creation is
+/// allowed here: callers of this function are explicit pairing-side flows
+/// (`azula invite --bridge`, `start_pairing`, the bridge startup banner),
+/// never a bare session-establishment path.
+pub async fn bind_machine_endpoint() -> Result<(Endpoint, String)> {
+    bind_endpoint_with_secret(identity::load_or_create_machine_secret()).await
 }
 
 /// Print a boxed startup banner: a centered `title`, then each of `body` on
