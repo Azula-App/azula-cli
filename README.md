@@ -1,24 +1,32 @@
 # azula
 
-Server-side companion for the **azula** p2p app. It runs on a server, binds an
-[iroh](https://iroh.computer) endpoint, prints a shareable ticket, and serves
-two ALPN protocols to connecting azula app clients:
+The command-line companion for the **azula** p2p app: everything your phone
+can be on the other end of, driven from a shell, a script, an MCP client, or
+CI — over direct, end-to-end [iroh](https://iroh.computer) connections, no
+account and no server in the middle.
 
-- **`azula/llm/0`** — an LLM relay that acts as an **MCP (Model Context
-  Protocol) client**. At startup the server opens one shared MCP session to an
-  upstream MCP server (a spawned stdio child process, or a remote Streamable
-  HTTP / SSE endpoint). Each `chat` message from an azula app client is pushed
-  into that session by calling a tool, and the tool's text result is streamed
-  back. If no MCP server is configured (or the connect fails), the relay streams
-  a short canned notice instead of erroring.
-- **`azula/term/0`** — a remote shell ("SSH"-like) bridge that runs your shell
-  inside a PTY and streams it over the connection.
+- **Talk to your phone from any tool.** `azula mcp` is an MCP server (stdio,
+  or Streamable HTTP with `--http`) exposing messaging, file transfer, and
+  live agent-drawn UI ([A2UI](../azula-docs/openspec/specs/a2ui/design.md));
+  the same verbs exist directly as CLI commands (`azula message`, `azula ui`,
+  `azula watch --json`) so a plain script can do everything an LLM can.
+- **Many sessions, one pairing.** Pair a machine once; every azula process
+  mints its own certified session key and becomes its own conversation on the
+  phone — run as many concurrent MCP sessions, terminals, and scripts as you
+  like. Ephemeral environments (CI, containers) pair per session with a
+  printed URL/QR instead of holding any standing credential.
+- **Terminals, including "come look at this" ones.** `azula terminal` hosts
+  persistent remote shells; `azula run --handoff on-error -- <cmd>` wraps a
+  command so a failure holds the session open — scrollback included — for
+  your phone (or `azula terminal attach`) to pick up right where it died.
+- **An always-on relay.** `azula relay` on a server stores-and-forwards agent
+  chat and A2UI state while your phone is offline, and live-forwards when it
+  isn't.
 
-The MCP client is built on the official Rust MCP SDK,
-[`rmcp`](https://github.com/modelcontextprotocol/rust-sdk).
-
-This is a standalone Cargo crate. It is **not** part of the Amper/Kotlin build
-in the rest of the repository.
+Built on the official Rust MCP SDK,
+[`rmcp`](https://github.com/modelcontextprotocol/rust-sdk). This is a
+standalone Cargo crate — not part of the Amper/Kotlin build in the rest of
+the repository.
 
 ## Install
 
@@ -113,293 +121,226 @@ cargo build
 ```
 
 (Requires a recent stable Rust toolchain. The first build fetches crates from
-crates.io, so network access is needed.)
+crates.io, so network access is needed. `cargo build` at the workspace root
+builds both the `azula` binary and the `azula-demos` binary below; add `-p
+azula` to build just the production CLI.)
 
-## Run
+## Command overview
+
+`azula` is a noun-verb CLI: one shared session core underneath every verb
+(the same core the MCP tools use), so a script can do anything an LLM
+talking to `azula mcp` can.
+
+| Command | Does |
+| --- | --- |
+| `azula mcp [--http BIND] [--session NAME] [--device URL]... [--name NAME] [--max-turns N]` | MCP server for an LLM client — stdio by default, Streamable HTTP with `--http` |
+| `azula message send [--device D] [--session S] TEXT` | Send a chat-style message (queues via the relay/local mailbox if the device is unreachable) |
+| `azula message recv [--device D] [--session S] [--wait SECS]` | Drain, or long-poll for, inbound messages |
+| `azula watch [--device D] [--session S] [--json]` | Follow a device's inbox continuously: messages, A2UI events, files, connect/disconnect |
+| `azula ui render [--device D] [--session S] [--surface ID] [--data-model JSON] FILE\|-` | Render an A2UI surface from a components JSON file or stdin |
+| `azula ui update [--device D] [--session S] --surface ID POINTER VALUE` | Update a rendered surface's data model at an RFC 6901 pointer |
+| `azula ui delete [--device D] [--session S] --surface ID` | Remove a rendered surface |
+| `azula ui catalog` | Print the A2UI component/prop vocabulary |
+| `azula file send [--device D] [--session S] PATH [--caption TEXT]` | Send a local file as an inline attachment (always requires a live connection) |
+| `azula run [--handoff on-error\|always\|never] [--hold MINUTES] -- CMD…` | Run a command in a PTY; on failure, hand off to a live shell in the same session |
+| `azula terminal [new\|list\|attach\|kill]` | Host, manage, or attach to persistent named terminal sessions |
+| `azula relay [--allow-legacy]` | Serve the identity's always-on relay role (alias: `azula mailbox`) |
+| `azula status [--json]` | Machine identity, known devices, and local sessions — reads disk state, binds nothing |
+| `azula devices [--json]` | List the merged device registry |
+| `azula pair <URL> [--name N] [--global]` | Save a device's ticket to the registry |
+| `azula qr <CODE>` | Print a QR code for any ticket/URL/token |
+| `azula invite [--expires W] [--sign] [--single-use] [--label L] [--bridge]` | Mint a signed invite; `azula invite revoke <id-prefix>` deletes one |
+| `azula invites` | List invites this node has issued |
+| `azula link [--name N] [--relay]` | Enroll this CLI as a sibling device of an existing multi-device identity |
+
+Every command supports `--help`; most one-shot verbs (`message`, `ui`,
+`file`, `watch`) also support `--json` for machine-readable output.
+
+## Multiple sessions: pair once, every process gets its own conversation
+
+Older versions of this CLI bound one persistent identity key per long-running
+command (`bridge.key` for the MCP bridge, `serve.key` for `azula serve`), so
+two `azula mcp` processes on one machine would collide — only one could hold
+the phone's connection at a time.
+
+That's gone. Every azula process — an `azula mcp` server, an `azula run`
+handoff, a `azula terminal new` host, a one-shot `azula message send` — binds
+its **own** ephemeral (or named) session keypair and presents a short-lived
+certificate signed by this machine's stable identity (`~/.azula/machine.key`,
+adopted in place from an existing `~/.azula/bridge.key` if you're upgrading —
+your phone's existing pairing keeps working, no re-pairing needed). Concrete
+effects:
+
+- **Pair the machine once.** Any invite you redeem on the phone (from the
+  startup banner, `azula invite --bridge`, or a `azula run`/`azula terminal`
+  connect block) pairs the *machine*. Every session that machine's processes
+  create afterward is auto-admitted with no further prompt — the phone
+  recognizes the session's certificate as chaining back to a machine it
+  already trusts.
+- **Every process is its own conversation.** Two Claude Code windows each
+  running `azula mcp` show up as two separate conversations on the phone —
+  that's the point, not a bug. Pass `--session NAME` (or set `AZULA_SESSION`)
+  to reuse the same conversation across invocations instead — one-shot verbs
+  (`message`, `ui`, `file`, `watch`) default to a shared session named `cli`
+  automatically, so casual use from any terminal lands in one "CLI"
+  conversation without you having to think about it. `azula mcp`, `azula
+  run`, and `azula terminal` default to a **fresh** session per invocation.
+- **Headless environments scan per session.** A container or CI runner with
+  no `~/.azula/machine.key` (a fresh Claude Code web container, a stateless
+  CI image) self-certifies instead of writing a standing credential: each
+  such process prints its own pairing URL + QR and waits, and the user
+  approves it individually from the phone. No secret is left on disk when
+  the process exits.
+
+## Scripting azula directly — the "blackjack pattern"
+
+Everything the MCP tools can do, a shell script can do too, by shelling out
+to the same one-shot verbs and following `azula watch --json`:
 
 ```sh
-cargo run                 # equivalent to `cargo run -- serve`
-cargo run -- serve
+# Learn the A2UI vocabulary once
+azula ui catalog
+
+# Render a surface from stdin — no MCP client needed
+echo '[
+  {"id":"root","component":"Column","children":["title","face","roll"]},
+  {"id":"title","component":"Text","text":"AZULA · DICE","variant":"caption"},
+  {"id":"face","component":"Text","text":{"path":"/you"},"variant":"h1"},
+  {"id":"rollL","component":"Text","text":"ROLL"},
+  {"id":"roll","component":"Button","child":"rollL","variant":"primary",
+   "action":{"event":{"name":"roll"}}}
+]' | azula ui render --device phone --data-model '{"you":"?"}' -
+# → {"status":"rendered","device":"phone","surface":"ui-<t>-<n>"}  (with --json)
+
+# React to taps as they arrive
+azula watch --device phone --json | while read -r line; do
+  case "$line" in
+    *'"type":"ui_event"'*'"name":"roll"'*)
+      azula ui update --device phone --surface "$SURFACE" /you '"⚄"'
+      ;;
+  esac
+done
 ```
 
-On startup the server prints a banner and a **pairing URL + QR code**:
+`azula ui render`/`update`/`delete` apply the same client-side validation the
+`render_ui` MCP tool does (a `"id":"root"` component is required; nothing is
+sent for an invalid payload), and `azula ui catalog`/`azula ui render --help`
+print the exact same component/prop reference the MCP tool description
+carries — one string in the crate (`catalog.rs`), three consumers.
 
-```
-  Paste this code into the azula app to connect:
-
-    <a long ticket string>
-
-  Short node id: <node id>
-
-  Pair by scanning:
-
-  https://azula.app/s/<ticket>
-
-  ██▀▀▀██ …
-  …QR…
-  Scan with your phone's camera, or open the URL.
-```
-
-Point your phone camera at the QR — iOS and Android will offer to open the
-azula app and dial in automatically. The server runs until you press **Ctrl-C**.
-
-### Flags / environment
-
-| Flag                | Env var                 | Default     | Meaning                                                                 |
-| ------------------- | ----------------------- | ----------- | ----------------------------------------------------------------------- |
-| `--mcp-stdio`       | `AZULA_MCP_STDIO`       | _(unset)_   | Full command line for an MCP server to spawn over stdio                 |
-| `--mcp-url`         | `AZULA_MCP_URL`         | _(unset)_   | URL of a remote MCP server (Streamable HTTP / SSE)                      |
-| `--mcp-tool`        | `AZULA_MCP_TOOL`        | _(first)_   | Tool to call to push a message; defaults to the first tool listed       |
-| `--mcp-message-arg` | `AZULA_MCP_MESSAGE_ARG` | `message`   | JSON argument name carrying the message text                            |
-| —                   | `RUST_LOG`              | `info`      | Log filter (`tracing-subscriber`)                                       |
-
-`--mcp-stdio` and `--mcp-url` are **mutually exclusive** — set at most one. If
-**neither** is set, the LLM relay does not error: it streams back a short
-word-by-word notice (`azula: no MCP server configured …`) so the end-to-end
-iroh path stays testable. A warning is logged at startup.
-
-The MCP session is established **eagerly at startup**. If the connect fails, a
-warning is logged and the relay falls back to the canned notice rather than
-crashing.
-
-#### Examples
-
-Spawn a local MCP server over stdio (Node's reference "everything" server):
+## `azula run` — hand a failing command to the phone
 
 ```sh
-cargo run -- serve --mcp-stdio "npx -y @modelcontextprotocol/server-everything"
+azula run --handoff on-error -- make test
 ```
 
-Connect to a remote MCP server over Streamable HTTP / SSE:
+Runs `make test` in a captured PTY, mirroring its output to your real
+terminal (or CI log) unmodified. On a nonzero exit, it keeps that output as
+scrollback, spawns a live shell in the *same* working directory, and prints a
+connect block (an invite URL + QR — scannable straight from a CI log viewed
+on a phone). Whoever attaches — the phone, or `azula terminal attach
+<invite-url>` from another shell — sees the failed command's output followed
+by a live prompt, "continue where execution left off." `azula run` itself
+stays alive until that session ends (or a `--hold` timeout, default 60
+minutes, expires), then exits with `make test`'s **original** exit code — so
+CI still reports the failure even though someone poked around afterward.
+`--handoff on-error` is the default (shown above); `--handoff always` hands
+off regardless of exit code; `--handoff never` is a pure PTY passthrough —
+`azula run` just exits with the command's own code, no connect block ever
+printed.
+
+## `azula terminal` — persistent, named shell sessions
 
 ```sh
-cargo run -- serve --mcp-url https://example.com/mcp
+azula terminal                              # host one interactive shell inline
+azula terminal new --cmd "claude" --name work   # spawn a detached, named session
+azula terminal list [--json]                # see what's running
+azula terminal attach work                  # continue it from any shell
+azula terminal kill work                    # tear it down
 ```
 
-Pick a specific tool and message argument:
+`azula terminal new` re-execs itself as a detached background process (stdout/
+stderr redirected to log files under `$TMPDIR/azula/sessions/<name>/`) hosting
+one persistent PTY under its own named session identity — spin up as many of
+these as you want, each its own phone conversation. `azula terminal attach
+<name|url>` is a raw-mode passthrough client with no terminal emulator
+involved: it works against a name from `azula terminal list`, or any invite
+URL/ticket (including one from an `azula run` connect block), so a session
+started in CI or on another machine can be continued from a laptop shell as
+well as from the phone. Detach with Ctrl-\\.
+
+## `azula relay` — the always-on sibling (alias: `azula mailbox`)
 
 ```sh
-cargo run -- serve \
-  --mcp-stdio "npx -y @modelcontextprotocol/server-everything" \
-  --mcp-tool echo --mcp-message-arg message
+azula link --relay     # enroll this device once (--mailbox is a kept alias)
+azula relay            # then run it, e.g. under systemd/launchd
 ```
 
-## `azula qr` — print a QR code for any ticket
+An ordinary sibling device of your azula identity that commits to always
+being reachable: it stores and forwards peer chat, bootstraps a brand-new
+device's full history, **and** — since sessions can't always reach the phone
+directly — relays agent chat (a session's messages, delivered to the phone
+on its next sync) and bounded A2UI surface snapshots (latest state per
+surface, replayed to the phone when it reconnects). A session's delivery
+order is: direct to the phone first, this relay second (only if you've
+paired a machine with a phone that has one enrolled), the local per-device
+mailbox last. Interactive terminal traffic and file transfers are never
+relayed — those always need a direct connection.
 
-Display a pairing URL and scannable QR code for any ticket, URL, or bare token:
+## Pairing & the device registry
 
 ```sh
+azula pair <URL> [--name NAME] [--global]
+azula devices [--json]
 azula qr <CODE>
+azula invite [--expires 1h|24h|7d|never] [--sign] [--single-use] [--label L] [--bridge]
+azula invite revoke <id-prefix>
+azula invites
+azula link [--name NAME] [--relay]
 ```
 
-`<CODE>` accepts the same forms as `azula pair`:
-- `https://azula.app/s/<token>`
-- `https://azula.app/connect/<token>`
-- `azula://connect?code=<token>`
-- a bare token string
-
-Handy for regenerating a QR when the terminal has scrolled past the startup
-banner, or for sharing a pairing link in a reproducible way.
-
-```sh
-azula qr "https://azula.app/s/abc123"
-# or
-azula qr abc123
-```
-
-## `azula pair` — register a device
-
-Save an azula app's ticket to the local device registry so `serve-mcp` can
-connect to it automatically.
-
-```sh
-azula pair <URL> [--name <NAME>] [--global]
-```
-
-`<URL>` accepts any of:
-- `https://azula.app/s/<token>`
-- `https://azula.app/connect/<token>`
-- `azula://connect?code=<token>`
-- a bare token string
-
-`--name` sets the display name (defaults to the first 8 characters of the
-token). `--global` writes to `~/.azula/devices.json` instead of the
-project-local `.azula/devices.json` (the project file is used when inside a git
-tree).
-
-```sh
-azula pair "https://azula.app/s/abc123" --name myphone
-azula pair "azula://connect?code=abc123" --name myphone --global
-```
-
-## `azula devices` — list registered devices
-
-Print the known device registry (merged from global and project files).
-
-```sh
-azula devices
-```
-
-Output example:
+`<URL>`/`<CODE>` accept any of: `https://azula.app/s/<token>`,
+`https://azula.app/connect/<token>`, `azula://connect?code=<token>`, an
+invite link (`https://azula.app/i/<payload>`, `azula://i?c=<payload>`, or a
+bare `azi…` payload), or a bare token. `--global` writes to
+`~/.azula/devices.json` instead of the project-local `.azula/devices.json`
+(used automatically inside a git tree; project entries win on name
+collision). `azula invite --bridge` mints against this machine's stable
+identity — the one every `azula mcp`/`azula run`/`azula terminal` session's
+certificate chains to — rather than the default `serve` identity, so a
+plain `azula invite` (no `--bridge`) will **not** pair with any of them.
+`azula link [--relay]` enrolls this CLI as a sibling device of an existing
+multi-device identity (print a QR/string for the root-holding device to
+scan, then wait for it to grant a certificate) — pass `--relay` to request
+the always-on relay role.
 
 ```
+$ azula devices
 NAME                 FINGERPRINT  SOURCE
 ------------------------------------------------
 laptop               testtoke…    project
 myphone              abc12345…    global
 ```
 
-Source is `project` (`.azula/devices.json` at git root) or `global`
-(`~/.azula/devices.json`). Project entries win on name collision.
-
-## `serve-mcp` — multi-device MCP↔iroh bridge
-
-The inverse of `serve`'s LLM channel: an **MCP server over Streamable HTTP**
-that an external LLM client connects to, bridging that LLM to one or more
-running Azula app devices over iroh.
-
-```sh
-azula serve-mcp [--bind 127.0.0.1:8765] [--device <URL>]...
-```
-
-On startup the bridge loads the device registry (global + project) and:
-
-1. **Dials** every known registered device in the background (non-fatal on
-   failure — `list_devices` will show them as offline).
-2. **Accepts** incoming connections from devices that scanned the bridge's own
-   QR code (printed at startup, also available via the `start_pairing` MCP
-   tool). Each scanned-in device is registered automatically under a name
-   derived from its remote node-id (e.g. `scan-f1aef7d5`), and behaves
-   identically to a registered dialled device for all tools.
-
-`--device` is repeatable and accepts the same URL / token forms as `azula pair`.
-
-The MCP endpoint is at `http://<bind>/mcp`. Add it to any MCP-capable LLM
-client.
-
-### MCP tools
-
-| Tool             | Description                                                                          |
-| ---------------- | ------------------------------------------------------------------------------------ |
-| `connect`        | Pair a new device or peer bridge by URL/token; dials immediately                     |
-| `list_devices`   | Show all known devices and live connection status                                    |
-| `send_message`   | Send text to an azula app device (lazy-reconnects if needed)                         |
-| `get_messages`   | Drain the inbox of one device or all devices (chat text + peer messages + `ui-event:` lines) |
-| `wait_for_reply` | Long-poll (default 120 s) until a device has new inbound activity, then drain it     |
-| `set_name`       | Set the conversation's name/description shown in the app (one device or all)         |
-| `say`            | Send a peer-to-peer chat message to another bridge; replies arrive via `get_messages` |
-| `render_ui`      | Render an A2UI declarative surface on a device                                        |
-| `update_ui`      | Update a surface's data model at a JSON-pointer path (react to a `ui-event`)          |
-| `delete_ui`      | Remove a surface from a device                                                        |
-| `disconnect`     | Drop a live connection; optionally remove from registry                              |
-| `start_pairing`  | Return the bridge's pairing URL + a Unicode QR the user can scan to connect         |
-
-The `start_pairing` tool returns a text block containing the URL on the first
-line, the QR code inside a fenced code block, and a one-line hint. The accept
-loop is already running at startup, so scanning the QR and dialling in works
-immediately without any additional setup.
-
-### A2UI — drive native UIs from the LLM
-
-The bridge can render [A2UI](https://github.com/a2ui-project/a2ui) v0.9.1
-declarative surfaces (basic catalog) in the app's azula conversation, and report
-the user's interactions back. The full loop is **`render_ui` → the user taps →
-`get_messages` returns a `ui-event:` line → `update_ui`**.
-
-`render_ui` takes a flat `components` array (exactly one component must have
-`"id":"root"`), an optional initial `data_model` (backing `{"path":"/ptr"}`
-bindings), and an optional `surface_id` (auto-generated as `ui-<t>-<n>` otherwise). It
-sends `createSurface` → `updateComponents` → `updateDataModel` and returns the
-surface id.
-
-```jsonc
-// render_ui — a dice surface
-{
-  "device": "phone",
-  "components": [
-    { "id": "root",  "component": "Column", "children": ["title", "faces", "roll"] },
-    { "id": "title", "component": "Text",   "text": "AZULA · DICE", "variant": "caption" },
-    { "id": "faces", "component": "Text",   "text": { "path": "/you" }, "variant": "h1" },
-    { "id": "rollL", "component": "Text",   "text": "ROLL" },
-    { "id": "roll",  "component": "Button", "child": "rollL", "variant": "primary",
-      "action": { "event": { "name": "roll" } } }
-  ],
-  "data_model": { "you": "?" }
-}
-// → "rendered surface 'ui-1' on 'phone'"
-```
-
-When the user taps the button, `get_messages` yields:
-
-```
-ui-event: {"name":"roll","surfaceId":"ui-1","sourceComponentId":"roll","context":{}}
-```
-
-React by mutating the data model:
-
-```jsonc
-// update_ui
-{ "device": "phone", "surface_id": "ui-1", "path": "/you", "value": "⚄" }
-```
-
-### Two LLMs talking
-
-Two `serve-mcp` instances can converse directly over iroh using the `say` tool.
-
-```sh
-# Start alice
-azula serve-mcp --name alice --bind 127.0.0.1:8765 &
-# Start bob (grab alice's ticket from her startup banner)
-azula serve-mcp --name bob --bind 127.0.0.1:8766 &
-
-# From alice's LLM session:
-#   connect url=<bob_ticket> name=bob
-#   say device=bob text="Hello, Bob!"
-#   get_messages device=bob   # → Bob's reply arrives here
-
-# From bob's LLM session:
-#   get_messages device=alice # → "Hello, Bob!"
-#   say device=alice text="Hi Alice, I'm here."
-```
-
-When Alice dials Bob, she sends a `hello` frame first so Bob registers her by
-name (rather than a `scan-` prefix). Replies flow symmetrically. The bridge
-enforces `--max-turns` hard cap per peer; `say done=true` closes early.
-
-### Flags / environment
-
-| Flag           | Env var            | Default                        | Meaning                                                   |
-| -------------- | ------------------ | ------------------------------ | --------------------------------------------------------- |
-| `--bind`       | `AZULA_MCP_BIND`   | `127.0.0.1:8765`               | Address to serve MCP-over-HTTP on                         |
-| `--device`     | —                  | _(none)_                       | Extra device URL (repeatable)                             |
-| `--name`       | —                  | `bridge-<first 8 of node id>`  | Display name sent in `hello` to peer bridges              |
-| `--max-turns`  | —                  | `20`                           | Hard per-peer turn cap for bridge-to-bridge conversations |
-
-### Registry files
-
-| Scope   | Path                           | When used                              |
-| ------- | ------------------------------ | -------------------------------------- |
+| Registry file | Path | When used |
+| --- | --- | --- |
 | project | `<git-root>/.azula/devices.json` | Inside a git tree; commit for team use |
-| global  | `~/.azula/devices.json`        | Always consulted; `azula pair --global`|
-| runtime | `$TMPDIR/azula/bridge.json`    | Live state: pid, bind, connection status |
+| global | `~/.azula/devices.json` | Always consulted; `azula pair --global` |
+| relay hints | `relay-hints.json` next to each `devices.json` above | Which relay ticket to try for a device (learned automatically at pairing time) |
+| runtime | `$TMPDIR/azula/bridge.json` | A running `azula mcp` process's `{bind, pid, devices}` |
+| sessions | `~/.azula/sessions/<name>.key` (named), `$TMPDIR/azula/sessions/` (ephemeral) | Session key material — see "Multiple sessions" above |
 
-### Example session
+## Deprecated aliases
 
-```sh
-# Pair two devices
-azula pair "https://azula.app/s/abc123" --name laptop
-azula pair "azula://connect?code=xyz789" --name phone
+Kept working for one release cycle, each printing a stderr deprecation
+notice before delegating to its replacement:
 
-# Start the bridge
-azula serve-mcp --bind 127.0.0.1:8765 &
-
-# Point your LLM client's MCP server at http://127.0.0.1:8765/mcp
-# Then use the MCP tools:
-#   list_devices            → shows laptop (connected) + phone (connected)
-#   send_message device=laptop text="hello"
-#   get_messages            → drains all inboxes
-#   disconnect device=phone forget=true
-```
+| Deprecated | Use instead |
+| --- | --- |
+| `azula serve-mcp [--bind ADDR]...` | `azula mcp --http [ADDR]` |
+| `azula mailbox` | `azula relay` |
+| `azula link --mailbox` | `azula link --relay` (same flag now — `--mailbox` is a clap alias, no notice printed) |
+| bare `azula` / `azula serve [--mcp-stdio CMD \| --mcp-url URL] [--mcp-tool T] [--term-only]` | Not deprecated (no notice on the bare invocation), but superseded for day-to-day use by `azula mcp`, `azula run`, and `azula terminal`. This is the original LLM-relay-plus-terminal demo server — it still works exactly as before, binding a `serve.key` identity and serving both `azula/llm/0` and `azula/term/0` on one endpoint. |
 
 ## `azula-demos` — standalone demo binaries
 
@@ -443,10 +384,13 @@ cargo run -p azula-demos -- blackjack
 
 ## ALPNs
 
-| ALPN bytes        | Protocol     |
-| ----------------- | ------------ |
-| `b"azula/llm/0"`  | LLM relay    |
-| `b"azula/term/0"` | remote shell |
+| ALPN bytes         | Protocol | Served by |
+| ------------------ | -------- | --------- |
+| `b"azula/llm/0"`   | LLM relay / MCP bridge / agent chat + A2UI snapshots | `azula serve`, `azula mcp`, `azula run`/`azula terminal` (their session endpoints), `azula relay` |
+| `b"azula/term/0"`  | remote shell (persistent-session capable) | `azula serve`, `azula run`/`azula terminal`'s session endpoints |
+| `b"azula/chat/0"`  | identity peer chat, store-and-forward | `azula relay` only |
+| `b"azula/sync/0"`  | identity log sync/bootstrap | `azula relay` (accept-side only in this crate; the phone app dials it) |
+| `b"azula/link/0"`  | device-linking enrollment (rootless on a relay) | `azula link`, `azula relay` |
 
 ## Wire protocol
 
@@ -454,19 +398,33 @@ Newline-delimited JSON. Each line is one `Frame` object, internally tagged on a
 `"type"` field. This matches kotlinx.serialization's default
 `classDiscriminator = "type"` for a sealed `Frame` class whose variants carry
 `@SerialName` annotations. Framing: write `serde_json::to_string(&frame)` plus a
-trailing `'\n'`; read with a buffered `read_line`.
+trailing `'\n'`; read with a buffered `read_line`. The full frame set lives in
+`src/proto.rs`; the ones most relevant to using this CLI day-to-day:
 
 | `type`     | Direction        | Fields                       | Meaning                                |
 | ---------- | ---------------- | ---------------------------- | -------------------------------------- |
-| `hello`    | peer → peer      | `name`                       | sent as the first frame when a bridge dials another bridge; names the dialer |
-| `chat`     | client → server  | `text`                       | LLM prompt / peer chat                 |
+| `hello`    | peer → peer      | `name`, `invite?`, `cert?`   | first frame on a new connection; names the dialer, optionally carries an invite to redeem and/or a session/device certificate |
+| `chat`     | client → server  | `text`, `id?`                | LLM prompt / peer chat / agent chat; `id` is a random hex string used for retry dedup |
 | `input`    | client → server  | `text`                       | terminal keystrokes / command          |
+| `resize`   | client → server  | `cols`, `rows`                | terminal viewport size                 |
 | `token`    | server → client  | `delta`, `done` (default false) | LLM token stream                    |
 | `thinking` | server → client  | `on`                         | thinking indicator                     |
 | `term`     | server → client  | `line`                       | shell output chunk                     |
+| `term_attach` | client → server | `session?`                 | opt into (or resume) a persistent terminal session instead of the legacy dies-with-stream behavior |
+| `term_session` | server → client | `session`, `resumed`      | acknowledges `term_attach`; `resumed:true` means scrollback replay follows |
+| `term_exit` | server → client  | `session`, `code?`           | the persistent session's shell exited  |
+| `profile`  | peer → peer      | `name`, `description?`, `avatar?`, `mime?` | names/describes the conversation (a terminal's hostname+cwd, or `set_name`'s output) |
 | `a2ui`     | server → client  | `message` (A2UI message JSON) | create/update/delete a UI surface     |
 | `a2ui_action` | client → server | `action` (A2UI action JSON) | user interaction with a surface        |
+| `a2ui_snapshot` | session → relay | `conversation`, `surface`, `components?`, `data_model?`, `lamport` | a coalesced full-surface A2UI snapshot, for the relay to hold and replay when the phone reconnects |
+| `relay_hint` | phone → session | `ticket`                   | the identity's relay connect ticket, sent once at machine-pairing time |
 | `file_begin` / `file_chunk` / `file_end` | both | (see `proto.rs`)  | chunked file transfer                  |
+
+`sync_hello`/`sync_vector`/`sync_entries`/`sync_ack` (identity log sync) and
+`link_hello`/`link_grant`/`link_reject` (device enrollment) are internal to
+`azula relay`/`azula link` and not something a script driving the CLI needs
+to speak directly — see `azula-docs`' `account-sync` and `device-linking`
+capability pages for those wire formats.
 
 ### LLM relay flow
 
@@ -482,12 +440,19 @@ content blocks of the result, and emits:
 3. `{"type":"token","delta":"","done":true}`
 4. `{"type":"thinking","on":false}`
 
+This is `azula serve`'s canned-fallback LLM relay specifically; `azula
+mcp`/`message send`/etc. speak the same `chat`/`token`/`thinking` frames but
+as an ordinary MCP-tool-backed chat, not a shared upstream MCP session.
+
 ### Remote shell flow
 
-The client opens the bi stream and writes first. On connect the server sends an
-initial `term` banner line. Thereafter PTY output is forwarded as `term`
-frames, and incoming `input` frames are written verbatim to the PTY stdin (the
-client is responsible for any trailing newline).
+The client opens the bi stream and writes first. If its first frame is
+`term_attach`, the session is persistent (see `azula terminal` above) —
+otherwise it's the legacy behavior: on connect the server sends an initial
+`term` banner line, PTY output is forwarded as `term` frames, and incoming
+`input` frames are written verbatim to the PTY stdin (the client is
+responsible for any trailing newline); the shell dies the instant the stream
+closes, no trace left behind.
 
 ## Crate layout
 
@@ -501,23 +466,50 @@ azula-cli/
 ├── README.md
 ├── .gitignore
 ├── src/
-│   ├── lib.rs       # pub mod declarations — the `azula` library other crates depend on
-│   ├── main.rs      # clap CLI (serve / serve-mcp / mcp / pair / devices / qr), serve loop
-│   ├── proto.rs     # Frame enum + read_frame / write_frame helpers
-│   ├── term.rs      # PTY bridge handler (azula/term/0)
-│   ├── mcp.rs       # LLM relay handler: rmcp MCP client + result streaming + canned fallback
-│   ├── bridge/      # serve-mcp (HTTP) + mcp (stdio): the AzulaBridge MCP server
-│   │   ├── mod.rs       # setup_bridge / run / run_stdio entrypoints
-│   │   ├── device.rs    # DeviceConn/DeviceMap, dial + accept + reconnect plumbing
-│   │   ├── state.rs     # runtime state file ($TMPDIR/azula/bridge.json)
-│   │   ├── tools.rs     # the 12 #[tool] MCP methods
-│   │   └── tests.rs     # in-process iroh integration tests
-│   ├── mailbox.rs   # per-device offline frame queue, flushed on reconnect
-│   ├── identity.rs  # persisted secret keys per identity name (~/.azula/<name>.key)
-│   ├── endpoint.rs  # shared bind_server_endpoint / print_banner helpers for serve, bridge, blackjack
-│   ├── link.rs      # parse_ticket: URL / bare-token → token string
-│   ├── qr.rs        # pairing_url / render_qr / print_pairing helpers
-│   └── registry.rs  # Device registry: load / add / remove / project_path / global_path
+│   ├── lib.rs         # pub mod declarations — the `azula` library other crates depend on
+│   ├── main.rs        # process entry point: stderr-only logging, hands off to cli::run()
+│   ├── proto.rs       # Frame enum + read_frame / write_frame helpers
+│   ├── cli/           # the noun-verb CLI surface (clap) — one thin module per noun
+│   │   ├── mod.rs         # top-level Cli/Command, dispatch, shared --device/--session args
+│   │   ├── mcp_cmd.rs      # `mcp [--http]` + the deprecated `serve-mcp` alias
+│   │   ├── message.rs      # `message send|recv`
+│   │   ├── ui.rs           # `ui render|update|delete|catalog`
+│   │   ├── file.rs         # `file send`
+│   │   ├── watch_cmd.rs    # `watch` — the JSONL inbox follower
+│   │   ├── status_cmd.rs   # `status`
+│   │   ├── run_cmd.rs      # `run` — the PTY wrapper + failure handoff
+│   │   ├── terminal_cmd.rs # `terminal [new|list|attach|kill]`
+│   │   ├── relay_cmd.rs    # `relay`
+│   │   └── legacy.rs       # pair/devices/qr/invite/invites/link, and the deprecated serve/mailbox
+│   ├── core/           # SessionCore — the shared connection layer the CLI and MCP tools both call
+│   │   ├── mod.rs         # SessionCore, establish(), send/render/delivery-chain logic
+│   │   ├── device.rs       # DeviceConn/DeviceMap, dial + accept + reconnect plumbing
+│   │   ├── state.rs        # runtime state file ($TMPDIR/azula/bridge.json)
+│   │   ├── status.rs       # `azula status`'s disk-only report
+│   │   ├── watch.rs        # `azula watch --json`'s event model
+│   │   └── relay_a2ui.rs   # the relay's bounded A2UI snapshot side store
+│   ├── bridge/         # the AzulaBridge MCP tool surface — thin wrappers over SessionCore
+│   │   ├── mod.rs         # setup_bridge / run / run_stdio entrypoints
+│   │   ├── tools.rs        # the 13 #[tool] MCP methods
+│   │   └── tests.rs        # in-process iroh integration tests
+│   ├── term.rs        # PTY bridge (azula/term/0): legacy + persistent-session paths
+│   ├── mcp.rs          # LLM relay handler: rmcp MCP client + result streaming + canned fallback
+│   ├── mailbox_role.rs # `azula relay`/`azula mailbox`: chat/LLM/sync/link ALPN serving
+│   ├── mailbox.rs      # per-device offline frame queue (send_message/say fallback), flushed on reconnect
+│   ├── eventlog.rs     # the identity log entry codec (incl. agent_in/agent_out kinds)
+│   ├── sync.rs         # the azula/sync/0 protocol session
+│   ├── accept_gate.rs  # invite- and cert-aware accept-side admission gates
+│   ├── identity.rs     # persisted secret keys per identity name; machine.key adoption
+│   ├── session.rs      # per-process session key resolution (named vs. ephemeral)
+│   ├── certs.rs        # azd/azr/azl codecs; FLAG_SESSION mint/verify
+│   ├── linked_identity.rs # this device's own granted cert + identity bundle, once `azula link`ed
+│   ├── catalog.rs      # the single A2UI catalog string (CLI + MCP tool description share it)
+│   ├── endpoint.rs     # shared bind_server_endpoint / bind_endpoint_with_secret / print_banner helpers
+│   ├── link.rs         # parse_ticket: URL / bare-token → token string
+│   ├── qr.rs           # pairing_url / render_qr / print_pairing helpers
+│   ├── invite.rs       # signed invite mint/verify/revoke
+│   ├── filexfer.rs     # file-transfer chunking/mime-guessing shared by send_file
+│   └── registry.rs     # device registry + relay-hints: load / add / remove / project_path / global_path
 └── demos/        # azula-demos: standalone manual-testing binaries, depends on `azula` as a library
     ├── Cargo.toml
     └── src/
