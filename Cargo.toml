@@ -11,11 +11,30 @@ all = "warn"
 name = "azula"
 version = "0.1.0"
 edition = "2021"
-description = "Server-side companion for the azula p2p app: binds an iroh endpoint and serves an LLM relay and a remote-shell bridge over ALPN protocols."
+description = "Command-line companion for the azula p2p app: an MCP server for your phone, remote terminals with CI handoff, agent-drawn UI, and an offline-forwarding relay — all over direct iroh connections."
 license = "MIT OR Apache-2.0"
 homepage = "https://azula.app"
 repository = "https://github.com/Azula-App/azula-cli"
 readme = "README.md"
+keywords = ["p2p", "iroh", "mcp", "terminal", "cli"]
+categories = ["command-line-utilities", "network-programming", "development-tools"]
+# Everything that isn't the crate itself. `.agents` is a symlink to the
+# untracked `.claude/`, so it DANGLES in any fresh checkout — `cargo package`
+# hard-errors on it ("failed to open for archiving"), which would have broken
+# the first release in CI. The rest is repo infrastructure (packaging
+# manifests, container files, CI) that has no business in a published crate.
+exclude = [
+    ".agents",
+    ".claude",
+    ".azula",
+    ".github",
+    "dist",
+    "docker",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".dockerignore",
+    "docs",
+]
 
 [lints]
 workspace = true

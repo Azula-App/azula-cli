@@ -13,17 +13,19 @@
 #                           Release. This Release is the artifact host the
 #                           other channels pull from; it is not itself a
 #                           user-facing install channel.
-#   3. publish-crates    — `cargo publish` to crates.io.
+#   3. publish-crates    — `cargo publish` to crates.io via Trusted
+#                           Publishing (OIDC); no API token secret.
 #   4. publish-npm       — generates + publishes the four platform npm
 #                           packages plus the `azula-cli` meta package.
 #   5. publish-homebrew  — bumps version + sha256 in the `homebrew-azula`
 #                           tap repo and pushes.
 #
-# Jobs 3-5 each `if:`-gate on their secret being present, so a repo that
-# hasn't configured a given channel yet still gets a clean GitHub Release
-# instead of a hard failure. See dist/README.md for what a maintainer must
-# set up manually (secrets, the tap repo, the npm org) before each channel
-# goes live.
+# Job 3 authenticates with OIDC (nothing to gate on). Jobs 4-5 `if:`-gate on
+# their secret being present, so a repo that hasn't configured a given
+# channel yet still gets a clean GitHub Release instead of a hard failure.
+# See dist/README.md for what a maintainer must set up manually (the
+# crates.io trusted publisher, the npm org, the tap repo) before each
+# channel goes live.
 #
 # Cross-compilation note (aarch64-unknown-linux-musl): this is the one
 # target in the matrix that isn't natively buildable on its runner (an
@@ -173,16 +175,30 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: [version-guard, build-and-release]
-    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC) — no CARGO_REGISTRY_TOKEN secret. crates.io
+    # verifies this workflow's identity against the trusted publisher
+    # configured on the crate (owner `Azula-App`, repo `azula-cli`, workflow
+    # file `release.yml` — that filename is part of the match, so RENAMING
+    # THIS FILE BREAKS PUBLISHING until the crates.io config is updated).
+    # The auth action's post step revokes the short-lived token when the job
+    # ends. NOTE: the crate's *first* ever publish cannot use this — crates.io
+    # requires the crate to already exist before a trusted publisher can be
+    # configured; see dist/README.md.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
       - name: cargo publish -p azula
         run: cargo publish -p azula --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   publish-npm:
     name: Publish npm packages

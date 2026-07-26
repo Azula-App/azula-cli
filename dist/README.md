@@ -57,13 +57,45 @@ unaffected either way since Homebrew doesn't go through a name registry.
 
 ## Manual setup before the first `v*` tag
 
-None of the three publish jobs are required to succeed — each is gated on
-its secret existing (`if:` in `release.yml`), so an unconfigured channel is
-skipped, not a failure. To light all three up:
+The npm and Homebrew jobs are gated on their secret existing (`if:` in
+`release.yml`), so an unconfigured channel is skipped, not a failure. The
+crates.io job uses OIDC and has nothing to gate on — it will run, and fail,
+until its trusted publisher is configured. To light all three up:
 
-1. **crates.io**: generate an API token at
-   <https://crates.io/settings/tokens>, add it as the `CARGO_REGISTRY_TOKEN`
-   repo secret.
+1. **crates.io** — Trusted Publishing (OIDC), no long-lived token. There is
+   a **bootstrap step**: crates.io only lets you configure a trusted
+   publisher on a crate that already exists, so the very first publish must
+   use an API token.
+
+   a. Claim the name once, from a clean checkout of `main`:
+
+      ```
+      cargo login          # paste a token from https://crates.io/settings/tokens
+      cargo publish -p azula --locked
+      ```
+
+      (Verify first with `cargo publish -p azula --dry-run` — it packages,
+      then compiles the packaged tarball, so it catches anything the normal
+      build wouldn't.)
+
+   b. Then on <https://crates.io/crates/azula/settings> → Trusted
+      Publishing → Add → GitHub, fill in:
+
+      | Field             | Value        |
+      |-------------------|--------------|
+      | Repository owner  | `Azula-App`  |
+      | Repository name   | `azula-cli`  |
+      | Workflow filename | `release.yml`|
+      | Environment       | *(leave empty)* |
+
+   c. Revoke the bootstrap token at <https://crates.io/settings/tokens> —
+      every later release authenticates over OIDC instead.
+
+   The workflow filename is part of the identity crates.io matches, so
+   **renaming `release.yml` breaks publishing** until the config is updated.
+   Optionally set a GitHub Actions environment (e.g. `release`) with
+   required reviewers and name it in both the job and the crates.io config
+   for a manual approval gate on every publish.
 2. **npm**: create the `azula-app` org on npmjs.com (needed for the four
    scoped `@azula-app/cli-*` platform packages regardless of the meta
    package's name), generate an Automation token with publish access, add
