@@ -148,30 +148,36 @@ until its trusted publisher is configured. To light all three up:
       rather than a secret, since OIDC leaves no secret to detect.
 
    Every later release then publishes over OIDC with **automatic provenance
-   attestations** — which is why the repo visibility note below matters.
+   attestations** (the repo is public, so these succeed — see below).
 3. **Homebrew**: create the `Azula-App/homebrew-azula` repo and a
    repo-scoped push token — see `dist/homebrew/README.md` for the full
    steps — add it as the `TAP_PUSH_TOKEN` repo secret.
 
-## Repo visibility gates two of the three channels
+## Repo visibility
 
-`Azula-App/azula-cli` is currently **private**. crates.io publishing is
-unaffected (it uploads a self-contained tarball), but:
+`Azula-App/azula-cli` is **public** (verified 2026-07-26), so nothing here
+is visibility-blocked: npm's automatic provenance attestations work, end
+users can fetch release assets from
+`github.com/<repo>/releases/download/...` unauthenticated (which is how a
+Homebrew install actually resolves), and the `repository` link on the
+crates.io page resolves for visitors.
 
-- **npm provenance** requires a public repository. Trusted Publishing
-  generates provenance attestations automatically and cannot be opted out
-  of, so `npm publish` fails from a private repo. npm therefore cannot go
-  live until the repo is public.
-- **Homebrew installs** fetch release assets from
-  `github.com/<repo>/releases/download/...` **unauthenticated**, from the
-  end user's machine. A private repo returns 404 for them, so a published
-  formula would be broken even though the workflow that renders it succeeds
-  (CI downloads are authenticated).
-- The `repository` link on the published crates.io page also 404s for
-  visitors while the repo is private.
+Keep it that way — turning the repo private again silently breaks Homebrew
+installs at the *user's* machine rather than in CI (the workflow's own
+downloads are authenticated via `gh`), and makes npm publishes fail
+outright.
 
-homebrew-core (the eventual goal, pending notability) requires a public
-repo as well.
+## Getting into homebrew-core
+
+The tap (`Azula-App/homebrew-azula`) is the interim channel. Per
+[Acceptable Formulae](https://docs.brew.sh/Acceptable-Formulae),
+homebrew-core requires a DFSG-compatible open-source licence (azula is
+`MIT OR Apache-2.0` — fine) and that "Upstream must identify the packaged
+version as stable and provide an immutable tag or release" (the `v*` tag
+flow satisfies this). Beyond that, notability is maintainer judgement
+rather than a published numeric threshold — the current docs list no star
+/ fork / watcher counts. All five azula repos are at 0 stars today, so the
+tap is the realistic channel for now.
 
 Also confirm the `Azula-App/azula-cli` GitHub repo (used throughout
 `release.yml`, the npm package.json `repository` fields, and the Homebrew
