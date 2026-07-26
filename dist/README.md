@@ -96,13 +96,82 @@ until its trusted publisher is configured. To light all three up:
    Optionally set a GitHub Actions environment (e.g. `release`) with
    required reviewers and name it in both the job and the crates.io config
    for a manual approval gate on every publish.
-2. **npm**: create the `azula-app` org on npmjs.com (needed for the four
-   scoped `@azula-app/cli-*` platform packages regardless of the meta
-   package's name), generate an Automation token with publish access, add
-   it as the `NPM_TOKEN` repo secret.
+2. **npm** — Trusted Publishing (OIDC), no `NPM_TOKEN`. Requires npm
+   >= 11.5.1 and Node >= 22.14.0 (the workflow pins both). Two constraints
+   shape the setup:
+
+   - **A trusted publisher is configured per package**, and each package
+     can only have one. This release ships **five** packages, so that's
+     five configurations:
+
+     | Package | |
+     |---|---|
+     | `azula-cli` | the meta package users install |
+     | `@azula-app/cli-darwin-arm64` | platform binary |
+     | `@azula-app/cli-darwin-x64` | platform binary |
+     | `@azula-app/cli-linux-x64` | platform binary |
+     | `@azula-app/cli-linux-arm64` | platform binary |
+
+   - **Same bootstrap as crates.io**: configuration lives on an existing
+     package's settings page, so each package must be published once
+     before OIDC can take over.
+
+   Steps:
+
+   a. Create the `azula-app` org on npmjs.com (needed for the scoped
+      platform packages).
+
+   b. Bootstrap all five once, from a tag whose GitHub Release already has
+      the four binaries (so `v0.1.1` must be tagged first):
+
+      ```
+      gh release download v0.1.1 --dir bin-download-raw
+      # unpack each azula-<version>-<target>.tar.gz into bin-download/<target>/
+      node dist/npm/generate.mjs --version 0.1.1 --bin-dir bin-download --out-dir npm-out
+      npm login
+      for p in npm-out/cli-*/; do npm publish "$p" --access public; done
+      npm publish npm-out/azula-cli/ --access public
+      ```
+
+   c. For **each** of the five packages: npmjs.com → package → Settings →
+      Trusted Publisher → GitHub Actions, with:
+
+      | Field | Value |
+      |---|---|
+      | Organization or user | `Azula-App` |
+      | Repository | `azula-cli` |
+      | Workflow filename | `release.yml` |
+      | Environment name | *(leave empty)* |
+
+   d. Set the repo **variable** (Settings → Secrets and variables →
+      Actions → Variables) `PUBLISH_NPM` = `true`. The job is gated on this
+      rather than a secret, since OIDC leaves no secret to detect.
+
+   Every later release then publishes over OIDC with **automatic provenance
+   attestations** — which is why the repo visibility note below matters.
 3. **Homebrew**: create the `Azula-App/homebrew-azula` repo and a
    repo-scoped push token — see `dist/homebrew/README.md` for the full
    steps — add it as the `TAP_PUSH_TOKEN` repo secret.
+
+## Repo visibility gates two of the three channels
+
+`Azula-App/azula-cli` is currently **private**. crates.io publishing is
+unaffected (it uploads a self-contained tarball), but:
+
+- **npm provenance** requires a public repository. Trusted Publishing
+  generates provenance attestations automatically and cannot be opted out
+  of, so `npm publish` fails from a private repo. npm therefore cannot go
+  live until the repo is public.
+- **Homebrew installs** fetch release assets from
+  `github.com/<repo>/releases/download/...` **unauthenticated**, from the
+  end user's machine. A private repo returns 404 for them, so a published
+  formula would be broken even though the workflow that renders it succeeds
+  (CI downloads are authenticated).
+- The `repository` link on the published crates.io page also 404s for
+  visitors while the repo is private.
+
+homebrew-core (the eventual goal, pending notability) requires a public
+repo as well.
 
 Also confirm the `Azula-App/azula-cli` GitHub repo (used throughout
 `release.yml`, the npm package.json `repository` fields, and the Homebrew

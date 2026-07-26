@@ -203,26 +203,54 @@ jobs:
   publish-npm:
     name: Publish npm packages
     needs: [version-guard, build-and-release]
-    if: ${{ secrets.NPM_TOKEN != '' }}
+    # Opt-in via a repo VARIABLE (Settings → Variables), not a secret: npm
+    # Trusted Publishing needs no secret, so there is nothing to gate on
+    # otherwise. Flip `PUBLISH_NPM` to `true` once all five packages exist
+    # and each has a trusted publisher configured — see dist/README.md.
+    if: ${{ vars.PUBLISH_NPM == 'true' }}
     runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC) — no NPM_TOKEN. npm matches this workflow's
+    # identity against the trusted publisher configured on EACH package
+    # (owner `Azula-App`, repo `azula-cli`, workflow file `release.yml`), so
+    # renaming this file breaks publishing until those configs are updated.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
+      # Node >= 22.14.0 and npm >= 11.5.1 are hard requirements for OIDC
+      # publishing. Node 24 ships npm 11.x, but the floor is pinned
+      # explicitly so a runner image change can't silently drop below it.
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Ensure npm >= 11.5.1 (Trusted Publishing floor)
+        run: |
+          set -euo pipefail
+          npm install -g npm@^11.5.1
+          npm --version
+
+      # `gh release download` authenticates with GITHUB_TOKEN. The previous
+      # bare `curl` only worked against a public repo's release assets; this
+      # works either way, so enabling npm no longer depends on repo
+      # visibility (npm *provenance* still does — see dist/README.md).
       - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           VERSION="${{ needs.version-guard.outputs.version }}"
           TAG="${{ github.ref_name }}"
-          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
 
           for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             mkdir -p "bin-download/${target}"
-            curl -sSfL -o "archive.tar.gz" "${BASE}/azula-${VERSION}-${target}.tar.gz"
+            gh release download "$TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern "azula-${VERSION}-${target}.tar.gz" \
+              --output archive.tar.gz --clobber
             tar -xzf archive.tar.gz -C "bin-download/${target}"
             rm archive.tar.gz
           done
@@ -238,13 +266,14 @@ jobs:
         run: |
           set -euo pipefail
           # Platform packages first so the meta package's optionalDependencies
-          # resolve on npm the moment it's published.
+          # resolve on npm the moment it's published. No NODE_AUTH_TOKEN:
+          # npm detects the OIDC-capable runner and exchanges the workflow's
+          # identity for a short-lived token itself, and generates provenance
+          # attestations automatically.
           for pkg in npm-out/cli-*/; do
             npm publish "$pkg" --access public
           done
           npm publish "npm-out/azula-cli/" --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-homebrew:
     name: Bump Homebrew tap
@@ -264,16 +293,24 @@ jobs:
           token: ${{ secrets.TAP_PUSH_TOKEN }}
           path: homebrew-azula
 
+      # Authenticated download (see the npm job's note) — a bare curl only
+      # reaches a public repo's assets. NOTE: end users installing via the
+      # tap fetch these same URLs *unauthenticated*, so the formula only
+      # actually works once this repo is public.
       - name: Download sha256 sums from the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           VERSION="${{ needs.version-guard.outputs.version }}"
           TAG="${{ github.ref_name }}"
-          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
 
           mkdir -p sums
           for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            curl -sSfL -o "sums/${target}.sha256" "${BASE}/azula-${VERSION}-${target}.tar.gz.sha256"
+            gh release download "$TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern "azula-${VERSION}-${target}.tar.gz.sha256" \
+              --output "sums/${target}.sha256" --clobber
           done
 
       - name: Render Formula/azula.rb from the template
