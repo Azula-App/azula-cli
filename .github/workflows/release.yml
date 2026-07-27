@@ -278,7 +278,13 @@ jobs:
   publish-homebrew:
     name: Bump Homebrew tap
     needs: [version-guard, build-and-release]
-    if: ${{ secrets.TAP_PUSH_TOKEN != '' }}
+    # Opt-in via a repo VARIABLE, like publish-npm. NOT `secrets.X != ''`:
+    # the `secrets` context is unavailable in a job-level `if:` (only
+    # `github`, `needs`, `vars`, `inputs` are), and using it there makes the
+    # whole workflow file invalid — every run fails at startup in 0s with
+    # "This run likely failed because of a workflow file issue", including
+    # runs for jobs that have nothing to do with this one.
+    if: ${{ vars.PUBLISH_HOMEBREW == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout azula-cli (formula template)

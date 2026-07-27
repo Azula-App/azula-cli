@@ -58,8 +58,12 @@ unaffected either way since Homebrew doesn't go through a name registry.
 
 ## Manual setup before the first `v*` tag
 
-The npm and Homebrew jobs are gated on their secret existing (`if:` in
-`release.yml`), so an unconfigured channel is skipped, not a failure. The
+The npm and Homebrew jobs are gated on repo **variables**
+(`PUBLISH_NPM`, `PUBLISH_HOMEBREW`), so an unconfigured channel is skipped,
+not a failure. They are deliberately NOT gated on `secrets.X != ''`: the
+`secrets` context is unavailable in a job-level `if:`, and using it there
+invalidates the entire workflow file — every run then fails at startup in
+0s, including jobs unrelated to the gate. The
 crates.io job uses OIDC and has nothing to gate on — it will run, and fail,
 until its trusted publisher is configured. To light all three up:
 
@@ -152,7 +156,8 @@ until its trusted publisher is configured. To light all three up:
    attestations** (the repo is public, so these succeed — see below).
 3. **Homebrew**: create the `Azula-App/homebrew-azula` repo and a
    repo-scoped push token — see `dist/homebrew/README.md` for the full
-   steps — add it as the `TAP_PUSH_TOKEN` repo secret.
+   steps — add it as the `TAP_PUSH_TOKEN` repo secret, then set the repo
+   variable `PUBLISH_HOMEBREW` = `true` to enable the job.
 
 ## Repo visibility
 
