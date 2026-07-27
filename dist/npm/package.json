@@ -1,7 +1,7 @@
 {
-  "name": "azula-cli",
+  "name": "@azula-app/cli",
   "version": "0.0.0-dev",
-  "description": "azula CLI — pair, message, and drive the azula p2p app from the command line, and run it as an MCP server (`npx -y azula-cli mcp`).",
+  "description": "azula CLI — pair, message, and drive the azula p2p app from the command line, and run it as an MCP server (`npx -y @azula-app/cli mcp`).",
   "homepage": "https://azula.app",
   "repository": {
     "type": "git",

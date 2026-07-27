@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 "use strict";
 
-// Launcher for the `azula-cli` meta package. Resolves the platform-specific
+// Launcher for the `@azula-app/cli` meta package. Resolves the platform-specific
 // binary published as an npm optionalDependency and execs it, passing
 // through argv/stdio untouched. This is the file that ships inside the
-// published `azula-cli` package at `bin/azula.js` (see ../package.json's
+// published `@azula-app/cli` package at `bin/azula.js` (see ../package.json's
 // "bin" field and ../generate.mjs, which copies it in place).
 //
 // Layout this expects, matching what dist/npm/generate.mjs emits:
-//   node_modules/azula-cli/bin/azula.js            (this file)
+//   node_modules/@azula-app/cli/bin/azula.js         (this file)
 //   node_modules/@azula-app/cli-<platform>/bin/azula (the real binary)
 
 const { spawnSync } = require("node:child_process");
@@ -41,7 +41,7 @@ function missingPackageMessage(pkgName) {
     "This usually means npm skipped an optionalDependency — a lockfile from",
     "a different platform, an offline/cached install, or `--omit=optional`.",
     `Try: npm install ${pkgName}`,
-    "Or reinstall clean: npm install azula-cli --force",
+    "Or reinstall clean: npm install @azula-app/cli --force",
   ].join("\n");
 }
 

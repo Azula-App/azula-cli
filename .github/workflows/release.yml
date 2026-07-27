@@ -16,7 +16,7 @@
 #   3. publish-crates    — `cargo publish` to crates.io via Trusted
 #                           Publishing (OIDC); no API token secret.
 #   4. publish-npm       — generates + publishes the four platform npm
-#                           packages plus the `azula-cli` meta package.
+#                           packages plus the `@azula-app/cli` meta package.
 #   5. publish-homebrew  — bumps version + sha256 in the `homebrew-azula`
 #                           tap repo and pushes.
 #
@@ -273,7 +273,7 @@ jobs:
           for pkg in npm-out/cli-*/; do
             npm publish "$pkg" --access public
           done
-          npm publish "npm-out/azula-cli/" --access public
+          npm publish "npm-out/meta/" --access public
 
   publish-homebrew:
     name: Bump Homebrew tap

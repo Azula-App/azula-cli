@@ -43,7 +43,11 @@ const TARGETS = [
 ];
 
 const SCOPE = "@azula-app";
-const META_NAME = "azula-cli";
+const META_NAME = "@azula-app/cli";
+// Output directory for the meta package. Kept separate from META_NAME
+// because a scoped name would otherwise nest as `<out>/@azula-app/cli`;
+// the workflow publishes `npm-out/meta/` by this path, not by package name.
+const META_DIR = "meta";
 
 function parseArgs(argv) {
   const args = { binDir: null, outDir: null, version: null };
@@ -109,7 +113,7 @@ async function buildPlatformPackage({ rustTarget, npmSuffix, os, cpu }, version,
 async function buildMetaPackage(version, platformPkgNames, outDir) {
   const template = await readJsonTemplate("package.json");
 
-  const pkgDir = path.join(outDir, META_NAME);
+  const pkgDir = path.join(outDir, META_DIR);
   const binOutDir = path.join(pkgDir, "bin");
   await mkdir(binOutDir, { recursive: true });
 

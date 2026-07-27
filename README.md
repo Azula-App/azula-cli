@@ -54,18 +54,18 @@ Builds and installs the `azula` binary from the crates.io source package.
 web container)
 
 ```sh
-npx -y azula-cli --version
+npx -y @azula-app/cli --version
 ```
 
-`azula-cli` is a meta package: it fetches the right prebuilt binary for your
+`@azula-app/cli` is a meta package: it fetches the right prebuilt binary for your
 platform as an npm optional dependency (`@azula-app/cli-darwin-arm64`,
 `-darwin-x64`, `-linux-x64`, or `-linux-arm64`) and execs it. There's nothing
-to install ahead of time — `npx -y azula-cli@<version> …` pins an exact
+to install ahead of time — `npx -y @azula-app/cli@<version> …` pins an exact
 release if you don't want to float on latest.
 
 ### `mcp.json` — azula as an MCP server
 
-`npx -y azula-cli mcp` works on a machine that has never touched azula
+`npx -y @azula-app/cli mcp` works on a machine that has never touched azula
 before, which makes it the most portable way to wire azula into an MCP
 client config:
 
@@ -74,7 +74,7 @@ client config:
   "mcpServers": {
     "azula": {
       "command": "npx",
-      "args": ["-y", "azula-cli", "mcp"]
+      "args": ["-y", "@azula-app/cli", "mcp"]
     }
   }
 }

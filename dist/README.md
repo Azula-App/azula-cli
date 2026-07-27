@@ -10,7 +10,7 @@ for the normative requirements.
 dist/
 ├── README.md          # this file
 ├── npm/
-│   ├── package.json    # template for the `azula-cli` meta package
+│   ├── package.json    # template for the `@azula-app/cli` meta package
 │   ├── bin/azula.js     # launcher: resolves + execs the platform binary
 │   └── generate.mjs     # release-time generator: binaries dir -> 5 npm packages
 └── homebrew/
@@ -28,13 +28,13 @@ API policy, and `registry.npmjs.org/<name>`):
 | --------- | ----------------------------- | ---------------------------------------------------------------- |
 | crates.io | `azula`                       | **Available** — `{"errors":[{"detail":"crate \`azula\` does not exist"}]}` |
 | crates.io | `azula-cli`                   | **Available** (checked as the D7 fallback; not needed)          |
-| npm       | `azula-cli`                   | **Available** — registry returned `{"error":"Not found"}`       |
+| npm       | `@azula-app/cli`              | **Available** — chosen over the unscoped `azula-cli`; plain `azula` is taken by an unrelated 2019 package |
 | npm       | `@azula-app/cli-darwin-arm64` | Returned `{"error":"Not found"}` for the package, which is expected whether or not the `azula-app` org exists — **the `azula-app` npm org must be created manually regardless** (see below); package names under it aren't independently reserved until first publish |
 
 Both primary names from D7 are free, so **no fallback is needed right now**:
 - crates.io crate: `azula` (binary `azula`, matches the existing package name
   in `Cargo.toml` — no rename).
-- npm meta package: `azula-cli`.
+- npm meta package: `@azula-app/cli`.
 
 Re-check immediately before the *first* tagged release in case either name
 gets claimed between now and then — `cargo publish -p azula` / `npm publish`
@@ -50,10 +50,11 @@ unaffected either way since Homebrew doesn't go through a name registry.
   free) — would require renaming the `[package] name` in the root
   `Cargo.toml`, which is a breaking change for anyone who already ran
   `cargo install azula`, so prefer to catch this *before* the first release.
-- npm: publish the meta package scoped, e.g. `@azula-app/cli` or
-  `@azula-app/azula-cli`, instead of the unscoped `azula-cli`. This changes
-  the `npx` invocation to `npx -y @azula-app/cli mcp` — update the README
-  Install section and the `mcp.json` example if this path is taken.
+- npm: **taken** — the meta package now ships scoped as `@azula-app/cli`
+  (decided 2026-07-26), so all five packages share the org namespace and
+  none can be squatted. `azula` itself was already taken on npm by an
+  unrelated 2019 package. The `npx` invocation is
+  `npx -y @azula-app/cli mcp`.
 
 ## Manual setup before the first `v*` tag
 
@@ -106,7 +107,7 @@ until its trusted publisher is configured. To light all three up:
 
      | Package | |
      |---|---|
-     | `azula-cli` | the meta package users install |
+     | `@azula-app/cli` | the meta package users install |
      | `@azula-app/cli-darwin-arm64` | platform binary |
      | `@azula-app/cli-darwin-x64` | platform binary |
      | `@azula-app/cli-linux-x64` | platform binary |
@@ -130,7 +131,7 @@ until its trusted publisher is configured. To light all three up:
       node dist/npm/generate.mjs --version 0.1.1 --bin-dir bin-download --out-dir npm-out
       npm login
       for p in npm-out/cli-*/; do npm publish "$p" --access public; done
-      npm publish npm-out/azula-cli/ --access public
+      npm publish npm-out/meta/ --access public
       ```
 
    c. For **each** of the five packages: npmjs.com → package → Settings →
