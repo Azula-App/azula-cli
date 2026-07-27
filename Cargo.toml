@@ -9,7 +9,7 @@ all = "warn"
 
 [package]
 name = "azula"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Command-line companion for the azula p2p app: an MCP server for your phone, remote terminals with CI handoff, agent-drawn UI, and an offline-forwarding relay — all over direct iroh connections."
 license = "MIT OR Apache-2.0"
