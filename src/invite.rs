@@ -199,7 +199,7 @@ fn now_unix() -> u32 {
 // Issuer-side store: ~/.azula/invites.json
 // ---------------------------------------------------------------------------
 
-/// An invite this node has minted, as persisted in the issuer-side store.
+/// An invite this endpoint has minted, as persisted in the issuer-side store.
 /// Revocation is deletion from this list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssuedInvite {
@@ -417,14 +417,14 @@ pub struct VerifiedInvite {
 
 /// Verify an inbound invite token against the default store dir. See
 /// [`verify_inbound_in`] for the rules.
-pub fn verify_inbound(token: &str, my_node_id: PublicKey, my_key: &PublicKey) -> Result<VerifiedInvite> {
+pub fn verify_inbound(token: &str, my_endpoint_id: PublicKey, my_key: &PublicKey) -> Result<VerifiedInvite> {
     let dir = store_dir().context("cannot resolve invite store dir ($HOME unset)")?;
-    verify_inbound_in(&dir, token, my_node_id, my_key)
+    verify_inbound_in(&dir, token, my_endpoint_id, my_key)
 }
 
 /// Verify an inbound invite token per the spec's rules 1-6:
 /// 1. decodes, `version == 1`;
-/// 2. the embedded ticket's node id is `my_node_id`;
+/// 2. the embedded ticket's endpoint id is `my_endpoint_id`;
 /// 3. `invite_id` exists in the store at `dir` (⇒ not revoked);
 /// 4. not expired;
 /// 5. if signed, the signature verifies against `my_key`;
@@ -435,14 +435,14 @@ pub fn verify_inbound(token: &str, my_node_id: PublicKey, my_key: &PublicKey) ->
 pub fn verify_inbound_in(
     dir: &Path,
     token: &str,
-    my_node_id: PublicKey,
+    my_endpoint_id: PublicKey,
     my_key: &PublicKey,
 ) -> Result<VerifiedInvite> {
     let payload = InvitePayload::decode(token)?; // rule 1 (version) enforced in decode
 
     let ticket = payload.ticket()?;
-    if ticket.endpoint_addr().id != my_node_id {
-        bail!("invite: was not issued by/addressed to this node");
+    if ticket.endpoint_addr().id != my_endpoint_id {
+        bail!("invite: was not issued by/addressed to this endpoint");
     }
 
     let id_hex = payload.invite_id_hex();
@@ -688,12 +688,12 @@ mod tests {
     fn verify_inbound_accepts_valid_unsigned_invite() {
         let dir = isolated_dir("verify_valid");
         let secret = SecretKey::generate();
-        let node_id = secret.public();
-        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(node_id)).to_string();
+        let endpoint_id = secret.public();
+        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(endpoint_id)).to_string();
         let (payload, _) = mint_in(&dir, &ticket_str, Expiry::Never, false, false, None, &secret).unwrap();
         let token = payload.encode();
 
-        let verified = verify_inbound_in(&dir, &token, node_id, &node_id).expect("verifies");
+        let verified = verify_inbound_in(&dir, &token, endpoint_id, &endpoint_id).expect("verifies");
         assert_eq!(verified.invite_id, payload.invite_id_hex());
     }
 
@@ -701,23 +701,23 @@ mod tests {
     fn verify_inbound_rejects_unknown_invite_id() {
         let dir = isolated_dir("verify_unknown");
         let secret = SecretKey::generate();
-        let node_id = secret.public();
-        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(node_id)).to_string();
+        let endpoint_id = secret.public();
+        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(endpoint_id)).to_string();
         // Mint, then revoke — the token now refers to an id absent from the store.
         let (payload, record) =
             mint_in(&dir, &ticket_str, Expiry::Never, false, false, None, &secret).unwrap();
         revoke_in(&dir, &record.id).unwrap();
         let token = payload.encode();
 
-        assert!(verify_inbound_in(&dir, &token, node_id, &node_id).is_err());
+        assert!(verify_inbound_in(&dir, &token, endpoint_id, &endpoint_id).is_err());
     }
 
     #[test]
     fn verify_inbound_rejects_expired() {
         let dir = isolated_dir("verify_expired");
         let secret = SecretKey::generate();
-        let node_id = secret.public();
-        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(node_id)).to_string();
+        let endpoint_id = secret.public();
+        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(endpoint_id)).to_string();
         let (mut payload, _) =
             mint_in(&dir, &ticket_str, Expiry::Never, false, false, None, &secret).unwrap();
         // Force expiry into the past directly on the payload (bypassing mint's
@@ -725,16 +725,16 @@ mod tests {
         payload.expires_at = 1;
         let token = payload.encode();
 
-        let err = verify_inbound_in(&dir, &token, node_id, &node_id).unwrap_err();
+        let err = verify_inbound_in(&dir, &token, endpoint_id, &endpoint_id).unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");
     }
 
     #[test]
-    fn verify_inbound_rejects_wrong_node_id() {
+    fn verify_inbound_rejects_wrong_endpoint_id() {
         let dir = isolated_dir("verify_wrong_node");
         let secret = SecretKey::generate();
-        let node_id = secret.public();
-        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(node_id)).to_string();
+        let endpoint_id = secret.public();
+        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(endpoint_id)).to_string();
         let (payload, _) = mint_in(&dir, &ticket_str, Expiry::Never, false, false, None, &secret).unwrap();
         let token = payload.encode();
 
@@ -746,8 +746,8 @@ mod tests {
     fn verify_inbound_rejects_bad_signature() {
         let dir = isolated_dir("verify_bad_sig");
         let secret = SecretKey::generate();
-        let node_id = secret.public();
-        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(node_id)).to_string();
+        let endpoint_id = secret.public();
+        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(endpoint_id)).to_string();
         let (mut payload, _) =
             mint_in(&dir, &ticket_str, Expiry::Never, true, false, None, &secret).unwrap();
         assert!(payload.is_signed());
@@ -756,26 +756,26 @@ mod tests {
         payload.signature = Some(sig);
         let token = payload.encode();
 
-        assert!(verify_inbound_in(&dir, &token, node_id, &node_id).is_err());
+        assert!(verify_inbound_in(&dir, &token, endpoint_id, &endpoint_id).is_err());
     }
 
     #[test]
     fn verify_inbound_rejects_consumed_single_use() {
         let dir = isolated_dir("verify_consumed");
         let secret = SecretKey::generate();
-        let node_id = secret.public();
-        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(node_id)).to_string();
+        let endpoint_id = secret.public();
+        let ticket_str = EndpointTicket::new(iroh::EndpointAddr::from(endpoint_id)).to_string();
         let (payload, record) =
             mint_in(&dir, &ticket_str, Expiry::Never, false, true, None, &secret).unwrap();
         let token = payload.encode();
 
         // First use succeeds.
-        let verified = verify_inbound_in(&dir, &token, node_id, &node_id).expect("first use verifies");
+        let verified = verify_inbound_in(&dir, &token, endpoint_id, &endpoint_id).expect("first use verifies");
         assert!(verified.single_use);
         mark_consumed_in(&dir, &record.id).unwrap();
 
         // Second use is rejected.
-        let err = verify_inbound_in(&dir, &token, node_id, &node_id).unwrap_err();
+        let err = verify_inbound_in(&dir, &token, endpoint_id, &endpoint_id).unwrap_err();
         assert!(err.to_string().contains("consumed"), "{err}");
     }
 }

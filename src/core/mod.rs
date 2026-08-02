@@ -229,8 +229,8 @@ pub async fn establish(
 ) -> Result<Established> {
     let session = SessionKey::resolve(session_name.as_deref())?;
     let (raw_endpoint, bridge_ticket) = crate::endpoint::bind_endpoint_with_secret(session.secret.clone()).await?;
-    let my_node_id = raw_endpoint.id();
-    info!(session = %session.display_name, mode = ?session.mode, node_id = %my_node_id, "core: session identity");
+    let my_endpoint_id = raw_endpoint.id();
+    info!(session = %session.display_name, mode = ?session.mode, endpoint_id = %my_endpoint_id, "core: session identity");
 
     // D1: the machine identity, read-only — session establishment must never
     // implicitly create `machine.key`. `None` here is the headless case: the
@@ -238,14 +238,14 @@ pub async fn establish(
     let machine_secret = identity::load_machine_secret_if_exists();
 
     let session_cert = match &machine_secret {
-        Some(m) => certs::mint_session_cert(m, my_node_id, certs::DEFAULT_SESSION_EXPIRY),
+        Some(m) => certs::mint_session_cert(m, my_endpoint_id, certs::DEFAULT_SESSION_EXPIRY),
         None => certs::mint_self_certified_session(&session.secret, certs::DEFAULT_SESSION_EXPIRY),
     }
     .encode();
 
     let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
 
-    let endpoint_id_str = my_node_id.to_string();
+    let endpoint_id_str = my_endpoint_id.to_string();
     let own_name = name.unwrap_or_else(|| {
         let len = endpoint_id_str.len();
         format!("bridge-{}", &endpoint_id_str[..8_usize.min(len)])
@@ -255,7 +255,7 @@ pub async fn establish(
         devices.clone(),
         label.to_string(),
         own_name.clone(),
-        my_node_id,
+        my_endpoint_id,
         allow_legacy,
         session_cert.clone(),
     );

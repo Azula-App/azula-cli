@@ -3,7 +3,7 @@
 //! `mcp.rs`'s `LlmHandler` and `term.rs`'s `TermHandler` have the same
 //! connection shape: a loop of independent bi-streams with no existing
 //! per-stream handshake, so gating runs once per connection on the first
-//! stream only. A known peer (registry node-id match, checked by the caller)
+//! stream only. A known peer (registry endpoint-id match, checked by the caller)
 //! skips the gate entirely; a stranger's first stream must open with
 //! `Hello.invite`, verified the same way `bridge/device.rs`'s accept path
 //! verifies it. See `azula-docs/openspec/specs/invitations/design.md`.
@@ -38,7 +38,7 @@ pub enum GateOutcome {
 }
 
 /// Require the first frame of a stranger's first stream to be a `Hello`
-/// carrying a valid invite (verified against `my_node_id`'s issued-invite
+/// carrying a valid invite (verified against `my_endpoint_id`'s issued-invite
 /// store). Registers the device (as `azula pair` would, named `device_name`)
 /// and marks single-use invites consumed on success. Falls back to admitting
 /// unverified when `allow_legacy` is set (transition escape hatch);
@@ -46,7 +46,7 @@ pub enum GateOutcome {
 /// the two callers' logs stay distinguishable.
 pub async fn gate_stranger<R>(
     reader: &mut BufReader<R>,
-    my_node_id: EndpointId,
+    my_endpoint_id: EndpointId,
     allow_legacy: bool,
     remote: &str,
     device_name: &str,
@@ -69,7 +69,7 @@ where
     };
 
     let verified = match invite_token {
-        Some(tok) => match invite::verify_inbound(&tok, my_node_id, &my_node_id) {
+        Some(tok) => match invite::verify_inbound(&tok, my_endpoint_id, &my_endpoint_id) {
             Ok(v) => {
                 info!(%remote, component, invite_id = %v.invite_id, "stranger presented a valid invite");
                 Some(v)
@@ -167,7 +167,7 @@ pub enum CertCheck {
     /// pins the root").
     CertifiedStranger { root_pk: PublicKey },
     /// No cert was presented, it failed to decode/verify, didn't bind to
-    /// this connection (transport node id != the cert's device key), or its
+    /// this connection (transport endpoint id != the cert's device key), or its
     /// device key has been revoked — every one of these is treated exactly
     /// as if the field were absent (spec: "a certificate that fails
     /// verification SHALL be treated exactly as if the field were absent");
@@ -179,14 +179,14 @@ pub enum CertCheck {
 }
 
 /// Check a presented `Hello.cert` (`"azd…"`, or `None`) against `gate`, for
-/// a connection whose transport peer id is `connection_node_id`.
-pub fn check_cert(cert: Option<&str>, connection_node_id: EndpointId, gate: &CertGate<'_>) -> CertCheck {
+/// a connection whose transport peer id is `connection_endpoint_id`.
+pub fn check_cert(cert: Option<&str>, connection_endpoint_id: EndpointId, gate: &CertGate<'_>) -> CertCheck {
     let Some(cert_str) = cert else { return CertCheck::Absent };
     let Ok(cert) = DeviceCert::decode(cert_str) else { return CertCheck::Absent };
     if cert.verify().is_err() {
         return CertCheck::Absent;
     }
-    if !cert.binds_to_connection(connection_node_id) {
+    if !cert.binds_to_connection(connection_endpoint_id) {
         return CertCheck::Absent;
     }
     if cert.is_revoked_by(gate.revocations) {
@@ -221,8 +221,8 @@ pub enum GatePeerOutcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn gate_peer<R>(
     reader: &mut BufReader<R>,
-    my_node_id: EndpointId,
-    remote_node_id: EndpointId,
+    my_endpoint_id: EndpointId,
+    remote_endpoint_id: EndpointId,
     allow_legacy: bool,
     remote: &str,
     device_name: &str,
@@ -245,14 +245,14 @@ where
         _ => (None, None),
     };
 
-    let cert_check = check_cert(cert_field.as_deref(), remote_node_id, cert_gate);
+    let cert_check = check_cert(cert_field.as_deref(), remote_endpoint_id, cert_gate);
     if let CertCheck::KnownByRoot { root_pk } = cert_check {
         info!(%remote, component, %root_pk, "peer known by certified root match; admitting without an invite");
         return GatePeerOutcome::Admit { replay: replay_of(first), root_pk: Some(root_pk) };
     }
 
     let verified = match invite_field {
-        Some(tok) => match invite::verify_inbound(&tok, my_node_id, &my_node_id) {
+        Some(tok) => match invite::verify_inbound(&tok, my_endpoint_id, &my_endpoint_id) {
             Ok(v) => {
                 info!(%remote, component, invite_id = %v.invite_id, "peer presented a valid invite");
                 Some(v)
@@ -328,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_invite_token_closes_when_strict() {
-        let node_id = iroh::SecretKey::generate().public();
+        let endpoint_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
         write_frame(
@@ -338,13 +338,13 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, node_id, false, "remote-invalid", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-invalid", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
     }
 
     #[tokio::test]
     async fn invalid_invite_token_admits_unverified_when_legacy_allowed() {
-        let node_id = iroh::SecretKey::generate().public();
+        let endpoint_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
         write_frame(
@@ -354,31 +354,31 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, node_id, true, "remote-invalid-legacy", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, true, "remote-invalid-legacy", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Admit { replay: None }));
     }
 
     #[tokio::test]
     async fn no_invite_closes_when_strict() {
-        let node_id = iroh::SecretKey::generate().public();
+        let endpoint_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
         // A legacy client that never sends Hello at all — its first real
         // frame arrives directly.
         write_frame(&mut writer, &Frame::Chat { text: "hi".into(), id: None }).await.unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, node_id, false, "remote-none", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-none", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
     }
 
     #[tokio::test]
     async fn no_invite_admits_unverified_and_replays_the_frame_when_legacy_allowed() {
-        let node_id = iroh::SecretKey::generate().public();
+        let endpoint_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
         write_frame(&mut writer, &Frame::Chat { text: "hi".into(), id: None }).await.unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, node_id, true, "remote-none-legacy", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, true, "remote-none-legacy", "peer-device", "test").await;
         match outcome {
             GateOutcome::Admit { replay } => {
                 assert!(
@@ -392,12 +392,12 @@ mod tests {
 
     #[tokio::test]
     async fn clean_eof_closes_when_strict() {
-        let node_id = iroh::SecretKey::generate().public();
+        let endpoint_id = iroh::SecretKey::generate().public();
         let (writer, reader) = tokio::io::duplex(4096);
         drop(writer); // immediate EOF, no first frame at all
         let mut buf_reader = BufReader::new(reader);
 
-        let outcome = gate_stranger(&mut buf_reader, node_id, false, "remote-eof", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-eof", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
     }
 
@@ -408,7 +408,7 @@ mod tests {
     /// and both hold `ENV_TEST_LOCK` so they can't race each other.
     ///
     /// Deliberately does *not* assert the registry side effect
-    /// (`registry::find_by_node_id` after this returns): `registry.rs`'s
+    /// (`registry::find_by_endpoint_id` after this returns): `registry.rs`'s
     /// `cfg(test)` fallback dir is a single path shared by every registry
     /// test in the crate that doesn't set `AZULA_REGISTRY_DIR` itself, so
     /// asserting against it here would race with unrelated tests running in
@@ -417,7 +417,7 @@ mod tests {
     /// still fully exercises the verification path under test; the
     /// registration side effect is covered by the real two-process E2E run
     /// (see the invitations E2E report) and by `bridge/tests.rs`'s
-    /// `match_known_device_by_node_id`/`reconnect_by_node_id_flushes_mailbox`.
+    /// `match_known_device_by_endpoint_id`/`reconnect_by_endpoint_id_flushes_mailbox`.
     #[tokio::test]
     async fn valid_invite_admits_with_no_replay() {
         // Holds ENV_TEST_LOCK for the whole body — see its doc comment.
@@ -430,8 +430,8 @@ mod tests {
         std::env::set_var("AZULA_INVITES_DIR", base.join("invites"));
 
         let secret = iroh::SecretKey::generate();
-        let node_id = secret.public();
-        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(node_id)).to_string();
+        let endpoint_id = secret.public();
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(endpoint_id)).to_string();
         let (payload, _) =
             invite::mint(&ticket_str, invite::Expiry::Never, false, false, None, &secret).unwrap();
         let token = payload.encode();
@@ -440,7 +440,7 @@ mod tests {
         let mut buf_reader = BufReader::new(reader);
         write_frame(&mut writer, &Frame::Hello { name: "peer".into(), invite: Some(token), cert: None }).await.unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, node_id, false, "remote-valid", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-valid", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Admit { replay: None }));
 
         std::env::remove_var("AZULA_INVITES_DIR");
@@ -544,7 +544,7 @@ mod tests {
         let gate = CertGate { known_roots: &known_roots, revocations: &[] };
 
         // The presented cert's device_pk doesn't match this connection's
-        // transport node id.
+        // transport endpoint id.
         let someone_else = iroh::SecretKey::from_bytes(&seed(0x40)).public();
         let outcome = check_cert(Some(&cert.encode()), someone_else, &gate);
         assert_eq!(outcome, CertCheck::Absent);
@@ -562,7 +562,7 @@ mod tests {
         let root = cert_gate_root_secret();
         let device = cert_gate_device_secret();
         let cert = make_cert(&root, &device);
-        let my_node_id = iroh::SecretKey::generate().public();
+        let my_endpoint_id = iroh::SecretKey::generate().public();
         let known_roots = [root.public()];
         let gate = CertGate { known_roots: &known_roots, revocations: &[] };
 
@@ -579,7 +579,7 @@ mod tests {
         // can admit this connection.
         let outcome = gate_peer(
             &mut buf_reader,
-            my_node_id,
+            my_endpoint_id,
             device.public(),
             false,
             "remote-known-root",
@@ -607,7 +607,7 @@ mod tests {
             signature: [0u8; 64],
         };
         revocation.sign(&root);
-        let my_node_id = iroh::SecretKey::generate().public();
+        let my_endpoint_id = iroh::SecretKey::generate().public();
         let known_roots = [root.public()];
         let revocations = [revocation];
         let gate = CertGate { known_roots: &known_roots, revocations: &revocations };
@@ -626,7 +626,7 @@ mod tests {
         // spec's "Revoked device does not ride the root match" scenario.
         let outcome = gate_peer(
             &mut buf_reader,
-            my_node_id,
+            my_endpoint_id,
             device.public(),
             false,
             "remote-revoked",
@@ -657,8 +657,8 @@ mod tests {
         let gate = CertGate { known_roots: &known_roots, revocations: &[] };
 
         let my_secret = iroh::SecretKey::generate();
-        let my_node_id = my_secret.public();
-        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(my_node_id)).to_string();
+        let my_endpoint_id = my_secret.public();
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(my_endpoint_id)).to_string();
         let (payload, _) =
             invite::mint(&ticket_str, invite::Expiry::Never, false, false, None, &my_secret).unwrap();
         let token = payload.encode();
@@ -674,7 +674,7 @@ mod tests {
 
         let outcome = gate_peer(
             &mut buf_reader,
-            my_node_id,
+            my_endpoint_id,
             device.public(),
             false,
             "remote-invalid-cert",
@@ -708,8 +708,8 @@ mod tests {
         let gate = CertGate { known_roots: &[], revocations: &[] }; // root not yet known
 
         let my_secret = iroh::SecretKey::generate();
-        let my_node_id = my_secret.public();
-        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(my_node_id)).to_string();
+        let my_endpoint_id = my_secret.public();
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::from(my_endpoint_id)).to_string();
         let (payload, _) =
             invite::mint(&ticket_str, invite::Expiry::Never, false, false, None, &my_secret).unwrap();
         let token = payload.encode();
@@ -725,7 +725,7 @@ mod tests {
 
         let outcome = gate_peer(
             &mut buf_reader,
-            my_node_id,
+            my_endpoint_id,
             device.public(),
             false,
             "remote-certified-stranger",

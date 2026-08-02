@@ -1,8 +1,8 @@
-//! Persistent node identity for the long-lived server commands.
+//! Persistent endpoint identity for the long-lived server commands.
 //!
 //! Per the iroh Endpoint guidance (https://docs.iroh.computer/concepts/endpoints.md)
 //! an application should keep a single long-lived endpoint and reuse its
-//! `SecretKey` across restarts so its node id — and thus the shareable connect
+//! `SecretKey` across restarts so its endpoint id — and thus the shareable connect
 //! code — stays stable. Each server stores its raw 32-byte secret under
 //! `~/.azula/<name>.key` (`serve.key`, `bridge.key`, `blackjack.key`).
 
@@ -69,7 +69,7 @@ pub fn load_or_create_secret(name: &str) -> SecretKey {
 // certificates. On a machine that already ran `azula serve-mcp`/`azula mcp`
 // before per-session keys existed, `~/.azula/bridge.key` holds that identity
 // — it is adopted as-is (bytes copied to `machine.key`, `bridge.key` left in
-// place untouched) so the node id, and therefore every pairing the phone
+// place untouched) so the endpoint id, and therefore every pairing the phone
 // already has with this machine, is unchanged.
 //
 // CRITICAL: session-establishment code paths (binding the per-process
@@ -116,7 +116,7 @@ pub fn load_machine_secret_if_exists() -> Option<SecretKey> {
         Ok(()) => info!(
             path = %machine_path.display(),
             bridge_path = %bridge_path.display(),
-            "adopted bridge.key as the machine identity (node id unchanged)"
+            "adopted bridge.key as the machine identity (endpoint id unchanged)"
         ),
         Err(e) => warn!(path = %machine_path.display(), error = %e, "could not persist adopted machine key"),
     }
@@ -176,7 +176,7 @@ mod tests {
     // --- Machine identity (design.md D1) -----------------------------------
 
     #[test]
-    fn bridge_key_adopted_as_machine_key_preserves_node_id() {
+    fn bridge_key_adopted_as_machine_key_preserves_endpoint_id() {
         let _guard = crate::registry::ENV_TEST_LOCK.blocking_lock();
         let dir = isolated_key_dir("adopt_bridge");
 
@@ -189,12 +189,12 @@ mod tests {
         assert_eq!(
             adopted.to_bytes(),
             bridge_key.to_bytes(),
-            "adopted machine key must be byte-identical to bridge.key (same node id)"
+            "adopted machine key must be byte-identical to bridge.key (same endpoint id)"
         );
         assert_eq!(
             adopted.public(),
             bridge_key.public(),
-            "the node id (public key) must be unchanged by adoption"
+            "the endpoint id (public key) must be unchanged by adoption"
         );
 
         // machine.key now exists on disk, with the same bytes; bridge.key is

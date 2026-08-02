@@ -48,7 +48,7 @@ fn new_surface_id() -> String {
     format!("blackjack-{}-{}", run, GAME_CTR.fetch_add(1, Ordering::Relaxed))
 }
 
-/// A player's live table, kept in memory and keyed by their node id so a
+/// A player's live table, kept in memory and keyed by their endpoint id so a
 /// reconnect resumes the same hand (and same A2UI surface) instead of dealing
 /// a fresh one. In-memory only — a server restart starts everyone fresh.
 #[derive(Clone, Debug)]
@@ -61,7 +61,7 @@ type Tables = Arc<AsyncMutex<HashMap<String, Table>>>;
 
 /// Bind, print connect info, and serve Blackjack games until Ctrl-C.
 pub async fn run() -> Result<()> {
-    // Reuse a persisted key so restarts keep the same node id (stable connect code).
+    // Reuse a persisted key so restarts keep the same endpoint id (stable connect code).
     let (endpoint, ticket) = azula::endpoint::bind_server_endpoint("blackjack").await?;
 
     let lines = vec![
@@ -75,7 +75,7 @@ pub async fn run() -> Result<()> {
     println!();
 
     // A Router dispatches each inbound app connection to the Blackjack handler.
-    // Games are kept per player (by node id) so several apps can play at once and
+    // Games are kept per player (by endpoint id) so several apps can play at once and
     // a reconnecting player resumes their hand rather than getting a fresh deal.
     let tables: Tables = Arc::new(AsyncMutex::new(HashMap::new()));
     let router = Router::builder(endpoint)

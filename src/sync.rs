@@ -7,7 +7,7 @@
 //!
 //! 1. Mutual `SyncHello{cert}`. Each side verifies the peer's cert —
 //!    signature valid, chains to *its own* root key, not revoked, and the
-//!    cert's `device_pk` equals the connection's transport node id — closing
+//!    cert's `device_pk` equals the connection's transport endpoint id — closing
 //!    the connection (no further writes) on any failure. See
 //!    [`read_and_verify_hello`].
 //! 2. Both sides send `SyncVector{vector}`: device public key hex to the
@@ -420,7 +420,7 @@ pub enum SyncOutcome {
 /// in is enforced too, not just ones present in the caller's own baseline
 /// (e.g. the identity bundle) — device-linking spec: "Own devices enforce
 /// revocation after sync". `transport_peer_id` is the connection's actual
-/// transport node id — the caller's job to obtain (e.g.
+/// transport endpoint id — the caller's job to obtain (e.g.
 /// `iroh::endpoint::Connection::remote_id()`).
 ///
 /// Thin wrapper over [`run_session_with_hook`] with no pre-ack hook — every
@@ -553,7 +553,7 @@ async fn read_and_verify_hello<R: AsyncRead + Unpin>(
     }
     if !cert.binds_to_connection(transport_peer_id) {
         return Err(
-            "certificate's device key does not match the connection's transport node id".to_string(),
+            "certificate's device key does not match the connection's transport endpoint id".to_string(),
         );
     }
     Ok(cert)
@@ -999,7 +999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_rejects_a_cert_transport_node_id_mismatch_before_any_vector_exchange() {
+    async fn hello_rejects_a_cert_transport_endpoint_id_mismatch_before_any_vector_exchange() {
         let my_root = root_secret();
         let my_device = device_a_secret();
         let my_cert = make_cert(&my_root, &my_device, "victim");
@@ -1011,13 +1011,13 @@ mod tests {
         let (mut attacker_writer, attacker_reader, my_reader, my_writer) = wire_pair();
         write_frame(&mut attacker_writer, &Frame::SyncHello { cert: sibling_cert.encode() }).await.unwrap();
 
-        let store = LogStore::open(test_dir("node_id_mismatch"), my_root.public()).unwrap();
+        let store = LogStore::open(test_dir("endpoint_id_mismatch"), my_root.public()).unwrap();
         // Transport peer id does NOT match sibling_cert.device_pk.
         let outcome =
             run_session(my_reader, my_writer, &my_cert, &[], someone_else.public(), store).await.unwrap();
         match &outcome {
             SyncOutcome::HelloRejected(reason) => {
-                assert!(reason.contains("transport") || reason.contains("node id"), "{reason}")
+                assert!(reason.contains("transport") || reason.contains("endpoint id"), "{reason}")
             }
             other => panic!("expected HelloRejected, got {other:?}"),
         }
@@ -1390,7 +1390,7 @@ mod tests {
         append_chain(&store_a, &device_a, 3).await;
         append_chain(&store_b, &device_b, 2).await;
 
-        // The certs must bind to the connections' *transport* node ids
+        // The certs must bind to the connections' *transport* endpoint ids
         // (`read_and_verify_hello` checks it), so each endpoint is bound
         // with its device's own secret key rather than a random one.
         let server_ep = Endpoint::builder(presets::Minimal)

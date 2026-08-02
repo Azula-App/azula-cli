@@ -120,7 +120,7 @@ pub async fn run(
 }
 
 /// Run the bridge as a **stdio** MCP server — for `claude mcp add azula -- azula mcp`.
-/// Same `AzulaBridge` + iroh node as [`run`], but JSON-RPC is spoken over stdin/stdout,
+/// Same `AzulaBridge` + iroh endpoint as [`run`], but JSON-RPC is spoken over stdin/stdout,
 /// so all human output goes to **stderr** and never corrupts the protocol stream.
 pub async fn run_stdio(
     device_urls: Vec<String>,

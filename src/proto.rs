@@ -21,17 +21,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
 // ---------------------------------------------------------------------------
 
 /// A contact entry inside an [`IdentityBundle`] snapshot: pins either the
-/// contact's root public key (a certified contact) or its legacy node id —
+/// contact's root public key (a certified contact) or its legacy endpoint id —
 /// exactly one of the two, never both — plus an optional display name.
-/// Senders are responsible for setting exactly one of `root_pk`/`node_id`;
+/// Senders are responsible for setting exactly one of `root_pk`/`endpoint_id`;
 /// this is not enforced at the type level, matching `certs.rs`'s convention
 /// of leaving encode-side invariants to the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Contact {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "rootPk")]
     pub root_pk: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "nodeId")]
-    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "endpointId")]
+    pub endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -234,7 +234,7 @@ pub enum Frame {
     /// is the sender's `"azd…"`-encoded device certificate
     /// (`certs::DeviceCert`). Each side verifies the other's cert — chains
     /// to its own root key, not revoked, `device_pk` matches the
-    /// connection's transport node id — before any vector or entry
+    /// connection's transport endpoint id — before any vector or entry
     /// exchange; any failure closes the connection (see `sync.rs`'s
     /// `run_session`).
     #[serde(rename = "sync_hello")]
@@ -260,7 +260,7 @@ pub enum Frame {
     SyncAck { vector: BTreeMap<String, u64> },
 
     /// new device -> root-holding device (link ALPN): first frame,
-    /// presenting the new device's freshly generated node public key,
+    /// presenting the new device's freshly generated endpoint public key,
     /// requested display name, and requested roles bitfield (see
     /// `certs::FLAG_MAILBOX`/`FLAG_BOT`).
     #[serde(rename = "link_hello")]
@@ -792,7 +792,7 @@ mod tests {
             root_pk: "root-hex".into(),
             certs: vec!["azd1".into()],
             revocations: vec![],
-            contacts: vec![Contact { root_pk: Some("contact-root".into()), node_id: None, name: Some("Alice".into()) }],
+            contacts: vec![Contact { root_pk: Some("contact-root".into()), endpoint_id: None, name: Some("Alice".into()) }],
             mailbox: Some("mailbox-ticket".into()),
         };
         let f = Frame::LinkGrant { cert: "azd-mine".into(), bundle: bundle.clone() };
@@ -806,19 +806,19 @@ mod tests {
     }
 
     #[test]
-    fn link_grant_bundle_omits_mailbox_and_uses_node_id_contact() {
+    fn link_grant_bundle_omits_mailbox_and_uses_endpoint_id_contact() {
         let bundle = IdentityBundle {
             root_pk: "root-hex".into(),
             certs: vec![],
             revocations: vec![],
-            contacts: vec![Contact { root_pk: None, node_id: Some("legacy-node".into()), name: None }],
+            contacts: vec![Contact { root_pk: None, endpoint_id: Some("legacy-endpoint".into()), name: None }],
             mailbox: None,
         };
         let f = Frame::LinkGrant { cert: "azd-mine".into(), bundle };
         let json = serde_json::to_string(&f).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"link_grant","cert":"azd-mine","bundle":{"rootPk":"root-hex","certs":[],"revocations":[],"contacts":[{"nodeId":"legacy-node"}]}}"#
+            r#"{"type":"link_grant","cert":"azd-mine","bundle":{"rootPk":"root-hex","certs":[],"revocations":[],"contacts":[{"endpointId":"legacy-endpoint"}]}}"#
         );
         let back: Frame = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Frame::LinkGrant { .. }));

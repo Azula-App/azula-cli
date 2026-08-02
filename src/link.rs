@@ -493,7 +493,7 @@ mod tests {
             root_pk: "root-hex".to_string(),
             certs: vec!["azd-example".to_string()],
             revocations: vec![],
-            contacts: vec![Contact { root_pk: Some("contact-root".into()), node_id: None, name: Some("Alice".into()) }],
+            contacts: vec![Contact { root_pk: Some("contact-root".into()), endpoint_id: None, name: Some("Alice".into()) }],
             mailbox: None,
         }
     }

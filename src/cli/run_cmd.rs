@@ -274,7 +274,7 @@ fn terminal_size() -> Option<(u16, u16)> {
 /// D2 says that should happen "on clean exit," not the instant the endpoint
 /// finishes binding.
 struct Handoff {
-    node_id: iroh::EndpointId,
+    endpoint_id: iroh::EndpointId,
     invite_url: String,
     session_id: String,
     router: iroh::protocol::Router,
@@ -302,16 +302,16 @@ async fn start_handoff(
     let (endpoint, ticket) = crate::endpoint::bind_endpoint_with_secret(session.secret.clone())
         .await
         .context("binding the handoff session's endpoint")?;
-    let my_node_id = endpoint.id();
+    let my_endpoint_id = endpoint.id();
 
     let session_id = term::spawn_host_shell_session(shell_argv, local_pty_size(), captured)
         .context("spawning the handoff shell")?;
 
     let router = iroh::protocol::Router::builder(endpoint)
-        .accept(LLM_ALPN, LlmHandler::new(None, my_node_id, allow_legacy))
+        .accept(LLM_ALPN, LlmHandler::new(None, my_endpoint_id, allow_legacy))
         .accept(
             TERM_ALPN,
-            TermHandler::new(my_node_id, allow_legacy, name, desc, Some(HANDOFF_SESSION_TTL))
+            TermHandler::new(my_endpoint_id, allow_legacy, name, desc, Some(HANDOFF_SESSION_TTL))
                 .with_default_session(session_id.clone()),
         )
         .spawn();
@@ -323,7 +323,7 @@ async fn start_handoff(
             None => qr::pairing_url(&ticket),
         };
 
-    Ok(Handoff { node_id: my_node_id, invite_url, session_id, router, _session: session })
+    Ok(Handoff { endpoint_id: my_endpoint_id, invite_url, session_id, router, _session: session })
 }
 
 async fn handoff(
@@ -334,7 +334,7 @@ async fn handoff(
     hold: Duration,
 ) -> Result<()> {
     let h = start_handoff(&captured, name, desc, allow_legacy, None).await?;
-    print_connect_block(&h.node_id.to_string(), &h.invite_url);
+    print_connect_block(&h.endpoint_id.to_string(), &h.invite_url);
     wait_for_session_end_or_hold(&h.session_id, hold).await;
     // Kill sessions BEFORE router shutdown: a live session's PTY-reader
     // thread is parked in a blocking read from a shell that may still be

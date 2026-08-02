@@ -15,7 +15,7 @@
 //!                never set by this change — bits 2-7 reserved: 0 on encode,
 //!                ignored on decode)
 //! 2       32    root_pk (Ed25519 root public key)
-//! 34      32    device_pk (Ed25519 device / iroh node public key)
+//! 34      32    device_pk (Ed25519 device / iroh endpoint public key)
 //! 66      4     issued_at (unix seconds)
 //! 70      4     expires_at (unix seconds; 0 = never)
 //! 74      1     name_len (n, 0..=63)
@@ -45,7 +45,7 @@
 //! ```text
 //! offset  size  field
 //! 0       1     version (0x01)
-//! 1       32    device_pk (the new device's freshly generated node key)
+//! 1       32    device_pk (the new device's freshly generated endpoint key)
 //! 33      1     name_len (n)
 //! 34      n     name (UTF-8 requested display name)
 //! 34+n    2     ticket_len (m)
@@ -63,7 +63,7 @@
 //! [`DeviceCert::is_revoked_by`], which takes the verifier's own revocation
 //! set) and it confers **no identity association** by itself — a cert is
 //! just an association claim. Callers MUST additionally check
-//! [`DeviceCert::binds_to_connection`] (the connection's transport node id
+//! [`DeviceCert::binds_to_connection`] (the connection's transport endpoint id
 //! equals `device_pk`) before treating a presented cert as identifying the
 //! peer on that connection.
 
@@ -302,12 +302,12 @@ impl DeviceCert {
             .any(|r| r.root_pk == self.root_pk && r.device_pk == self.device_pk)
     }
 
-    /// A certificate confers nothing unless the connection's transport node
+    /// A certificate confers nothing unless the connection's transport endpoint
     /// id equals the certificate's device public key. Callers MUST call this
     /// (or perform the equivalent comparison) before treating a presented,
     /// verified cert as identifying the peer on a given connection.
-    pub fn binds_to_connection(&self, connection_node_id: EndpointId) -> bool {
-        self.device_pk == connection_node_id
+    pub fn binds_to_connection(&self, connection_endpoint_id: EndpointId) -> bool {
+        self.device_pk == connection_endpoint_id
     }
 }
 
@@ -353,7 +353,7 @@ pub fn mint_self_certified_session(session_secret: &SecretKey, expires: Duration
 }
 
 /// Verify a decoded session certificate against `expected_transport_peer`
-/// (the live connection's transport node id), enforcing every check that's
+/// (the live connection's transport endpoint id), enforcing every check that's
 /// self-contained to the cert plus the connection:
 ///
 /// 1. structural/signature validity against the cert's own embedded
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn cert_wrong_connection_node_id_does_not_bind() {
+    fn cert_wrong_connection_endpoint_id_does_not_bind() {
         let cert = signed_cert("phone", 0);
         assert!(cert.binds_to_connection(cert.device_pk));
         assert!(!cert.binds_to_connection(device2_secret().public()));

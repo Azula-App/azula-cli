@@ -65,7 +65,7 @@ pub(super) struct InviteMintArgs {
     #[arg(long, default_value = "24h")]
     expires: String,
 
-    /// Sign the invite with this node's key so the redeemer/azula.app can
+    /// Sign the invite with this endpoint's key so the redeemer/azula.app can
     /// verify authenticity before dialing.
     #[arg(long)]
     sign: bool,
@@ -306,7 +306,7 @@ fn parse_expiry(s: &str) -> Result<Expiry> {
 pub(super) async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     let expiry = parse_expiry(&args.expires)?;
 
-    // `serve` (default) persists its own node key; `--bridge` mints against
+    // `serve` (default) persists its own endpoint key; `--bridge` mints against
     // the **machine** identity (`~/.azula/machine.key`, adopting an existing
     // `bridge.key` in place — see `identity::load_or_create_machine_secret`)
     // — the root that every `azula mcp` session's cert chains to
@@ -321,7 +321,7 @@ pub(super) async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     } else {
         endpoint::bind_server_endpoint("serve").await?
     };
-    let node_id = endpoint.id();
+    let endpoint_id = endpoint.id();
 
     let (payload, record) = invite::mint(
         &ticket,
@@ -334,11 +334,11 @@ pub(super) async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     let encoded = payload.encode();
     let url = qr::invite_url(&encoded);
 
-    let node_id_str = node_id.to_string();
+    let endpoint_id_str = endpoint_id.to_string();
     println!(
-        "Minted invite {} for the {identity_label} identity (node {}…)",
+        "Minted invite {} for the {identity_label} identity (endpoint {}…)",
         record.id,
-        &node_id_str[..8.min(node_id_str.len())]
+        &endpoint_id_str[..8.min(endpoint_id_str.len())]
     );
     println!("  expires: {}", describe_expiry(record.expires_at));
     if let Some(label) = &record.label {
@@ -409,7 +409,7 @@ pub(super) fn cmd_invite_revoke(args: InviteRevokeArgs) -> Result<()> {
     Ok(())
 }
 
-/// `azula link`: generate (or reuse) the `"link"`-named persisted node key
+/// `azula link`: generate (or reuse) the `"link"`-named persisted endpoint key
 /// (kept separate from `serve`/`bridge`/`blackjack`'s own identities — see
 /// `identity::load_or_create_secret`), print the `azl…` payload as a
 /// terminal QR and copyable string, accept the inbound `azula/link/0` dial,
@@ -521,9 +521,9 @@ pub(super) async fn cmd_mailbox(args: MailboxArgs) -> Result<()> {
 /// not being deleted this release.
 pub(super) async fn serve(args: ServeArgs) -> Result<()> {
     // Bind with the n0 defaults (public discovery + relays), reusing a persisted
-    // key so the node id (and connect code) stays stable across restarts.
+    // key so the endpoint id (and connect code) stays stable across restarts.
     let (endpoint, ticket) = endpoint::bind_server_endpoint("serve").await?;
-    let node_id = endpoint.id();
+    let endpoint_id = endpoint.id();
 
     // `0` disables persistence outright (no reaper needed — sessions never
     // survive a detach in that mode, see `term::bind_attachment`).
@@ -559,7 +559,7 @@ pub(super) async fn serve(args: ServeArgs) -> Result<()> {
         String::new(),
         format!("    {ticket}"),
         String::new(),
-        format!("  Short node id: {node_id}"),
+        format!("  Short endpoint id: {endpoint_id}"),
         String::new(),
         "  Serving ALPNs:".to_string(),
     ];
@@ -612,15 +612,15 @@ pub(super) async fn serve(args: ServeArgs) -> Result<()> {
         Router::builder(endpoint)
             .accept(
                 TERM_ALPN,
-                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
+                TermHandler::new(endpoint_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
             )
             .spawn()
     } else {
         Router::builder(endpoint)
-            .accept(LLM_ALPN, LlmHandler::new(mcp, node_id, args.allow_legacy))
+            .accept(LLM_ALPN, LlmHandler::new(mcp, endpoint_id, args.allow_legacy))
             .accept(
                 TERM_ALPN,
-                TermHandler::new(node_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
+                TermHandler::new(endpoint_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
             )
             .spawn()
     };

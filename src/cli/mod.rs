@@ -85,7 +85,7 @@ enum Command {
     Qr(legacy::QrArgs),
     /// Mint a new invite (or, with `revoke`, delete a previously issued one).
     Invite(legacy::InviteCliArgs),
-    /// List all invites this node has issued.
+    /// List all invites this endpoint has issued.
     Invites,
     /// Link this CLI as a new device of an existing multi-device identity:
     /// print an `azl…` QR/string for a root-holding device to scan, then

@@ -57,7 +57,7 @@ pub enum Kind {
     MessageIn,
     /// `{conversation, up_to_lamport}`
     ReadMarker,
-    /// `{root_pk | node_id, name?}`
+    /// `{root_pk | endpoint_id, name?}`
     ContactAdd,
     /// same body shape as `ContactAdd`
     ContactRemove,
@@ -71,7 +71,7 @@ pub enum Kind {
     /// inbound to the identity (cli-multi-session-relay's relay capability:
     /// a session delivered this to the relay while the phone was
     /// unreachable). `conversation` is the SESSION's public key in hex, not
-    /// a contact root/node id like the peer-chat kinds above.
+    /// a contact root/endpoint id like the peer-chat kinds above.
     AgentIn,
     /// `{conversation, text, id?}` — the identity's reply to an agent
     /// conversation, keyed the same way as [`Kind::AgentIn`].
@@ -120,7 +120,7 @@ impl Kind {
 
 /// Body of a [`Kind::AgentIn`] entry: `{"conversation":…,"text":…,"id":…,
 /// "from_name":…}`. `conversation` is the session's public key in hex (not a
-/// contact root/node id, unlike the peer-chat kinds). Field order and
+/// contact root/endpoint id, unlike the peer-chat kinds). Field order and
 /// `skip_serializing_if` are pinned — the Kotlin decoder is byte-exact
 /// against this shape (see `eventlog::tests::cross_language_vector_agent_in_entry`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -119,8 +119,8 @@ const TTL_REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// with `mcp.rs`'s `LlmHandler`).
 #[derive(Debug, Clone)]
 pub struct TermHandler {
-    /// Our own node id — the invite-verification audience and signature key.
-    my_node_id: EndpointId,
+    /// Our own endpoint id — the invite-verification audience and signature key.
+    my_endpoint_id: EndpointId,
     /// Admit invite-less strangers as unverified instead of closing the
     /// connection (`--allow-legacy`, default on for one release).
     allow_legacy: bool,
@@ -146,14 +146,14 @@ pub struct TermHandler {
 
 impl TermHandler {
     pub fn new(
-        my_node_id: EndpointId,
+        my_endpoint_id: EndpointId,
         allow_legacy: bool,
         name_override: Option<String>,
         description_override: Option<String>,
         session_ttl: Option<Duration>,
     ) -> Self {
         TermHandler {
-            my_node_id,
+            my_endpoint_id,
             allow_legacy,
             name_override,
             description_override,
@@ -178,7 +178,7 @@ impl ProtocolHandler for TermHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         handle(
             connection,
-            self.my_node_id,
+            self.my_endpoint_id,
             self.allow_legacy,
             self.name_override.clone(),
             self.description_override.clone(),
@@ -192,7 +192,7 @@ impl ProtocolHandler for TermHandler {
 
 async fn handle(
     connection: Connection,
-    my_node_id: EndpointId,
+    my_endpoint_id: EndpointId,
     allow_legacy: bool,
     name_override: Option<String>,
     description_override: Option<String>,
@@ -207,7 +207,7 @@ async fn handle(
     // per connection (not per stream): a stranger who verifies on the first
     // stream is registered and every later stream on the same connection is
     // then implicitly from a "known" peer for the rest of its lifetime.
-    let mut known = registry::find_by_node_id(&remote_id).is_some();
+    let mut known = registry::find_by_endpoint_id(&remote_id).is_some();
     let mut first_stream = true;
     // The app keys a terminal conversation by peer id, so every stream on this
     // connection rewires the *same* conversation (see `ConnectService.wireStream`
@@ -234,7 +234,7 @@ async fn handle(
 
         if first_stream && !known {
             let device_name = format!("term-{}", &remote[..8.min(remote.len())]);
-            match gate_stranger(&mut reader, my_node_id, allow_legacy, &remote, &device_name, "term").await {
+            match gate_stranger(&mut reader, my_endpoint_id, allow_legacy, &remote, &device_name, "term").await {
                 GateOutcome::Admit { replay } => {
                     known = true; // don't re-gate later streams on this connection
                     first_frame = replay.map(|b| *b);
@@ -489,12 +489,12 @@ fn new_session_id() -> String {
 /// "Invite-Authorized Session Attach": the creating/claimed owner, or — for
 /// an `invite_gated` session — any peer that has itself been admitted via a
 /// verified invite against this process. That second check is
-/// `registry::find_by_node_id(&requester).is_some()`: `accept_gate::
+/// `registry::find_by_endpoint_id(&requester).is_some()`: `accept_gate::
 /// gate_stranger` only ever calls `registry::add` for a stranger on the
 /// *verified-invite* path (never for an `--allow-legacy` fallback, and never
 /// re-run for an already-known peer) — see `handle`'s gating call site — so a
 /// hit there is exactly "this peer has redeemed a valid invite issued by
-/// this node id." A host-created session's process mints exactly one such
+/// this endpoint id." A host-created session's process mints exactly one such
 /// invite (`spawn_host_shell_session`'s caller), so that's unambiguously
 /// *this* session's invite.
 ///
@@ -513,7 +513,7 @@ fn find_owned_session(id: &str, requester: EndpointId) -> Option<Arc<Session>> {
         return Some(session);
     }
 
-    if session.invite_gated && registry::find_by_node_id(&requester).is_some() {
+    if session.invite_gated && registry::find_by_endpoint_id(&requester).is_some() {
         let mut owner = session.owner.lock().unwrap();
         if owner.is_none() {
             *owner = Some(requester);
@@ -1802,7 +1802,7 @@ mod tests {
         client_ep.close().await;
     }
 
-    /// Reattaching from a FRESH connection (new `Endpoint`, same node key)
+    /// Reattaching from a FRESH connection (new `Endpoint`, same endpoint key)
     /// still resumes the same session — persistence survives a full
     /// reconnect, not just a new stream on the same connection.
     #[tokio::test]
@@ -1986,7 +1986,7 @@ mod tests {
         client_ep.close().await;
     }
 
-    /// A different peer (different node key) presenting the same session id
+    /// A different peer (different endpoint key) presenting the same session id
     /// never resumes another owner's session — it silently gets a fresh one.
     #[tokio::test]
     async fn owner_check_prevents_cross_peer_attach() {
@@ -2045,7 +2045,7 @@ mod tests {
     /// Reproduces the azula app's real wire shape for a KNOWN peer: every
     /// dialed stream starts with `Frame::Hello` (`ConnectService.ping()`)
     /// before the actual `Frame::TermAttach` (`wireConv`). Pre-registering the
-    /// client's node id makes the server treat it as known from its very
+    /// client's endpoint id makes the server treat it as known from its very
     /// first stream, so the accept gate never runs and `term_session`'s own
     /// leading-frame read is what has to see past the Hello — this is
     /// exactly the bug: a known peer's reconnect used to fall through to
@@ -2074,7 +2074,7 @@ mod tests {
 
         // Register the client as a known device BEFORE it ever connects, so
         // `known` is true on its very first stream (see `handle`'s
-        // `registry::find_by_node_id` check) — no invite, no gate, exactly
+        // `registry::find_by_endpoint_id` check) — no invite, no gate, exactly
         // like a device that paired in a previous session.
         registry::add(
             Device { name: "known-term-peer".to_string(), ticket: client_id.to_string(), added_at: None, invite: None },
@@ -2232,7 +2232,7 @@ mod tests {
             )
             .spawn();
 
-        // Mint an invite for the server's own node id — exactly what
+        // Mint an invite for the server's own endpoint id — exactly what
         // `azula run`/`azula terminal`'s connect block hands out.
         let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(server_addr.clone()).to_string();
         let (payload, _) =

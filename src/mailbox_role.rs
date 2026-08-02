@@ -33,7 +33,7 @@
 //!     [`ChatHandler`].
 //!   - [`run`] — the `azula relay` command (also `azula mailbox`, unchanged
 //!     call site in `cli/legacy.rs`): load the linked identity, bind its
-//!     node key, and serve [`CHAT_ALPN`] + [`crate::mcp::LLM_ALPN`] +
+//!     endpoint key, and serve [`CHAT_ALPN`] + [`crate::mcp::LLM_ALPN`] +
 //!     `sync::SYNC_ALPN` (with a [`crate::sync::PreSyncAckHook`] replaying
 //!     pending A2UI snapshots) + `link::LINK_ALPN` (via
 //!     `link::RootlessLinkHandler` — this device holds no root secret)
@@ -72,7 +72,7 @@ pub const CHAT_ALPN: &[u8] = b"azula/chat/0";
 
 /// Parse the root public keys of an identity bundle's contacts snapshot —
 /// the mailbox's initial "known roots" set for `accept_gate::CertGate`.
-/// Unparseable/node-id-only entries are skipped rather than failing the
+/// Unparseable/endpoint-id-only entries are skipped rather than failing the
 /// whole bundle.
 pub fn known_roots_from_bundle(bundle: &IdentityBundle) -> Vec<PublicKey> {
     bundle
@@ -117,7 +117,7 @@ struct MessageInBody<'a> {
 /// (`store.append_own`) — the store-and-forward behavior "Mailbox Role
 /// Stores and Forwards" describes. `conversation` is the peer's root public
 /// key hex when it presented (or already held) a valid cert, else its
-/// (legacy) transport node id hex, matching `eventlog`'s `message_in` body
+/// (legacy) transport endpoint id hex, matching `eventlog`'s `message_in` body
 /// shape `{conversation, from_device_pk, text, id?}`.
 ///
 /// `revocations` (typically the identity bundle's baseline set) is merged
@@ -129,7 +129,7 @@ struct MessageInBody<'a> {
 pub async fn run_chat_session<R, W>(
     reader: R,
     mut writer: W,
-    remote_node_id: EndpointId,
+    remote_endpoint_id: EndpointId,
     remote: &str,
     device_secret: &SecretKey,
     my_cert_encoded: &str,
@@ -142,7 +142,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let my_node_id = device_secret.public();
+    let my_endpoint_id = device_secret.public();
     let mut reader = BufReader::new(reader);
 
     let mut live_revocations = revocations.to_vec();
@@ -154,8 +154,8 @@ where
 
     let (replay, conversation_root) = match gate_peer(
         &mut reader,
-        my_node_id,
-        remote_node_id,
+        my_endpoint_id,
+        remote_endpoint_id,
         allow_legacy,
         remote,
         &device_name,
@@ -324,8 +324,8 @@ const LLM_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 ///
 /// Admission (task 4.3, all of which must hold): the first frame is
 /// `Hello{cert}`; the cert decodes and `certs::verify_session_cert` passes
-/// against `remote_node_id` (signature, [`FLAG_SESSION`](crate::certs::FLAG_SESSION),
-/// unexpired, `device_pk == remote_node_id`); and `cert.root_pk` is already
+/// against `remote_endpoint_id` (signature, [`FLAG_SESSION`](crate::certs::FLAG_SESSION),
+/// unexpired, `device_pk == remote_endpoint_id`); and `cert.root_pk` is already
 /// in `known_roots` — the *same* live set [`ChatHandler`]'s `gate_peer` call
 /// maintains (see [`ChatHandler::known_roots_handle`]), so a machine root
 /// pinned as a contact via ordinary peer chat is recognized here too, and
@@ -337,7 +337,7 @@ const LLM_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 ///
 /// Once admitted, `conversation` for both folded kinds is the *session's*
 /// public key hex (`cert.device_pk`, which — per `verify_session_cert` —
-/// already equals `remote_node_id`): `Frame::Chat{text,id}` appends an
+/// already equals `remote_endpoint_id`): `Frame::Chat{text,id}` appends an
 /// `agent_in` entry on `device_secret`'s own log (`from_name` from the
 /// `Hello`, when non-empty), and `Frame::A2uiSnapshot` writes into
 /// `a2ui_store` (its own `conversation` field is deliberately ignored here —
@@ -347,7 +347,7 @@ const LLM_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 pub async fn run_llm_session<R, W>(
     reader: R,
     _writer: W,
-    remote_node_id: EndpointId,
+    remote_endpoint_id: EndpointId,
     device_secret: &SecretKey,
     store: &LogStore,
     a2ui_store: &crate::core::relay_a2ui::RelayA2uiStore,
@@ -362,33 +362,33 @@ where
     let first = match tokio::time::timeout(LLM_HELLO_TIMEOUT, read_frame(&mut reader)).await {
         Ok(result) => result,
         Err(_elapsed) => {
-            info!(%remote_node_id, "relay: session's first frame timed out; closing");
+            info!(%remote_endpoint_id, "relay: session's first frame timed out; closing");
             return Ok(());
         }
     };
     let Ok(Some(Frame::Hello { name, cert: Some(cert_str), .. })) = first else {
-        info!(%remote_node_id, "relay: session presented no cert; closing (no invite fallback on this ALPN)");
+        info!(%remote_endpoint_id, "relay: session presented no cert; closing (no invite fallback on this ALPN)");
         return Ok(());
     };
     let Ok(cert) = DeviceCert::decode(&cert_str) else {
-        info!(%remote_node_id, "relay: session's cert did not decode; closing");
+        info!(%remote_endpoint_id, "relay: session's cert did not decode; closing");
         return Ok(());
     };
-    if let Err(e) = crate::certs::verify_session_cert(&cert, remote_node_id) {
-        info!(%remote_node_id, error = %e, "relay: session cert failed verification; closing");
+    if let Err(e) = crate::certs::verify_session_cert(&cert, remote_endpoint_id) {
+        info!(%remote_endpoint_id, error = %e, "relay: session cert failed verification; closing");
         return Ok(());
     }
     {
         let roots = known_roots.lock().await;
         if !roots.contains(&cert.root_pk) {
-            info!(%remote_node_id, root_pk = %cert.root_pk, "relay: session's root is not a known contact; closing");
+            info!(%remote_endpoint_id, root_pk = %cert.root_pk, "relay: session's root is not a known contact; closing");
             return Ok(());
         }
     }
 
     let conversation = cert.device_pk.to_string();
     let from_name = if name.trim().is_empty() { None } else { Some(name) };
-    info!(%remote_node_id, %conversation, "relay: session admitted on the LLM ALPN");
+    info!(%remote_endpoint_id, %conversation, "relay: session admitted on the LLM ALPN");
 
     loop {
         match read_frame(&mut reader).await {
@@ -483,7 +483,7 @@ pub fn log_store_dir() -> Option<PathBuf> {
 }
 
 /// Run `azula relay`: load the identity linked via `azula link`, bind its
-/// node key, and serve the chat/LLM/sync/link ALPNs until Ctrl-C. relay
+/// endpoint key, and serve the chat/LLM/sync/link ALPNs until Ctrl-C. relay
 /// spec: "Relay Subsumes the Mailbox Role" — `azula mailbox` (`cli/legacy.rs`'s
 /// `cmd_mailbox`) calls this exact function too, unchanged, so both commands
 /// get identical behavior; kept named `mailbox_role::run` (not renamed) to
@@ -502,10 +502,10 @@ pub async fn run(allow_legacy: bool) -> Result<()> {
     let known_roots = known_roots_from_bundle(&linked.bundle);
 
     let (endpoint, ticket) = endpoint::bind_server_endpoint(NODE_IDENTITY_NAME).await?;
-    let node_id = endpoint.id();
+    let endpoint_id = endpoint.id();
     anyhow::ensure!(
-        cert.binds_to_connection(node_id),
-        "relay: stored certificate's device key does not match this device's node id -- re-link with `azula link`"
+        cert.binds_to_connection(endpoint_id),
+        "relay: stored certificate's device key does not match this device's endpoint id -- re-link with `azula link`"
     );
 
     let dir = log_store_dir().context("cannot resolve relay log directory ($HOME unset)")?;
@@ -527,7 +527,7 @@ pub async fn run(allow_legacy: bool) -> Result<()> {
         String::new(),
         format!("    {ticket}"),
         String::new(),
-        format!("  Short node id: {node_id}"),
+        format!("  Short endpoint id: {endpoint_id}"),
         String::new(),
         "  Serving ALPNs:".to_string(),
         format!("    {}  peer chat (store-and-forward)", String::from_utf8_lossy(CHAT_ALPN)),
@@ -607,16 +607,16 @@ mod tests {
     // --- known_roots_from_bundle / verified_revocations_from_bundle --------
 
     #[test]
-    fn known_roots_from_bundle_parses_root_pk_contacts_and_skips_node_id_only() {
+    fn known_roots_from_bundle_parses_root_pk_contacts_and_skips_endpoint_id_only() {
         let root = SecretKey::from_bytes(&seed(0x01)).public();
         let bundle = IdentityBundle {
             root_pk: "self".to_string(),
             certs: vec![],
             revocations: vec![],
             contacts: vec![
-                Contact { root_pk: Some(root.to_string()), node_id: None, name: None },
-                Contact { root_pk: None, node_id: Some("legacy-node-id".into()), name: None },
-                Contact { root_pk: Some("not-a-valid-pubkey".into()), node_id: None, name: None },
+                Contact { root_pk: Some(root.to_string()), endpoint_id: None, name: None },
+                Contact { root_pk: None, endpoint_id: Some("legacy-endpoint-id".into()), name: None },
+                Contact { root_pk: Some("not-a-valid-pubkey".into()), endpoint_id: None, name: None },
             ],
             mailbox: None,
         };
@@ -866,7 +866,7 @@ mod tests {
 
         let store = LogStore::open(test_dir("quic_chat"), mailbox_root.public()).unwrap();
 
-        // The peer's cert must bind to its *transport* node id
+        // The peer's cert must bind to its *transport* endpoint id
         // (`accept_gate::check_cert`), so both endpoints are bound with
         // their device's own secret key rather than a random one.
         let server_ep = Endpoint::builder(presets::Minimal)

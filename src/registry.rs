@@ -178,19 +178,19 @@ pub fn add(device: Device, global: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Find a registered device whose ticket's embedded node id matches
-/// `node_id`. Used by accept-side gates (`term.rs`, `mcp.rs`,
+/// Find a registered device whose ticket's embedded endpoint id matches
+/// `endpoint_id`. Used by accept-side gates (`term.rs`, `mcp.rs`,
 /// `accept_gate.rs`) to recognize a reconnecting known peer regardless of
 /// what name it announces. Matches two `ticket` shapes: a dialable
 /// `EndpointTicket` string (from `azula pair` / outbound dial), or a bare
-/// node-id hex string (from accept-side registration, which has no
+/// endpoint-id hex string (from accept-side registration, which has no
 /// dialable address to store — see `accept_gate::gate_stranger`).
-pub fn find_by_node_id(node_id: &EndpointId) -> Option<Device> {
-    let node_id_str = node_id.to_string();
+pub fn find_by_endpoint_id(endpoint_id: &EndpointId) -> Option<Device> {
+    let endpoint_id_str = endpoint_id.to_string();
     load().into_iter().find(|d| {
-        d.ticket == node_id_str
+        d.ticket == endpoint_id_str
             || EndpointTicket::from_str(&d.ticket)
-                .map(|t| &t.endpoint_addr().id == node_id)
+                .map(|t| &t.endpoint_addr().id == endpoint_id)
                 .unwrap_or(false)
     })
 }

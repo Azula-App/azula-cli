@@ -197,29 +197,29 @@ fn extract_text(result: &CallToolResult) -> String {
 /// Protocol handler for the LLM relay ALPN, backed by a shared MCP session.
 ///
 /// Gated the same way `term.rs`'s `TermHandler` is (see
-/// `accept_gate::gate_stranger`): a known device (registry node-id match)
+/// `accept_gate::gate_stranger`): a known device (registry endpoint-id match)
 /// connects unchanged; a stranger's first stream must open with a valid
 /// `Hello.invite`, or `allow_legacy` admits it unverified.
 #[derive(Clone)]
 pub struct LlmHandler {
     /// `None` => no/failed MCP session; use the canned fallback responder.
     mcp: Option<Arc<McpHandle>>,
-    /// Our own node id — the invite-verification audience and signature key.
-    my_node_id: EndpointId,
+    /// Our own endpoint id — the invite-verification audience and signature key.
+    my_endpoint_id: EndpointId,
     /// Admit invite-less strangers as unverified instead of closing the
     /// connection (`--allow-legacy`, default on for one release).
     allow_legacy: bool,
 }
 
 impl LlmHandler {
-    pub fn new(mcp: Option<Arc<McpHandle>>, my_node_id: EndpointId, allow_legacy: bool) -> Self {
+    pub fn new(mcp: Option<Arc<McpHandle>>, my_endpoint_id: EndpointId, allow_legacy: bool) -> Self {
         if mcp.is_none() {
             warn!(
                 "no MCP server configured (or connect failed); the LLM relay will reply with a \
                  canned notice. Pass --mcp-stdio or --mcp-url to enable real responses."
             );
         }
-        LlmHandler { mcp, my_node_id, allow_legacy }
+        LlmHandler { mcp, my_endpoint_id, allow_legacy }
     }
 }
 
@@ -251,7 +251,7 @@ impl LlmHandler {
         // connection (not per stream): a stranger who verifies on the first
         // stream is registered and every later stream on the same connection
         // is then implicitly from a "known" peer for the rest of its lifetime.
-        let mut known = registry::find_by_node_id(&remote_id).is_some();
+        let mut known = registry::find_by_endpoint_id(&remote_id).is_some();
         let mut first_stream = true;
 
         // Each bi stream is an independent LLM session, so one connection can
@@ -270,7 +270,7 @@ impl LlmHandler {
 
             if first_stream && !known {
                 let device_name = format!("llm-{}", &remote[..8.min(remote.len())]);
-                match gate_stranger(&mut reader, self.my_node_id, self.allow_legacy, &remote, &device_name, "llm").await
+                match gate_stranger(&mut reader, self.my_endpoint_id, self.allow_legacy, &remote, &device_name, "llm").await
                 {
                     GateOutcome::Admit { replay } => {
                         known = true; // don't re-gate later streams on this connection

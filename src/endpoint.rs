@@ -41,7 +41,7 @@ pub async fn bind_machine_endpoint() -> Result<(Endpoint, String)> {
 }
 
 /// Print a boxed startup banner: a centered `title`, then each of `body` on
-/// its own line. Callers format `body` with whatever's relevant (ticket, node
+/// its own line. Callers format `body` with whatever's relevant (ticket, endpoint
 /// id, ALPNs, HTTP endpoint, …) — this just owns the shared framing.
 pub fn print_banner(title: &str, body: &[String]) {
     const INNER_WIDTH: usize = 60;

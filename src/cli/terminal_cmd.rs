@@ -124,7 +124,7 @@ pub(super) struct NewArgs {
 #[derive(Debug, Clone, clap::Args)]
 pub(super) struct ListArgs {
     /// Machine-readable output: a JSON array of
-    /// `{name,pid,alive,node_id,invite_url,started_at}`.
+    /// `{name,pid,alive,endpoint_id,invite_url,started_at}`.
     #[arg(long)]
     json: bool,
 }
@@ -176,7 +176,7 @@ pub(super) async fn run(args: TerminalArgs) -> Result<()> {
 /// persist), so this is a no-op either way for `terminal new`'s detached
 /// hosts.
 pub(super) struct HostedTerminal {
-    pub(super) node_id: EndpointId,
+    pub(super) endpoint_id: EndpointId,
     pub(super) invite_url: String,
     pub(super) session_id: String,
     pub(super) router: Router,
@@ -205,7 +205,7 @@ pub(super) async fn host_session(
     let (endpoint, ticket) = crate::endpoint::bind_endpoint_with_secret(session.secret.clone())
         .await
         .context("binding the terminal session's endpoint")?;
-    let my_node_id = endpoint.id();
+    let my_endpoint_id = endpoint.id();
 
     let argv: Option<Vec<String>> =
         cmd.map(|c| shell_words::split(c).context("parsing --cmd")).transpose()?;
@@ -222,10 +222,10 @@ pub(super) async fn host_session(
     }
 
     let router = Router::builder(endpoint)
-        .accept(LLM_ALPN, LlmHandler::new(None, my_node_id, allow_legacy))
+        .accept(LLM_ALPN, LlmHandler::new(None, my_endpoint_id, allow_legacy))
         .accept(
             TERM_ALPN,
-            TermHandler::new(my_node_id, allow_legacy, name_override, description_override, session_ttl)
+            TermHandler::new(my_endpoint_id, allow_legacy, name_override, description_override, session_ttl)
                 .with_default_session(session_id.clone()),
         )
         .spawn();
@@ -237,12 +237,12 @@ pub(super) async fn host_session(
             None => qr::pairing_url(&ticket),
         };
 
-    Ok(HostedTerminal { node_id: my_node_id, invite_url, session_id, router, _session: session })
+    Ok(HostedTerminal { endpoint_id: my_endpoint_id, invite_url, session_id, router, _session: session })
 }
 
 async fn cmd_bare(args: TerminalArgs) -> Result<()> {
     let hosted = host_session(None, None, args.name, args.desc, args.session_ttl, args.allow_legacy).await?;
-    print_connect_block(&hosted.node_id.to_string(), &hosted.invite_url);
+    print_connect_block(&hosted.endpoint_id.to_string(), &hosted.invite_url);
     wait_until_session_ends_or_ctrl_c(&hosted.session_id).await;
     term::kill_all_sessions();
     let _ = tokio::time::timeout(Duration::from_secs(5), hosted.router.shutdown()).await;
@@ -265,7 +265,7 @@ async fn cmd_host_detached(args: TerminalArgs) -> Result<()> {
     let state = SessionState {
         name: name.clone(),
         pid: std::process::id(),
-        node_id: hosted.node_id.to_string(),
+        endpoint_id: hosted.endpoint_id.to_string(),
         invite_url: hosted.invite_url.clone(),
         started_at: now_secs(),
     };
@@ -273,7 +273,7 @@ async fn cmd_host_detached(args: TerminalArgs) -> Result<()> {
         warn!(error = %e, "terminal: failed to write runtime state file");
     }
 
-    print_connect_block(&hosted.node_id.to_string(), &hosted.invite_url);
+    print_connect_block(&hosted.endpoint_id.to_string(), &hosted.invite_url);
 
     wait_until_session_ends_or_signal(&hosted.session_id).await;
 
@@ -321,9 +321,9 @@ async fn wait_until_session_ends_or_signal(session_id: &str) {
 /// Build the connect block's text: session identity, invite URL, and its
 /// Unicode QR. Pure (no I/O) so it's directly unit-testable; [`print_connect_block`]
 /// is the thin I/O wrapper both `azula run` and `azula terminal` use.
-pub(super) fn format_connect_block(node_id: &str, invite_url: &str) -> String {
+pub(super) fn format_connect_block(endpoint_id: &str, invite_url: &str) -> String {
     let qr = qr::render_qr(invite_url);
-    let short: String = node_id.chars().take(8).collect();
+    let short: String = endpoint_id.chars().take(8).collect();
     format!(
         "\n  azula session: {short}…\n\n  {invite_url}\n\n{qr}\n  Scan with your phone, run `azula terminal attach {invite_url}` from another shell, or open the URL.\n\n"
     )
@@ -333,8 +333,8 @@ pub(super) fn format_connect_block(node_id: &str, invite_url: &str) -> String {
 /// connect block to stderr AND stdout" — stderr so it survives even when
 /// stdout is redirected into a CI log parser, stdout so a human tailing the
 /// job output still sees it inline).
-pub(super) fn print_connect_block(node_id: &str, invite_url: &str) {
-    let block = format_connect_block(node_id, invite_url);
+pub(super) fn print_connect_block(endpoint_id: &str, invite_url: &str) {
+    let block = format_connect_block(endpoint_id, invite_url);
     print!("{block}");
     let _ = std::io::stdout().flush();
     eprint!("{block}");
@@ -349,7 +349,7 @@ pub(super) fn print_connect_block(node_id: &str, invite_url: &str) {
 pub(super) struct SessionState {
     pub(super) name: String,
     pub(super) pid: u32,
-    pub(super) node_id: String,
+    pub(super) endpoint_id: String,
     pub(super) invite_url: String,
     pub(super) started_at: u64,
 }
@@ -473,7 +473,7 @@ async fn cmd_new(args: NewArgs) -> Result<()> {
         if let Some(state) = read_state(&name) {
             println!("Started detached terminal session '{name}' (pid {}).", state.pid);
             println!("Logs: {}", dir.display());
-            print_connect_block(&state.node_id, &state.invite_url);
+            print_connect_block(&state.endpoint_id, &state.invite_url);
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -500,7 +500,7 @@ fn cmd_list(args: ListArgs) -> Result<()> {
                     "name": s.name,
                     "pid": s.pid,
                     "alive": pid_alive(s.pid),
-                    "node_id": s.node_id,
+                    "endpoint_id": s.endpoint_id,
                     "invite_url": s.invite_url,
                     "started_at": s.started_at,
                 })
@@ -771,7 +771,7 @@ mod tests {
         SessionState {
             name: name.to_string(),
             pid,
-            node_id: "deadbeef".to_string(),
+            endpoint_id: "deadbeef".to_string(),
             invite_url: "https://azula.app/i/azitest".to_string(),
             started_at: 1_767_225_600,
         }
@@ -783,7 +783,7 @@ mod tests {
     fn format_connect_block_contains_the_invite_url_and_a_qr() {
         let block = format_connect_block("abcdef1234567890", "https://azula.app/i/azitest");
         assert!(block.contains("https://azula.app/i/azitest"), "{block}");
-        assert!(block.contains("abcdef12"), "expected a short node id: {block}");
+        assert!(block.contains("abcdef12"), "expected a short endpoint id: {block}");
         // The QR renderer emits dense block characters; a real invite string
         // is always long enough to produce a non-trivial code.
         assert!(block.contains('█') || block.contains('▀') || block.contains('▄'), "expected QR art: {block}");
@@ -918,7 +918,7 @@ mod tests {
         write_state(&SessionState {
             name: "work".to_string(),
             pid: 1,
-            node_id: "abcd".to_string(),
+            endpoint_id: "abcd".to_string(),
             invite_url: format!("https://azula.app/i/{}", payload.encode()),
             started_at: 0,
         })

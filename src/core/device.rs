@@ -1,6 +1,6 @@
 //! Per-device connection state: the live device map, dialing (outbound) and
 //! the accept-side handler (inbound) that registers azula app / peer-bridge
-//! connections, and reconnect-by-node-id matching.
+//! connections, and reconnect-by-endpoint-id matching.
 //!
 //! Both directions converge on the same [`DeviceMap`]: `connect_device` fills
 //! in an entry when a [`super::SessionCore`] dials out, and
@@ -314,20 +314,20 @@ async fn flush_mailbox(device: &str, send: &mut SendStream) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Node-id matching — reconnect recognition
+// Endpoint-id matching — reconnect recognition
 // ---------------------------------------------------------------------------
 
-/// Given the node id of an inbound connection, look it up against all known
+/// Given the endpoint id of an inbound connection, look it up against all known
 /// devices (from the in-memory map and the registry) and return the existing
 /// device name if a ticket matches.
 ///
 /// This is a pure function (no I/O) so it is easily unit-tested.
 pub(crate) fn match_known_device(
-    remote_node_id: &EndpointId,
+    remote_endpoint_id: &EndpointId,
     map_devices: &HashMap<String, DeviceConn>,
     registry_devices: &[Device],
 ) -> Option<String> {
-    let remote_str = remote_node_id.to_string();
+    let remote_str = remote_endpoint_id.to_string();
 
     // Chain in-memory map entries and registry entries together, preferring
     // in-memory (project wins, same as registry::load()).
@@ -369,9 +369,9 @@ pub(crate) struct BridgeAcceptHandler {
     /// The name this bridge announces to apps that connect in (the conversation
     /// title on the phone), e.g. "Claude".
     own_name: String,
-    /// Our own node id — the invite-verification audience (rule 2: the
+    /// Our own endpoint id — the invite-verification audience (rule 2: the
     /// invite's embedded ticket must name *us*) and signature-verification key.
-    my_node_id: EndpointId,
+    my_endpoint_id: EndpointId,
     /// Admit invite-less strangers as unverified pending devices instead of
     /// closing the connection (transition escape hatch; `--allow-legacy`,
     /// default on for one release per the invitations spec).
@@ -389,7 +389,7 @@ impl BridgeAcceptHandler {
         devices: DeviceMap,
         bind: String,
         own_name: String,
-        my_node_id: EndpointId,
+        my_endpoint_id: EndpointId,
         allow_legacy: bool,
         own_cert: String,
     ) -> Self {
@@ -397,7 +397,7 @@ impl BridgeAcceptHandler {
             devices,
             bind,
             own_name,
-            my_node_id,
+            my_endpoint_id,
             allow_legacy,
             own_cert,
             scan_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -413,7 +413,7 @@ impl ProtocolHandler for BridgeAcceptHandler {
             self.bind.clone(),
             self.own_name.clone(),
             self.scan_counter.clone(),
-            self.my_node_id,
+            self.my_endpoint_id,
             self.allow_legacy,
             self.own_cert.clone(),
         )
@@ -433,7 +433,7 @@ async fn accept_incoming(
     bind: String,
     own_name: String,
     counter: Arc<std::sync::atomic::AtomicU32>,
-    my_node_id: EndpointId,
+    my_endpoint_id: EndpointId,
     allow_legacy: bool,
     own_cert: String,
 ) -> Result<()> {
@@ -448,18 +448,18 @@ async fn accept_incoming(
 
     info!(%fallback_name, "bridge: incoming connection");
 
-    // --- Node-id match: check if this is a known registered device ---
+    // --- Endpoint-id match: check if this is a known registered device ---
     // Snapshot current map entries and registry to avoid holding the lock
     // across async I/O (the bi-stream accept and frame read below).
-    let node_id_match: Option<String> = {
+    let endpoint_id_match: Option<String> = {
         let guard = devices.lock().await;
         let reg = registry::load();
         match_known_device(&remote_id, &guard, &reg)
     };
-    if let Some(ref matched) = node_id_match {
-        info!(peer=%matched, "bridge: recognised reconnecting device by node id");
+    if let Some(ref matched) = endpoint_id_match {
+        info!(peer=%matched, "bridge: recognised reconnecting device by endpoint id");
     }
-    let known = node_id_match.is_some();
+    let known = endpoint_id_match.is_some();
 
     // The dialer opens the bi stream.
     let (mut send, recv) = connection.accept_bi().await?;
@@ -488,7 +488,7 @@ async fn accept_incoming(
             _ => None,
         };
         match invite_token {
-            Some(tok) => match invite::verify_inbound(&tok, my_node_id, &my_node_id) {
+            Some(tok) => match invite::verify_inbound(&tok, my_endpoint_id, &my_endpoint_id) {
                 Ok(v) => {
                     info!(%fallback_name, invite_id = %v.invite_id, "bridge: stranger presented a valid invite");
                     verified = Some(v);
@@ -512,24 +512,24 @@ async fn accept_incoming(
     }
 
     // Read the very first frame to determine the peer's name.
-    // Priority: (1) node-id matched known device, (2) Hello frame, (3) scan-<id>.
+    // Priority: (1) endpoint-id matched known device, (2) Hello frame, (3) scan-<id>.
     let recognised = known;
     let (peer_name, pending_frame, from_app) = match first_frame {
         Ok(Some(Frame::Hello { name, .. })) => {
-            // An azula app announces its 64-hex node id as the Hello name; a peer
+            // An azula app announces its 64-hex endpoint id as the Hello name; a peer
             // bridge announces a "bridge-…" name. Only app clients get our reply.
-            let looks_like_node_id = name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit());
-            // Node-id match takes priority over hello name (a registered device
+            let looks_like_endpoint_id = name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit());
+            // Endpoint-id match takes priority over hello name (a registered device
             // dialling in IS that device, regardless of what name it advertises).
-            let resolved = node_id_match.unwrap_or_else(|| {
+            let resolved = endpoint_id_match.unwrap_or_else(|| {
                 if name.trim().is_empty() { fallback_name.clone() } else { name }
             });
             info!(peer=%resolved, "bridge: hello from peer");
-            (resolved, None, recognised || looks_like_node_id)
+            (resolved, None, recognised || looks_like_endpoint_id)
         }
         Ok(Some(other)) => {
-            // Non-hello first frame — use node-id match or fallback name, replay frame.
-            let resolved = node_id_match.unwrap_or(fallback_name.clone());
+            // Non-hello first frame — use endpoint-id match or fallback name, replay frame.
+            let resolved = endpoint_id_match.unwrap_or(fallback_name.clone());
             (resolved, Some(other), recognised)
         }
         Ok(None) | Err(_) => {

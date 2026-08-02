@@ -1,6 +1,6 @@
 //! Integration and unit tests for the bridge: the frame-reader → inbox path,
 //! bridge-to-bridge `say` relaying (with the turn cap), the offline mailbox
-//! queue/flush path, and reconnect-by-node-id matching (both the pure helper
+//! queue/flush path, and reconnect-by-endpoint-id matching (both the pure helper
 //! and the full accept-side flow).
 
 use std::collections::HashMap;
@@ -499,7 +499,7 @@ async fn bridge_to_bridge_relay() {
 async fn offline_queue_then_flush() {
     // Holds ENV_TEST_LOCK for the whole body — see its doc comment: this test
     // mutates the process-global AZULA_MAILBOX_DIR, which
-    // `reconnect_by_node_id_flushes_mailbox` also mutates (both queue frames
+    // `reconnect_by_endpoint_id_flushes_mailbox` also mutates (both queue frames
     // for a device named "phone"), and cargo test runs them concurrently by
     // default — unguarded, either test's `has_pending("phone")` can resolve
     // against the other's directory, or lose the var to the other's cleanup.
@@ -681,11 +681,11 @@ async fn render_ui_to_an_offline_device_with_a_relay_reports_queued() {
 // -----------------------------------------------------------------------
 
 /// Verifies that `match_known_device` finds a device whose ticket encodes
-/// the given remote node id and returns its name, and returns None when
+/// the given remote endpoint id and returns its name, and returns None when
 /// no ticket matches.
 #[tokio::test]
-async fn match_known_device_by_node_id() {
-    // Build two iroh endpoints to get real, distinct node ids.
+async fn match_known_device_by_endpoint_id() {
+    // Build two iroh endpoints to get real, distinct endpoint ids.
     let ep_phone = Endpoint::bind(presets::Minimal).await.unwrap();
     let ep_other = Endpoint::bind(presets::Minimal).await.unwrap();
 
@@ -710,21 +710,21 @@ async fn match_known_device_by_node_id() {
     assert_eq!(
         match_known_device(&phone_id, &map, &reg),
         Some("phone".to_string()),
-        "phone's node id should match 'phone'"
+        "phone's endpoint id should match 'phone'"
     );
 
     // other_id → "other"
     assert_eq!(
         match_known_device(&other_id, &map, &reg),
         Some("other".to_string()),
-        "other's node id should match 'other'"
+        "other's endpoint id should match 'other'"
     );
 
     // stranger_id → None (not in map or registry)
     assert_eq!(
         match_known_device(&stranger_id, &map, &reg),
         None,
-        "unknown node id should return None"
+        "unknown endpoint id should return None"
     );
 
     // Now test registry path: device only in registry, not in map.
@@ -751,7 +751,7 @@ async fn match_known_device_by_node_id() {
     assert_eq!(
         match_known_device(&phone_id, &map, &reg_conflict),
         Some("phone".to_string()),
-        "in-memory map should win over registry for same node id"
+        "in-memory map should win over registry for same endpoint id"
     );
 
     ep_phone.close().await;
@@ -760,14 +760,14 @@ async fn match_known_device_by_node_id() {
 }
 
 // -----------------------------------------------------------------------
-// Integration test: reconnecting device is matched by node id, mail flushed
+// Integration test: reconnecting device is matched by endpoint id, mail flushed
 // -----------------------------------------------------------------------
 
 /// A registered device "phone" reconnects by dialling the bridge.
-/// `accept_incoming` should recognise it by node id (not assign scan-<id>)
+/// `accept_incoming` should recognise it by endpoint id (not assign scan-<id>)
 /// and flush the offline mailbox.
 #[tokio::test]
-async fn reconnect_by_node_id_flushes_mailbox() {
+async fn reconnect_by_endpoint_id_flushes_mailbox() {
     // Holds ENV_TEST_LOCK for the whole body — see its doc comment: this test
     // mutates the process-global AZULA_MAILBOX_DIR, which
     // `offline_queue_then_flush` also mutates (both queue frames for a device
@@ -857,7 +857,7 @@ async fn reconnect_by_node_id_flushes_mailbox() {
     }
     assert!(
         registered_as_phone,
-        "bridge should register the inbound connection under 'phone' (node-id match)"
+        "bridge should register the inbound connection under 'phone' (endpoint-id match)"
     );
 
     // Confirm no scan- entry was created.

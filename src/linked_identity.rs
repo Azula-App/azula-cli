@@ -2,7 +2,7 @@
 //! via `azula link`: the granted device certificate and identity bundle
 //! delivered by `LinkGrant` (`certs::DeviceCert` / `proto::IdentityBundle`).
 //!
-//! The device's own node secret is persisted separately, under its own
+//! The device's own endpoint secret is persisted separately, under its own
 //! named identity ([`NODE_IDENTITY_NAME`], via
 //! `identity::load_or_create_secret`) — distinct from `serve`/`bridge`/
 //! `blackjack`'s own persistent identities, per the device-linking spec's
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::proto::IdentityBundle;
 
-/// The named identity `azula link`/`azula mailbox` persist their node
+/// The named identity `azula link`/`azula mailbox` persist their endpoint
 /// secret under (`identity::load_or_create_secret(NODE_IDENTITY_NAME)`,
 /// `~/.azula/link.key`) — distinct from `"serve"`/`"bridge"`/`"blackjack"`.
 pub const NODE_IDENTITY_NAME: &str = "link";
@@ -59,7 +59,7 @@ fn file_path() -> Option<PathBuf> {
 /// Load the persisted linked identity, if `azula link` has ever completed
 /// successfully. `None` if never linked, or the file is missing/corrupt —
 /// per "Device Registry Persistence", losing this cache degrades to
-/// re-linking, never to identity loss (the underlying node key survives
+/// re-linking, never to identity loss (the underlying endpoint key survives
 /// independently, under [`NODE_IDENTITY_NAME`]).
 pub fn load() -> Option<LinkedIdentity> {
     let path = file_path()?;
@@ -102,7 +102,7 @@ mod tests {
                 revocations: vec![],
                 contacts: vec![Contact {
                     root_pk: Some("contact-root".into()),
-                    node_id: None,
+                    endpoint_id: None,
                     name: Some("Alice".into()),
                 }],
                 mailbox: None,

@@ -24,7 +24,7 @@ arrow keys recall history, Tab completes, Ctrl-C interrupts.
 
 ## Notes
 
-- The node identity is persisted in the `azula-identity` volume, so the connect
+- The endpoint identity is persisted in the `azula-identity` volume, so the connect
   code stays the same across `docker compose restart`.
 - Needs outbound internet (iroh relays/discovery + TLS via `ca-certificates`).
 - Stop with `docker compose down` (add `-v` to also wipe the identity volume).

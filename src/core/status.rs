@@ -10,7 +10,7 @@ use serde::Serialize;
 pub struct MachineIdentityStatus {
     pub present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
+    pub endpoint_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,9 +44,9 @@ pub fn compute() -> StatusReport {
     let machine_identity = match crate::identity::load_machine_secret_if_exists() {
         Some(secret) => MachineIdentityStatus {
             present: true,
-            node_id: Some(data_encoding::HEXLOWER.encode(secret.public().as_bytes())),
+            endpoint_id: Some(data_encoding::HEXLOWER.encode(secret.public().as_bytes())),
         },
-        None => MachineIdentityStatus { present: false, node_id: None },
+        None => MachineIdentityStatus { present: false, endpoint_id: None },
     };
 
     StatusReport { machine_identity, devices: device_statuses(), sessions: session_statuses() }
@@ -130,9 +130,9 @@ pub fn render_human(report: &StatusReport) -> String {
     let mut out = String::new();
 
     match &report.machine_identity {
-        MachineIdentityStatus { present: true, node_id: Some(id) } => {
+        MachineIdentityStatus { present: true, endpoint_id: Some(id) } => {
             let short = &id[..8.min(id.len())];
-            out.push_str(&format!("Machine identity: present (node {short}…)\n"));
+            out.push_str(&format!("Machine identity: present (endpoint {short}…)\n"));
         }
         _ => out.push_str("Machine identity: none (headless — sessions self-certify)\n"),
     }
@@ -210,7 +210,7 @@ mod tests {
         // No machine.key/bridge.key seeded — headless case.
         let report = compute();
         assert!(!report.machine_identity.present);
-        assert!(report.machine_identity.node_id.is_none());
+        assert!(report.machine_identity.endpoint_id.is_none());
 
         assert_eq!(report.devices.len(), 1);
         assert_eq!(report.devices[0].name, "phone");
@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compute_reports_present_machine_identity_with_hex_node_id() {
+    async fn compute_reports_present_machine_identity_with_hex_endpoint_id() {
         let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!("azula-status-machine-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -247,7 +247,7 @@ mod tests {
 
         let report = compute();
         assert!(report.machine_identity.present);
-        assert_eq!(report.machine_identity.node_id.as_deref(), Some(expected_hex.as_str()));
+        assert_eq!(report.machine_identity.endpoint_id.as_deref(), Some(expected_hex.as_str()));
 
         std::env::remove_var("AZULA_REGISTRY_DIR");
         std::env::remove_var("AZULA_SESSIONS_DIR");

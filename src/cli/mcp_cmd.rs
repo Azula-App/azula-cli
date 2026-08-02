@@ -24,7 +24,7 @@ pub(super) struct McpArgs {
 
     /// Display name for this session (sent as `hello` to peer bridges/the app
     /// so they can identify it by name). Defaults to "Claude" over stdio, or
-    /// `bridge-<first 8 chars of node id>` over `--http`.
+    /// `bridge-<first 8 chars of endpoint id>` over `--http`.
     #[arg(long, value_name = "NAME")]
     pub(super) name: Option<String>,
 
@@ -56,7 +56,7 @@ pub(super) async fn run(args: McpArgs) -> Result<()> {
     let devices = args.device.clone().unwrap_or_default();
     // Preserve each pre-restructure command's own default: stdio (the old
     // `mcp`) defaulted the announced name to "Claude"; `--http` (the old
-    // `serve-mcp`) had no default, falling back to `bridge-<node id>` inside
+    // `serve-mcp`) had no default, falling back to `bridge-<endpoint id>` inside
     // `core::establish`.
     let name = args.name.clone().or_else(|| if args.http.is_none() { Some("Claude".to_string()) } else { None });
 
