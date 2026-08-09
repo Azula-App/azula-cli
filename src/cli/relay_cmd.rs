@@ -9,15 +9,11 @@ use anyhow::Result;
 
 use crate::mailbox_role;
 
-/// Options for `azula relay`.
+/// Options for `azula relay`. Takes none — the invite gate is
+/// unconditional since the legacy escape hatch was retired.
 #[derive(Debug, Clone, clap::Args)]
-pub(super) struct RelayArgs {
-    /// Admit invite-less unverified strangers instead of closing the
-    /// connection (same convention as `serve`/`serve-mcp`/`mailbox`).
-    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
-    pub(super) allow_legacy: bool,
-}
+pub(super) struct RelayArgs {}
 
-pub(super) async fn cmd_relay(args: RelayArgs) -> Result<()> {
-    mailbox_role::run(args.allow_legacy).await
+pub(super) async fn cmd_relay(_args: RelayArgs) -> Result<()> {
+    mailbox_role::run().await
 }

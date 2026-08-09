@@ -121,9 +121,6 @@ const TTL_REAP_INTERVAL: Duration = Duration::from_secs(30);
 pub struct TermHandler {
     /// Our own endpoint id — the invite-verification audience and signature key.
     my_endpoint_id: EndpointId,
-    /// Admit invite-less strangers as unverified instead of closing the
-    /// connection (`--allow-legacy`, default on for one release).
-    allow_legacy: bool,
     /// `--name` override for the terminal's announced `Frame::Profile.name`;
     /// falls back to this machine's hostname when unset.
     name_override: Option<String>,
@@ -147,14 +144,12 @@ pub struct TermHandler {
 impl TermHandler {
     pub fn new(
         my_endpoint_id: EndpointId,
-        allow_legacy: bool,
         name_override: Option<String>,
         description_override: Option<String>,
         session_ttl: Option<Duration>,
     ) -> Self {
         TermHandler {
             my_endpoint_id,
-            allow_legacy,
             name_override,
             description_override,
             session_ttl,
@@ -179,7 +174,6 @@ impl ProtocolHandler for TermHandler {
         handle(
             connection,
             self.my_endpoint_id,
-            self.allow_legacy,
             self.name_override.clone(),
             self.description_override.clone(),
             self.session_ttl,
@@ -193,7 +187,6 @@ impl ProtocolHandler for TermHandler {
 async fn handle(
     connection: Connection,
     my_endpoint_id: EndpointId,
-    allow_legacy: bool,
     name_override: Option<String>,
     description_override: Option<String>,
     session_ttl: Option<Duration>,
@@ -230,14 +223,12 @@ async fn handle(
         };
 
         let mut reader = BufReader::new(recv);
-        let mut first_frame: Option<Frame> = None;
 
         if first_stream && !known {
             let device_name = format!("term-{}", &remote[..8.min(remote.len())]);
-            match gate_stranger(&mut reader, my_endpoint_id, allow_legacy, &remote, &device_name, "term").await {
-                GateOutcome::Admit { replay } => {
+            match gate_stranger(&mut reader, my_endpoint_id, &remote, &device_name, "term").await {
+                GateOutcome::Admit => {
                     known = true; // don't re-gate later streams on this connection
-                    first_frame = replay.map(|b| *b);
                 }
                 GateOutcome::Close => return Ok(()),
             }
@@ -255,7 +246,7 @@ async fn handle(
         let default_session = default_session.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                term_session(send, reader, first_frame, remote.clone(), remote_id, profile, session_ttl, default_session).await
+                term_session(send, reader, remote.clone(), remote_id, profile, session_ttl, default_session).await
             {
                 warn!(%remote, error = %e, "term: session error");
             }
@@ -491,8 +482,8 @@ fn new_session_id() -> String {
 /// verified invite against this process. That second check is
 /// `registry::find_by_endpoint_id(&requester).is_some()`: `accept_gate::
 /// gate_stranger` only ever calls `registry::add` for a stranger on the
-/// *verified-invite* path (never for an `--allow-legacy` fallback, and never
-/// re-run for an already-known peer) — see `handle`'s gating call site — so a
+/// *verified-invite* path (never re-run for an already-known peer) — see
+/// `handle`'s gating call site — so a
 /// hit there is exactly "this peer has redeemed a valid invite issued by
 /// this endpoint id." A host-created session's process mints exactly one such
 /// invite (`spawn_host_shell_session`'s caller), so that's unambiguously
@@ -781,7 +772,6 @@ async fn read_bounded_frame(
 async fn term_session(
     send: SendStream,
     mut reader: BufReader<RecvStream>,
-    first_frame: Option<Frame>,
     remote: String,
     remote_id: EndpointId,
     profile: ProfileAnnounce,
@@ -799,7 +789,7 @@ async fn term_session(
 
     // Announce this terminal's identity before any shell output, so the app
     // names the conversation from the very first frame it sees. Reused for
-    // both known devices and invite-verified/allow-legacy strangers — see the
+    // both known devices and invite-verified strangers — see the
     // `profile_sent` comment in `handle` for why this is once per connection.
     if profile.send {
         let profile_frame = Frame::Profile {
@@ -813,19 +803,15 @@ async fn term_session(
         }
     }
 
-    // Resolve the stream's leading frame: the accept gate's replay if it ran,
-    // else a fresh bounded read. Both are treated identically from here on —
-    // this is the TRAP called out in the module docs: a gate replay MUST be
-    // checked for `TermAttach` too.
-    let leading_frame: Option<Frame> = match first_frame {
-        Some(f) => Some(f),
-        None => match read_bounded_frame(&mut reader, &remote, "the first frame").await {
-            Ok(f) => f,
-            Err(()) => {
-                let _ = send.finish();
-                return Ok(());
-            }
-        },
+    // Resolve the stream's leading frame. The accept gate never leaves one
+    // behind — it admits only a `Hello` and consumes it whole — so this is
+    // always a fresh bounded read.
+    let leading_frame: Option<Frame> = match read_bounded_frame(&mut reader, &remote, "the first frame").await {
+        Ok(f) => f,
+        Err(()) => {
+            let _ = send.finish();
+            return Ok(());
+        }
     };
 
     // The azula app's `ConnectService.ping()` sends `Frame::Hello` as the
@@ -1469,7 +1455,13 @@ mod tests {
         // ── Server ─────────────────────────────────────────────────────────
         // Use `presets::Minimal` (no public relays / STUN needed) for a
         // purely local, loopback test.
-        let server_ep = Endpoint::bind(presets::Minimal)
+        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        isolate_invites("end_to_end");
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
             .await
             .expect("server endpoint bind");
 
@@ -1477,8 +1469,9 @@ mod tests {
         let server_id = server_ep.id();
 
         let router = Router::builder(server_ep)
-            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(60 * 60))))
+            .accept(TERM_ALPN, TermHandler::new(server_id, None, None, Some(Duration::from_secs(60 * 60))))
             .spawn();
+        let token = mint_for(&server_secret, server_addr.clone());
 
         // ── Client ─────────────────────────────────────────────────────────
         let client_ep = Endpoint::bind(presets::Minimal)
@@ -1493,7 +1486,7 @@ mod tests {
 
         // The protocol requires the dialer to write first (server does
         // `accept_bi`, which blocks until the client sends data).
-        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        let (mut send, recv) = open_gated_bi(&conn, &token).await;
 
         // Write the echo command.  The PTY will echo the typed text and then
         // print the command's output, both as `Frame::Term` chunks.
@@ -1556,18 +1549,32 @@ mod tests {
     /// remote shell multiplexes many terminals over a single connection.
     #[tokio::test]
     async fn term_two_sessions_over_one_connection() {
-        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        isolate_invites("two_sessions");
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
+            .await
+            .expect("server bind");
         let server_addr = server_ep.addr();
         let server_id = server_ep.id();
         let router = Router::builder(server_ep)
-            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(60 * 60))))
+            .accept(TERM_ALPN, TermHandler::new(server_id, None, None, Some(Duration::from_secs(60 * 60))))
             .spawn();
+        let token = mint_for(&server_secret, server_addr.clone());
 
         let client_ep = Endpoint::bind(presets::Minimal).await.expect("client bind");
         let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
 
-        async fn run_echo(conn: &iroh::endpoint::Connection, marker: &str) -> bool {
-            let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        // Only the connection's first stream is gated; `gate` carries the
+        // invite there and is ignored on the second.
+        async fn run_echo(conn: &iroh::endpoint::Connection, marker: &str, gate: Option<&str>) -> bool {
+            let (mut send, recv) = match gate {
+                Some(token) => open_gated_bi(conn, token).await,
+                None => conn.open_bi().await.expect("open_bi"),
+            };
             write_frame(&mut send, &Frame::Input { text: format!("echo {marker}\n") })
                 .await
                 .expect("write");
@@ -1594,8 +1601,8 @@ mod tests {
         }
 
         // Two independent sessions multiplexed on the SAME connection.
-        let a = run_echo(&conn, "AZULA_SESS_A_11AA").await;
-        let b = run_echo(&conn, "AZULA_SESS_B_22BB").await;
+        let a = run_echo(&conn, "AZULA_SESS_A_11AA", Some(&token)).await;
+        let b = run_echo(&conn, "AZULA_SESS_B_22BB", None).await;
 
         conn.close(0u32.into(), b"done");
         let _ = router.shutdown().await;
@@ -1610,19 +1617,28 @@ mod tests {
     /// overrides passed to `TermHandler::new` end up in that frame verbatim.
     #[tokio::test]
     async fn term_session_sends_profile_before_term_output() {
-        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        isolate_invites("profile_first");
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
+            .await
+            .expect("server bind");
         let server_addr = server_ep.addr();
         let server_id = server_ep.id();
         let router = Router::builder(server_ep)
             .accept(
                 TERM_ALPN,
-                TermHandler::new(server_id, true, Some("Foo".to_string()), Some("/bar".to_string()), Some(Duration::from_secs(60 * 60))),
+                TermHandler::new(server_id, Some("Foo".to_string()), Some("/bar".to_string()), Some(Duration::from_secs(60 * 60))),
             )
             .spawn();
+        let token = mint_for(&server_secret, server_addr.clone());
 
         let client_ep = Endpoint::bind(presets::Minimal).await.expect("client bind");
         let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
-        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        let (mut send, recv) = open_gated_bi(&conn, &token).await;
         write_frame(&mut send, &Frame::Input { text: "echo hi\n".to_string() })
             .await
             .expect("write");
@@ -1654,21 +1670,92 @@ mod tests {
     // Persistent-session tests (Feature 5).
     // -----------------------------------------------------------------------
 
-    /// Spins up a server + client endpoint pair. Returns the router (drop /
-    /// shutdown when done) and a connected `Connection`.
+    /// Spins up a server + client endpoint pair and mints an invite the
+    /// client can redeem. Returns the router (drop / shutdown when done), a
+    /// connected `Connection`, the client endpoint, and the encoded invite
+    /// token to send in the connection's first `Hello`.
+    ///
+    /// The gate admits strangers only against a real issued invite, so this
+    /// touches the invite store and must isolate `AZULA_INVITES_DIR` under
+    /// `ENV_TEST_LOCK` — the caller holds the returned guard for the whole
+    /// test body. `slug` names the per-test store dir.
     async fn start_server_and_connect(
         ttl: Option<Duration>,
-    ) -> (Router, iroh::endpoint::Connection, Endpoint) {
-        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        slug: &str,
+    ) -> (tokio::sync::MutexGuard<'static, ()>, Router, iroh::endpoint::Connection, Endpoint, String) {
+        let guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        let base = std::env::temp_dir()
+            .join(format!("azula-term-test-{}", std::process::id()))
+            .join(slug);
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("AZULA_INVITES_DIR", base.join("invites"));
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
+            .await
+            .expect("server bind");
         let server_addr = server_ep.addr();
         let server_id = server_ep.id();
         let router = Router::builder(server_ep)
-            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None, ttl))
+            .accept(TERM_ALPN, TermHandler::new(server_id, None, None, ttl))
             .spawn();
+
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(server_addr.clone()).to_string();
+        let (payload, _) = crate::invite::mint(
+            &ticket_str,
+            crate::invite::Expiry::Never,
+            false,
+            false,
+            None,
+            &server_secret,
+        )
+        .expect("mint invite");
 
         let client_ep = Endpoint::bind(presets::Minimal).await.expect("client bind");
         let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
-        (router, conn, client_ep)
+        (guard, router, conn, client_ep, payload.encode())
+    }
+
+    /// Point the invite store at a per-test dir. The caller must already
+    /// hold `ENV_TEST_LOCK` (the var is process-global) and keep it for the
+    /// whole body — the server verifies the invite on the accept side, so
+    /// the override has to outlive the connection, not just the mint.
+    fn isolate_invites(slug: &str) {
+        let base = std::env::temp_dir()
+            .join(format!("azula-term-test-{}", std::process::id()))
+            .join(slug);
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("AZULA_INVITES_DIR", base.join("invites"));
+    }
+
+    /// Mint a multi-use, never-expiring invite for `secret`'s own endpoint —
+    /// what a server's connect block hands out. Multi-use so one token can
+    /// admit several test peers.
+    fn mint_for(secret: &iroh::SecretKey, addr: iroh::EndpointAddr) -> String {
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(addr).to_string();
+        let (payload, _) =
+            crate::invite::mint(&ticket_str, crate::invite::Expiry::Never, false, false, None, secret)
+                .expect("mint invite");
+        payload.encode()
+    }
+
+    /// Open a connection's **first** bi-stream and redeem `token` on it, the
+    /// way a real client does. Later streams on the same connection are
+    /// ungated (the peer is known by then) and can use `open_bi` directly.
+    async fn open_gated_bi(
+        conn: &iroh::endpoint::Connection,
+        token: &str,
+    ) -> (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) {
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        write_frame(
+            &mut send,
+            &Frame::Hello { name: "test-client".into(), invite: Some(token.to_string()), cert: None },
+        )
+        .await
+        .expect("write hello");
+        (send, recv)
     }
 
     /// Reads frames off `reader` until `f` returns `Some`, or `MARKER`-style
@@ -1698,9 +1785,10 @@ mod tests {
     /// fresh id, and the shell works normally.
     #[tokio::test]
     async fn attach_new_creates_a_persistent_session() {
-        let (router, conn, client_ep) = start_server_and_connect(Some(Duration::from_secs(3600))).await;
+        let (_guard, router, conn, client_ep, token) =
+            start_server_and_connect(Some(Duration::from_secs(3600)), "attach_new").await;
 
-        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        let (mut send, recv) = open_gated_bi(&conn, &token).await;
         write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write");
 
         let mut reader = BufReader::new(recv);
@@ -1741,10 +1829,11 @@ mod tests {
     /// detaching shows up in the replay, without re-running anything.
     #[tokio::test]
     async fn detach_reattach_replays_scrollback_without_rerunning() {
-        let (router, conn, client_ep) = start_server_and_connect(Some(Duration::from_secs(3600))).await;
+        let (_guard, router, conn, client_ep, token) =
+            start_server_and_connect(Some(Duration::from_secs(3600)), "detach_reattach").await;
 
         let session_id = {
-            let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+            let (mut send, recv) = open_gated_bi(&conn, &token).await;
             write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write");
             let mut reader = BufReader::new(recv);
             let (id, _resumed) = read_until(&mut reader, |f| match f {
@@ -1807,12 +1896,21 @@ mod tests {
     /// reconnect, not just a new stream on the same connection.
     #[tokio::test]
     async fn reattach_across_connections_with_same_owner_key() {
-        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        isolate_invites("reattach_same_key");
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
+            .await
+            .expect("server bind");
         let server_addr = server_ep.addr();
         let server_id = server_ep.id();
         let router = Router::builder(server_ep)
-            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(3600))))
+            .accept(TERM_ALPN, TermHandler::new(server_id, None, None, Some(Duration::from_secs(3600))))
             .spawn();
+        let token = mint_for(&server_secret, server_addr.clone());
 
         // First connection: create the session.
         let client_secret = iroh::SecretKey::generate();
@@ -1824,7 +1922,7 @@ mod tests {
         let conn1 = client_ep1.connect(server_addr.clone(), TERM_ALPN).await.expect("connect1");
 
         let session_id = {
-            let (mut send, recv) = conn1.open_bi().await.expect("open_bi");
+            let (mut send, recv) = open_gated_bi(&conn1, &token).await;
             write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write");
             let mut reader = BufReader::new(recv);
             let (id, _r) = read_until(&mut reader, |f| match f {
@@ -1847,7 +1945,9 @@ mod tests {
             .await
             .expect("client2 bind");
         let conn2 = client_ep2.connect(server_addr, TERM_ALPN).await.expect("connect2");
-        let (mut send2, recv2) = conn2.open_bi().await.expect("open_bi 2");
+        // Redeeming again is a no-op for a known peer, but this is a brand
+        // new connection so its first stream still goes through the gate.
+        let (mut send2, recv2) = open_gated_bi(&conn2, &token).await;
         write_frame(&mut send2, &Frame::TermAttach { session: Some(session_id.clone()) })
             .await
             .expect("write attach");
@@ -1869,36 +1969,28 @@ mod tests {
         client_ep2.close().await;
     }
 
-    /// A client that never sends `TermAttach` gets the exact legacy
-    /// behavior: no `term_session`/`term_exit` frames ever appear, just plain
-    /// `Frame::Term` output (covered fully by `term_handler_end_to_end`
-    /// above, which is unmodified). This test additionally confirms the
-    /// session registry stays empty for a legacy connection.
+    /// An invite-less stranger is dropped at the gate: no shell, no session,
+    /// no registry entry. This is the retired `--allow-legacy` path — it used
+    /// to be served (its first real frame replayed into a session), and the
+    /// invitations sunset closed it. The unit-level counterpart is
+    /// `accept_gate::no_invite_closes`; this one proves it over real QUIC.
     #[tokio::test]
-    async fn legacy_client_never_creates_a_registry_entry() {
-        let (router, conn, client_ep) = start_server_and_connect(Some(Duration::from_secs(3600))).await;
+    async fn invite_less_stranger_is_closed() {
+        let (_guard, router, conn, client_ep, _token) =
+            start_server_and_connect(Some(Duration::from_secs(3600)), "invite_less").await;
 
+        // No `Hello` at all — straight to a real frame, exactly what a legacy
+        // client did.
         let (mut send, recv) = conn.open_bi().await.expect("open_bi");
-        write_frame(&mut send, &Frame::Input { text: "echo AZULA_LEGACY_NO_REGISTRY\n".to_string() })
+        write_frame(&mut send, &Frame::Input { text: "echo AZULA_SHOULD_NOT_RUN\n".to_string() })
             .await
             .expect("write");
-        let mut reader = BufReader::new(recv);
-        let saw = read_until(&mut reader, |f| match f {
-            Frame::Term { line } if line.contains("AZULA_LEGACY_NO_REGISTRY") => Some(()),
-            _ => None,
-        })
-        .await;
-        assert!(saw.is_some());
 
-        // No term_session frame should ever have been sent for this stream —
-        // best-effort check: read a tiny bit more with a short timeout and
-        // confirm nothing but Term frames arrive.
-        let unexpected = timeout(Duration::from_millis(300), read_frame(&mut reader)).await;
-        if let Ok(Ok(Some(frame))) = unexpected {
-            assert!(
-                matches!(frame, Frame::Term { .. }),
-                "legacy stream must never see a term_session/term_exit frame, got {frame:?}"
-            );
+        let mut reader = BufReader::new(recv);
+        let got = timeout(Duration::from_secs(5), read_frame(&mut reader)).await;
+        match got {
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {} // closed, or nothing ever arrives
+            Ok(Ok(Some(frame))) => panic!("invite-less stranger must be dropped, got {frame:?}"),
         }
 
         let _ = send.finish();
@@ -1913,10 +2005,11 @@ mod tests {
     /// (`resumed: false`), not a replay of the old one.
     #[tokio::test]
     async fn session_ttl_zero_kills_on_detach_instead_of_persisting() {
-        let (router, conn, client_ep) = start_server_and_connect(None).await;
+        let (_guard, router, conn, client_ep, token) =
+            start_server_and_connect(None, "ttl_zero").await;
 
         let session_id = {
-            let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+            let (mut send, recv) = open_gated_bi(&conn, &token).await;
             write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write");
             let mut reader = BufReader::new(recv);
             let (id, resumed) = read_until(&mut reader, |f| match f {
@@ -1958,9 +2051,10 @@ mod tests {
     /// later attach with the same id creates a fresh session).
     #[tokio::test]
     async fn shell_exit_sends_term_exit_and_removes_session() {
-        let (router, conn, client_ep) = start_server_and_connect(Some(Duration::from_secs(3600))).await;
+        let (_guard, router, conn, client_ep, token) =
+            start_server_and_connect(Some(Duration::from_secs(3600)), "shell_exit").await;
 
-        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        let (mut send, recv) = open_gated_bi(&conn, &token).await;
         write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write");
         let mut reader = BufReader::new(recv);
         let (session_id, _resumed) = read_until(&mut reader, |f| match f {
@@ -1990,17 +2084,29 @@ mod tests {
     /// never resumes another owner's session — it silently gets a fresh one.
     #[tokio::test]
     async fn owner_check_prevents_cross_peer_attach() {
-        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server bind");
+        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        isolate_invites("owner_check");
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
+            .await
+            .expect("server bind");
         let server_addr = server_ep.addr();
         let server_id = server_ep.id();
         let router = Router::builder(server_ep)
-            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(3600))))
+            .accept(TERM_ALPN, TermHandler::new(server_id, None, None, Some(Duration::from_secs(3600))))
             .spawn();
+        // Multi-use: both the owner and the second peer redeem it. The point
+        // of this test is the owner check *behind* the gate, so the second
+        // peer has to get past the gate first.
+        let token = mint_for(&server_secret, server_addr.clone());
 
         let owner_ep = Endpoint::bind(presets::Minimal).await.expect("owner bind");
         let owner_conn = owner_ep.connect(server_addr.clone(), TERM_ALPN).await.expect("owner connect");
         let session_id = {
-            let (mut send, recv) = owner_conn.open_bi().await.expect("open_bi");
+            let (mut send, recv) = open_gated_bi(&owner_conn, &token).await;
             write_frame(&mut send, &Frame::TermAttach { session: None }).await.expect("write");
             let mut reader = BufReader::new(recv);
             let (id, _r) = read_until(&mut reader, |f| match f {
@@ -2015,7 +2121,7 @@ mod tests {
 
         let stranger_ep = Endpoint::bind(presets::Minimal).await.expect("stranger bind");
         let stranger_conn = stranger_ep.connect(server_addr, TERM_ALPN).await.expect("stranger connect");
-        let (mut send2, recv2) = stranger_conn.open_bi().await.expect("open_bi stranger");
+        let (mut send2, recv2) = open_gated_bi(&stranger_conn, &token).await;
         write_frame(&mut send2, &Frame::TermAttach { session: Some(session_id.clone()) })
             .await
             .expect("write attach");
@@ -2025,7 +2131,7 @@ mod tests {
             _ => None,
         })
         .await
-        .expect("expected term_session for the stranger too");
+        .expect("expected term_session for the second peer too");
 
         assert_ne!(id2, session_id, "a different owner must never resume someone else's session");
         assert!(!resumed2);
@@ -2083,7 +2189,7 @@ mod tests {
         .expect("register known device");
 
         let router = Router::builder(server_ep)
-            .accept(TERM_ALPN, TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(3600))))
+            .accept(TERM_ALPN, TermHandler::new(server_id, None, None, Some(Duration::from_secs(3600))))
             .spawn();
 
         let conn = client_ep.connect(server_addr, TERM_ALPN).await.expect("connect");
@@ -2227,7 +2333,7 @@ mod tests {
         let router = Router::builder(server_ep)
             .accept(
                 TERM_ALPN,
-                TermHandler::new(server_id, true, None, None, Some(Duration::from_secs(3600)))
+                TermHandler::new(server_id, None, None, Some(Duration::from_secs(3600)))
                     .with_default_session(session_id.clone()),
             )
             .spawn();
@@ -2307,28 +2413,30 @@ mod tests {
         redeemer_ep2.close().await;
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // ── An unrelated third peer — no invite, not the owner — silently
-        // gets a FRESH session instead of the held one. ─────────────────────
+        // ── An unrelated third peer — no invite, not the owner — is dropped
+        // at the gate. It used to be admitted and handed a *fresh* session
+        // (the held one stayed safe); since the invitations sunset it never
+        // gets that far, so the held session is protected by the gate rather
+        // than by the owner check behind it. ────────────────────────────────
         let stranger_ep = Endpoint::bind(presets::Minimal).await.expect("stranger bind");
         let stranger_conn = stranger_ep.connect(server_addr, TERM_ALPN).await.expect("stranger connect");
         let (mut send3, recv3) = stranger_conn.open_bi().await.expect("open_bi 3");
         write_frame(&mut send3, &Frame::TermAttach { session: None }).await.expect("write attach 3");
         let mut reader3 = BufReader::new(recv3);
-        let (id3, resumed3) = read_until(&mut reader3, |f| match f {
-            Frame::TermSession { session, resumed } => Some((session.clone(), *resumed)),
-            _ => None,
-        })
-        .await
-        .expect("expected term_session for the stranger too");
-        assert_ne!(id3, session_id, "an unrelated peer must never resume the held session");
-        assert!(!resumed3);
+        let got3 = timeout(Duration::from_secs(5), read_frame(&mut reader3)).await;
+        match got3 {
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {} // closed, or nothing ever arrives
+            Ok(Ok(Some(frame))) => {
+                panic!("an unrelated invite-less peer must be dropped at the gate, got {frame:?}")
+            }
+        }
 
         let _ = send3.finish();
         stranger_conn.close(0u32.into(), b"done");
         stranger_ep.close().await;
 
+        // Only the held session exists — the dropped peer never got one.
         super::kill_session(&session_id);
-        super::kill_session(&id3);
         let _ = router.shutdown().await;
 
         std::env::remove_var("AZULA_REGISTRY_DIR");

@@ -33,12 +33,6 @@ pub(super) struct McpArgs {
     #[arg(long = "max-turns", value_name = "N", default_value_t = 20)]
     pub(super) max_turns: u64,
 
-    /// Admit invite-less unknown strangers as unverified pending devices
-    /// instead of closing the connection. Transition escape hatch — default
-    /// on for one release, then off (see azula-docs/openspec/specs/invitations/design.md).
-    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
-    pub(super) allow_legacy: bool,
-
     /// Print the raw dial ticket in the startup pairing output instead of
     /// minting a signed 24h invite.
     #[arg(long = "legacy-ticket")]
@@ -62,9 +56,9 @@ pub(super) async fn run(args: McpArgs) -> Result<()> {
 
     match args.http {
         Some(bind) => {
-            crate::bridge::run(bind, devices, name, args.max_turns, args.allow_legacy, args.legacy_ticket, args.session).await
+            crate::bridge::run(bind, devices, name, args.max_turns, args.legacy_ticket, args.session).await
         }
-        None => crate::bridge::run_stdio(devices, name, args.max_turns, args.allow_legacy, args.legacy_ticket, args.session).await,
+        None => crate::bridge::run_stdio(devices, name, args.max_turns, args.legacy_ticket, args.session).await,
     }
 }
 
@@ -90,9 +84,6 @@ pub(super) struct ServeMcpArgs {
     #[arg(long = "max-turns", value_name = "N", default_value_t = 20)]
     max_turns: u64,
 
-    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
-    allow_legacy: bool,
-
     #[arg(long = "legacy-ticket")]
     legacy_ticket: bool,
 
@@ -102,5 +93,5 @@ pub(super) struct ServeMcpArgs {
 
 pub(super) async fn run_serve_mcp_alias(args: ServeMcpArgs) -> Result<()> {
     super::print_deprecation_notice("serve-mcp", "azula mcp --http <bind>");
-    crate::bridge::run(args.bind, args.device.unwrap_or_default(), args.name, args.max_turns, args.allow_legacy, args.legacy_ticket, args.session).await
+    crate::bridge::run(args.bind, args.device.unwrap_or_default(), args.name, args.max_turns, args.legacy_ticket, args.session).await
 }

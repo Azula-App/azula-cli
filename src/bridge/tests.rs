@@ -155,27 +155,45 @@ async fn reader_rejects_oversize_incoming_file() {
 /// bytes on disk. Exercises the exact wire path an LLM client drives.
 #[tokio::test]
 async fn send_file_tool_delivers_over_iroh() {
+    // Bob mints a real invite for Alice to redeem, so this holds
+    // ENV_TEST_LOCK for the whole body — the accept side verifies against
+    // the store, so AZULA_INVITES_DIR must stay overridden past the mint.
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
     let recv_dir = std::env::temp_dir()
         .join(format!("azula-bridge-test-{}", std::process::id()))
         .join("send_file_tool_delivers_over_iroh");
     let _ = std::fs::remove_dir_all(&recv_dir);
     std::env::set_var("AZULA_RECEIVED_DIR", &recv_dir);
+    std::env::set_var("AZULA_INVITES_DIR", recv_dir.join("invites"));
 
     let alice_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
-    let bob_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+    let bob_secret = SecretKey::generate();
+    let bob_raw_ep = Endpoint::builder(presets::Minimal).secret_key(bob_secret.clone()).bind().await.unwrap();
 
     let alice_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
     let bob_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
     let bind_placeholder = "127.0.0.1:0".to_string();
 
-    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true, "azd-test-cert-alice".to_string());
+    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), "azd-test-cert-alice".to_string());
     let alice_router = Router::builder(alice_raw_ep).accept(LLM_ALPN, alice_accept).spawn();
-    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true, "azd-test-cert-bob".to_string());
+    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), "azd-test-cert-bob".to_string());
     let bob_router = Router::builder(bob_raw_ep).accept(LLM_ALPN, bob_accept).spawn();
 
     let alice_ep = Arc::new(alice_router.endpoint().clone());
     let bob_ep = Arc::new(bob_router.endpoint().clone());
     let bob_ticket = EndpointTicket::new(bob_ep.addr()).to_string();
+    // What Bob's connect block hands out: an invite wrapping his own ticket.
+    let bob_invite = crate::invite::mint(
+        &bob_ticket,
+        crate::invite::Expiry::Never,
+        false,
+        false,
+        None,
+        &bob_secret,
+    )
+    .expect("mint bob's invite")
+    .0
+    .encode();
 
     let alice = AzulaBridge::new(alice_ep.clone(), alice_devices.clone(), bind_placeholder.clone(), "alice-ticket".to_string(), "alice".to_string(), 20, true, "azd-test-cert-alice".to_string(), None);
 
@@ -189,7 +207,7 @@ async fn send_file_tool_delivers_over_iroh() {
 
     // Alice connects to Bob, then sends the file.
     let connect_result = alice
-        .connect(Parameters(ConnectArgs { url: bob_ticket.clone(), name: Some("bob".to_string()) }))
+        .connect(Parameters(ConnectArgs { url: bob_invite.clone(), name: Some("bob".to_string()) }))
         .await
         .unwrap();
     assert!(!connect_result.is_error.unwrap_or(false), "connect should succeed: {connect_result:?}");
@@ -236,6 +254,7 @@ async fn send_file_tool_delivers_over_iroh() {
     alice_router.shutdown().await.unwrap();
     bob_router.shutdown().await.unwrap();
     std::env::remove_var("AZULA_RECEIVED_DIR");
+    std::env::remove_var("AZULA_INVITES_DIR");
     let _ = std::fs::remove_dir_all(&recv_dir);
     let _ = std::fs::remove_file(&src_path);
 }
@@ -244,10 +263,21 @@ async fn send_file_tool_delivers_over_iroh() {
 /// Bob says "pong" back. The turn limit is enforced at 3 turns.
 #[tokio::test]
 async fn bridge_to_bridge_relay() {
+    // Bob mints a real invite for Alice to redeem — the accept gate admits
+    // no one without one — so this holds ENV_TEST_LOCK and isolates the
+    // invite store for the whole body.
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+    let invites_dir = std::env::temp_dir()
+        .join(format!("azula-bridge-test-{}", std::process::id()))
+        .join("bridge_to_bridge_relay");
+    let _ = std::fs::remove_dir_all(&invites_dir);
+    std::env::set_var("AZULA_INVITES_DIR", &invites_dir);
+
     // Bind two separate iroh endpoints.  We use Minimal (no relay) so the
     // test works offline; we skip `online()` since that waits for a relay.
     let alice_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
-    let bob_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+    let bob_secret = SecretKey::generate();
+    let bob_raw_ep = Endpoint::builder(presets::Minimal).secret_key(bob_secret.clone()).bind().await.unwrap();
 
     let alice_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
     let bob_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
@@ -255,12 +285,12 @@ async fn bridge_to_bridge_relay() {
     let bind_placeholder = "127.0.0.1:0".to_string();
 
     // Build iroh routers with accept handlers.
-    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), true, "azd-test-cert-alice".to_string());
+    let alice_accept = BridgeAcceptHandler::new(alice_devices.clone(), bind_placeholder.clone(), "Alice".to_string(), alice_raw_ep.id(), "azd-test-cert-alice".to_string());
     let alice_router = Router::builder(alice_raw_ep)
         .accept(LLM_ALPN, alice_accept)
         .spawn();
 
-    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), true, "azd-test-cert-bob".to_string());
+    let bob_accept = BridgeAcceptHandler::new(bob_devices.clone(), bind_placeholder.clone(), "Bob".to_string(), bob_raw_ep.id(), "azd-test-cert-bob".to_string());
     let bob_router = Router::builder(bob_raw_ep)
         .accept(LLM_ALPN, bob_accept)
         .spawn();
@@ -270,6 +300,18 @@ async fn bridge_to_bridge_relay() {
 
     let alice_ticket = EndpointTicket::new(alice_ep.addr()).to_string();
     let bob_ticket = EndpointTicket::new(bob_ep.addr()).to_string();
+    // What Bob's connect block hands out: an invite wrapping his own ticket.
+    let bob_invite = crate::invite::mint(
+        &bob_ticket,
+        crate::invite::Expiry::Never,
+        false,
+        false,
+        None,
+        &bob_secret,
+    )
+    .expect("mint bob's invite")
+    .0
+    .encode();
 
     // Create the AzulaBridge handles.
     let alice = AzulaBridge::new(
@@ -298,7 +340,7 @@ async fn bridge_to_bridge_relay() {
     // Alice connects to Bob.
     let connect_result = alice
         .connect(Parameters(ConnectArgs {
-            url: bob_ticket.clone(),
+            url: bob_invite.clone(),
             name: Some("bob".to_string()),
         }))
         .await
@@ -809,7 +851,7 @@ async fn reconnect_by_endpoint_id_flushes_mailbox() {
     );
 
     // Stand up a bridge accept handler.
-    let bridge_accept = BridgeAcceptHandler::new(bridge_devices.clone(), bind_placeholder.clone(), "Claude".to_string(), bridge_raw_ep.id(), true, "azd-test-cert-bridge".to_string());
+    let bridge_accept = BridgeAcceptHandler::new(bridge_devices.clone(), bind_placeholder.clone(), "Claude".to_string(), bridge_raw_ep.id(), "azd-test-cert-bridge".to_string());
     let bridge_router = Router::builder(bridge_raw_ep)
         .accept(LLM_ALPN, bridge_accept)
         .spawn();

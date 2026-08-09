@@ -71,12 +71,11 @@ pub async fn run(
     device_urls: Vec<String>,
     name: Option<String>,
     max_turns: u64,
-    allow_legacy: bool,
     legacy_ticket: bool,
     session_name: Option<String>,
 ) -> Result<()> {
     let Established { core, session: _session, router: _router } =
-        core::establish(&bind, device_urls, name, allow_legacy, session_name).await?;
+        core::establish(&bind, device_urls, name, session_name).await?;
 
     // MCP server over Streamable HTTP, mounted at /mcp.
     let ep_svc = core.endpoint.clone();
@@ -126,12 +125,11 @@ pub async fn run_stdio(
     device_urls: Vec<String>,
     name: Option<String>,
     max_turns: u64,
-    allow_legacy: bool,
     legacy_ticket: bool,
     session_name: Option<String>,
 ) -> Result<()> {
     let Established { core, session: _session, router: _router } =
-        core::establish("stdio", device_urls, name, allow_legacy, session_name).await?;
+        core::establish("stdio", device_urls, name, session_name).await?;
 
     eprintln!("azula MCP bridge (stdio) online as \"{}\"", core.own_name);
     match startup_invite(&core, legacy_ticket).await {

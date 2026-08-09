@@ -30,24 +30,24 @@ const STRANGER_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Outcome of gating a stranger's first stream.
 pub enum GateOutcome {
-    /// Admit the connection; `replay` is a frame already consumed off the
-    /// stream while gating that the caller must still process (e.g. a
-    /// legacy client's first real frame sent with no preceding `Hello`).
-    Admit { replay: Option<Box<Frame>> },
+    /// Admit the connection. Nothing is ever left over for the caller to
+    /// process: only a `Hello` can pass the gate, and the gate consumes it
+    /// whole. (`gate_peer`'s `GatePeerOutcome` does carry a `replay` — a
+    /// peer known by root match may open with a real frame.)
+    Admit,
     Close,
 }
 
 /// Require the first frame of a stranger's first stream to be a `Hello`
 /// carrying a valid invite (verified against `my_endpoint_id`'s issued-invite
 /// store). Registers the device (as `azula pair` would, named `device_name`)
-/// and marks single-use invites consumed on success. Falls back to admitting
-/// unverified when `allow_legacy` is set (transition escape hatch);
-/// otherwise closes. `component` tags log lines (e.g. `"llm"`, `"term"`) so
+/// and marks single-use invites consumed on success; closes otherwise. There
+/// is no escape hatch — a stranger with no invite, or an invite that fails to
+/// verify, is dropped. `component` tags log lines (e.g. `"llm"`, `"term"`) so
 /// the two callers' logs stay distinguishable.
 pub async fn gate_stranger<R>(
     reader: &mut BufReader<R>,
     my_endpoint_id: EndpointId,
-    allow_legacy: bool,
     remote: &str,
     device_name: &str,
     component: &str,
@@ -72,58 +72,40 @@ where
         Some(tok) => match invite::verify_inbound(&tok, my_endpoint_id, &my_endpoint_id) {
             Ok(v) => {
                 info!(%remote, component, invite_id = %v.invite_id, "stranger presented a valid invite");
-                Some(v)
-            }
-            Err(e) if allow_legacy => {
-                warn!(%remote, component, error = %e, "invite verification failed; admitting as unverified (--allow-legacy)");
-                None
+                v
             }
             Err(e) => {
-                warn!(%remote, component, error = %e, "invite verification failed; closing (pass --allow-legacy to admit anyway)");
+                warn!(%remote, component, error = %e, "invite verification failed; closing");
                 return GateOutcome::Close;
             }
         },
-        None if allow_legacy => {
-            info!(%remote, component, "stranger connected without an invite; admitting as unverified (--allow-legacy)");
-            None
-        }
         None => {
-            warn!(%remote, component, "stranger connected without a valid invite; closing (pass --allow-legacy to admit anyway)");
+            warn!(%remote, component, "stranger connected without a valid invite; closing");
             return GateOutcome::Close;
         }
     };
 
-    if let Some(v) = verified {
-        let device = Device {
-            name: device_name.to_string(),
-            ticket: remote.to_string(),
-            added_at: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            invite: None,
-        };
-        if let Err(e) = registry::add(device, false) {
-            warn!(%remote, component, error = %e, "failed to register invite-verified device");
-        }
-        if v.single_use {
-            if let Err(e) = invite::mark_consumed(&v.invite_id) {
-                warn!(%remote, component, error = %e, "failed to mark invite consumed");
-            }
+    let device = Device {
+        name: device_name.to_string(),
+        ticket: remote.to_string(),
+        added_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ),
+        invite: None,
+    };
+    if let Err(e) = registry::add(device, false) {
+        warn!(%remote, component, error = %e, "failed to register invite-verified device");
+    }
+    if verified.single_use {
+        if let Err(e) = invite::mark_consumed(&verified.invite_id) {
+            warn!(%remote, component, error = %e, "failed to mark invite consumed");
         }
     }
 
-    // A non-Hello first frame (legacy client that sends its real first frame
-    // immediately) must be replayed into the session so it isn't lost; a
-    // Hello frame is fully consumed by the gate and has nothing to replay.
-    let replay = match first {
-        Ok(Some(Frame::Hello { .. })) => None,
-        Ok(Some(other)) => Some(Box::new(other)),
-        Ok(None) | Err(_) => None,
-    };
-    GateOutcome::Admit { replay }
+    GateOutcome::Admit
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +205,6 @@ pub async fn gate_peer<R>(
     reader: &mut BufReader<R>,
     my_endpoint_id: EndpointId,
     remote_endpoint_id: EndpointId,
-    allow_legacy: bool,
     remote: &str,
     device_name: &str,
     component: &str,
@@ -255,46 +236,36 @@ where
         Some(tok) => match invite::verify_inbound(&tok, my_endpoint_id, &my_endpoint_id) {
             Ok(v) => {
                 info!(%remote, component, invite_id = %v.invite_id, "peer presented a valid invite");
-                Some(v)
-            }
-            Err(e) if allow_legacy => {
-                warn!(%remote, component, error = %e, "invite verification failed; admitting as unverified (--allow-legacy)");
-                None
+                v
             }
             Err(e) => {
-                warn!(%remote, component, error = %e, "invite verification failed; closing (pass --allow-legacy to admit anyway)");
+                warn!(%remote, component, error = %e, "invite verification failed; closing");
                 return GatePeerOutcome::Close;
             }
         },
-        None if allow_legacy => {
-            info!(%remote, component, "peer connected without an invite; admitting as unverified (--allow-legacy)");
-            None
-        }
         None => {
-            warn!(%remote, component, "peer connected without a valid invite; closing (pass --allow-legacy to admit anyway)");
+            warn!(%remote, component, "peer connected without a valid invite; closing");
             return GatePeerOutcome::Close;
         }
     };
 
-    if let Some(v) = &verified {
-        let device = Device {
-            name: device_name.to_string(),
-            ticket: remote.to_string(),
-            added_at: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            invite: None,
-        };
-        if let Err(e) = registry::add(device, false) {
-            warn!(%remote, component, error = %e, "failed to register invite-verified peer");
-        }
-        if v.single_use {
-            if let Err(e) = invite::mark_consumed(&v.invite_id) {
-                warn!(%remote, component, error = %e, "failed to mark invite consumed");
-            }
+    let device = Device {
+        name: device_name.to_string(),
+        ticket: remote.to_string(),
+        added_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ),
+        invite: None,
+    };
+    if let Err(e) = registry::add(device, false) {
+        warn!(%remote, component, error = %e, "failed to register invite-verified peer");
+    }
+    if verified.single_use {
+        if let Err(e) = invite::mark_consumed(&verified.invite_id) {
+            warn!(%remote, component, error = %e, "failed to mark invite consumed");
         }
     }
 
@@ -327,7 +298,7 @@ mod tests {
     // isolation and can safely run concurrently with the rest of the suite.
 
     #[tokio::test]
-    async fn invalid_invite_token_closes_when_strict() {
+    async fn invalid_invite_token_closes() {
         let endpoint_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
@@ -338,28 +309,12 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-invalid", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, "remote-invalid", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
     }
 
     #[tokio::test]
-    async fn invalid_invite_token_admits_unverified_when_legacy_allowed() {
-        let endpoint_id = iroh::SecretKey::generate().public();
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let mut buf_reader = BufReader::new(reader);
-        write_frame(
-            &mut writer,
-            &Frame::Hello { name: "peer".into(), invite: Some("azi-not-a-real-token".into()), cert: None },
-        )
-        .await
-        .unwrap();
-
-        let outcome = gate_stranger(&mut buf_reader, endpoint_id, true, "remote-invalid-legacy", "peer-device", "test").await;
-        assert!(matches!(outcome, GateOutcome::Admit { replay: None }));
-    }
-
-    #[tokio::test]
-    async fn no_invite_closes_when_strict() {
+    async fn no_invite_closes() {
         let endpoint_id = iroh::SecretKey::generate().public();
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut buf_reader = BufReader::new(reader);
@@ -367,37 +322,18 @@ mod tests {
         // frame arrives directly.
         write_frame(&mut writer, &Frame::Chat { text: "hi".into(), id: None }).await.unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-none", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, "remote-none", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
     }
 
     #[tokio::test]
-    async fn no_invite_admits_unverified_and_replays_the_frame_when_legacy_allowed() {
-        let endpoint_id = iroh::SecretKey::generate().public();
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let mut buf_reader = BufReader::new(reader);
-        write_frame(&mut writer, &Frame::Chat { text: "hi".into(), id: None }).await.unwrap();
-
-        let outcome = gate_stranger(&mut buf_reader, endpoint_id, true, "remote-none-legacy", "peer-device", "test").await;
-        match outcome {
-            GateOutcome::Admit { replay } => {
-                assert!(
-                    matches!(replay.as_deref(), Some(Frame::Chat { text, .. }) if text == "hi"),
-                    "the stranger's first real frame must be replayed, not dropped"
-                );
-            }
-            GateOutcome::Close => panic!("expected the connection to be admitted"),
-        }
-    }
-
-    #[tokio::test]
-    async fn clean_eof_closes_when_strict() {
+    async fn clean_eof_closes() {
         let endpoint_id = iroh::SecretKey::generate().public();
         let (writer, reader) = tokio::io::duplex(4096);
         drop(writer); // immediate EOF, no first frame at all
         let mut buf_reader = BufReader::new(reader);
 
-        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-eof", "peer-device", "test").await;
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, "remote-eof", "peer-device", "test").await;
         assert!(matches!(outcome, GateOutcome::Close));
     }
 
@@ -440,8 +376,8 @@ mod tests {
         let mut buf_reader = BufReader::new(reader);
         write_frame(&mut writer, &Frame::Hello { name: "peer".into(), invite: Some(token), cert: None }).await.unwrap();
 
-        let outcome = gate_stranger(&mut buf_reader, endpoint_id, false, "remote-valid", "peer-device", "test").await;
-        assert!(matches!(outcome, GateOutcome::Admit { replay: None }));
+        let outcome = gate_stranger(&mut buf_reader, endpoint_id, "remote-valid", "peer-device", "test").await;
+        assert!(matches!(outcome, GateOutcome::Admit));
 
         std::env::remove_var("AZULA_INVITES_DIR");
     }
@@ -575,13 +511,11 @@ mod tests {
         .await
         .unwrap();
 
-        // allow_legacy: false and no invite at all -- only the root match
-        // can admit this connection.
+        // No invite at all -- only the root match can admit this connection.
         let outcome = gate_peer(
             &mut buf_reader,
             my_endpoint_id,
             device.public(),
-            false,
             "remote-known-root",
             "peer-device",
             "test",
@@ -622,13 +556,12 @@ mod tests {
         .unwrap();
 
         // Revoked -> not treated as known -> falls to the stranger path;
-        // strict (no --allow-legacy) and no invite -> closed. This is the
-        // spec's "Revoked device does not ride the root match" scenario.
+        // no invite -> closed. This is the spec's "Revoked device does not
+        // ride the root match" scenario.
         let outcome = gate_peer(
             &mut buf_reader,
             my_endpoint_id,
             device.public(),
-            false,
             "remote-revoked",
             "peer-device",
             "test",
@@ -676,7 +609,6 @@ mod tests {
             &mut buf_reader,
             my_endpoint_id,
             device.public(),
-            false,
             "remote-invalid-cert",
             "peer-device",
             "test",
@@ -727,7 +659,6 @@ mod tests {
             &mut buf_reader,
             my_endpoint_id,
             device.public(),
-            false,
             "remote-certified-stranger",
             "peer-device",
             "test",

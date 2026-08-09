@@ -136,7 +136,6 @@ pub async fn run_chat_session<R, W>(
     store: &LogStore,
     known_roots: &AsyncMutex<Vec<PublicKey>>,
     revocations: &[Revocation],
-    allow_legacy: bool,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -156,7 +155,6 @@ where
         &mut reader,
         my_endpoint_id,
         remote_endpoint_id,
-        allow_legacy,
         remote,
         &device_name,
         "mailbox",
@@ -242,7 +240,6 @@ pub struct ChatHandler {
     store: LogStore,
     known_roots: Arc<AsyncMutex<Vec<PublicKey>>>,
     revocations: Vec<Revocation>,
-    allow_legacy: bool,
 }
 
 impl ChatHandler {
@@ -252,7 +249,6 @@ impl ChatHandler {
         store: LogStore,
         known_roots: Vec<PublicKey>,
         revocations: Vec<Revocation>,
-        allow_legacy: bool,
     ) -> Self {
         Self {
             device_secret,
@@ -260,7 +256,6 @@ impl ChatHandler {
             store,
             known_roots: Arc::new(AsyncMutex::new(known_roots)),
             revocations,
-            allow_legacy,
         }
     }
 
@@ -280,7 +275,6 @@ impl std::fmt::Debug for ChatHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatHandler")
             .field("device_pk", &self.device_secret.public())
-            .field("allow_legacy", &self.allow_legacy)
             .finish()
     }
 }
@@ -300,7 +294,6 @@ impl ProtocolHandler for ChatHandler {
             &self.store,
             &self.known_roots,
             &self.revocations,
-            self.allow_legacy,
         )
         .await
         .map_err(|e| AcceptError::from_boxed(e.into()))
@@ -488,7 +481,7 @@ pub fn log_store_dir() -> Option<PathBuf> {
 /// `cmd_mailbox`) calls this exact function too, unchanged, so both commands
 /// get identical behavior; kept named `mailbox_role::run` (not renamed) to
 /// limit churn to files outside this phase's ownership.
-pub async fn run(allow_legacy: bool) -> Result<()> {
+pub async fn run() -> Result<()> {
     let linked = linked_identity::load()
         .context("no linked identity found -- run `azula link [--relay]` first")?;
     let cert = DeviceCert::decode(&linked.cert).context("relay: stored certificate is corrupt")?;
@@ -546,7 +539,6 @@ pub async fn run(allow_legacy: bool) -> Result<()> {
         store.clone(),
         known_roots,
         revocations.clone(),
-        allow_legacy,
     );
     // task 4.3: the LLM ALPN's admission gate shares ChatHandler's live
     // known-roots set, so a contact pinned via one ALPN is recognized by
@@ -712,7 +704,6 @@ mod tests {
             &store,
             &known_roots,
             &[],
-            false,
         )
         .await
         .unwrap();
@@ -750,7 +741,6 @@ mod tests {
             &store,
             &known_roots,
             &[],
-            false, // strict: no --allow-legacy
         )
         .await
         .unwrap();
@@ -818,7 +808,6 @@ mod tests {
             &store,
             &known_roots,
             &[], // baseline is empty -- the revocation is only in the store
-            false,
         )
         .await
         .unwrap();
@@ -881,7 +870,6 @@ mod tests {
             store.clone(),
             vec![peer_root.public()],
             vec![],
-            false, // strict: the cert path alone must admit the peer
         );
         let router = Router::builder(server_ep).accept(CHAT_ALPN, handler).spawn();
 
