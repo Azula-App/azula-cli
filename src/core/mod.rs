@@ -141,6 +141,10 @@ pub struct SessionCore {
     /// This session's display name (the conversation title the app shows),
     /// announced to apps in both the dial and accept directions.
     pub own_name: String,
+    /// This session's description (the conversation sub-line), announced as
+    /// `Frame::Profile` on each dial when set. `None` leaves whatever the
+    /// device already shows untouched.
+    pub own_description: Option<String>,
     /// This session's own `azd…` certificate (design.md D1/D3), re-presented
     /// in every `Hello` frame this session sends.
     pub session_cert: String,
@@ -191,6 +195,7 @@ impl SessionCore {
             label,
             ticket,
             own_name,
+            own_description: None,
             session_cert,
             machine_secret,
             relay_conns: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -222,6 +227,7 @@ pub async fn establish(
     label: &str,
     device_urls: Vec<String>,
     name: Option<String>,
+    description: Option<String>,
     session_name: Option<String>,
 ) -> Result<Established> {
     let session = SessionKey::resolve(session_name.as_deref())?;
@@ -340,6 +346,7 @@ pub async fn establish(
             label: label.to_string(),
             ticket: bridge_ticket,
             own_name,
+            own_description: description,
             session_cert,
             machine_secret,
             relay_conns: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -599,10 +606,19 @@ impl SessionCore {
                     .map(|d| (d.ticket, d.invite))
             });
             if let Some((t, invite)) = ticket_and_invite {
-                device::connect_device(
+                let connected = device::connect_device(
                     &self.endpoint, device_name, &t, &self.devices, &self.own_name, invite.as_deref(), Some(&self.session_cert),
                 )
                 .await;
+                // Announce the operator's `--description` on the fresh
+                // connection. `Hello` carries only a name, so the sub-line
+                // needs its own `Profile` frame; sending it here means every
+                // verb that dials gets it, not just the ones that thought to.
+                if connected && self.own_description.is_some() {
+                    let _ = self
+                        .set_name(Some(device_name), None, self.own_description.clone())
+                        .await;
+                }
             }
         }
 

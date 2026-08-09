@@ -37,7 +37,58 @@ struct Cli {
     command: Option<Command>,
 
     #[command(flatten)]
+    session: SessionLabel,
+
+    #[command(flatten)]
     serve: legacy::ServeArgs,
+}
+
+/// How this invocation's session identifies itself to a device.
+///
+/// Written before the subcommand (`azula --name deploy message send …`), and
+/// deliberately *not* a clap global: `pair` and `link` define their own
+/// `--name` meaning a different noun, and propagating a same-named global into
+/// them would make an established invocation ambiguous.
+///
+/// These used to live on [`legacy::ServeArgs`], which the root flattens — so
+/// clap accepted them for every subcommand while only the bare-`azula` branch
+/// ever read them, and every other verb discarded them in silence. Anything
+/// that can't apply them now says so; see [`reject_session_label`].
+#[derive(Debug, Clone, clap::Args)]
+pub(super) struct SessionLabel {
+    /// Override the name this session announces to the app (sent as
+    /// `Frame::Hello`/`Frame::Profile.name`, and used as the conversation
+    /// title). Defaults to this machine's hostname when serving, or
+    /// `bridge-<endpoint id>` for a one-shot verb.
+    #[arg(long, value_name = "NAME")]
+    pub(super) name: Option<String>,
+
+    /// Override the description this session announces to the app (sent as
+    /// `Frame::Profile.description`, becomes the conversation sub-line).
+    /// Defaults to the shell's launch working directory when serving.
+    #[arg(long, value_name = "DESCRIPTION")]
+    pub(super) description: Option<String>,
+}
+
+impl SessionLabel {
+    fn is_set(&self) -> bool {
+        self.name.is_some() || self.description.is_some()
+    }
+}
+
+/// Refuse a session label on a verb that opens no session.
+///
+/// Accepting a flag and throwing it away is the defect this change exists to
+/// fix; a verb that can't honour one owes the user an error instead.
+fn reject_session_label(label: &SessionLabel, verb: &str) -> Result<()> {
+    if !label.is_set() {
+        return Ok(());
+    }
+    let flag = if label.name.is_some() { "--name" } else { "--description" };
+    anyhow::bail!(
+        "`{flag}` labels the session a device sees, and `azula {verb}` opens none.\n\
+         Drop it, or see `azula {verb} --help` — some verbs take a `--name` of their own."
+    )
 }
 
 #[derive(Debug, Subcommand)]
@@ -205,6 +256,7 @@ pub async fn run() -> Result<()> {
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
+    let label = cli.session;
     match cli.command {
         Some(Command::Mcp(args)) => mcp_cmd::run(args).await,
 
@@ -212,35 +264,59 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Terminal(args)) => terminal_cmd::run(args).await,
 
         Some(Command::Message(args)) => match args.action {
-            message::MessageAction::Send(a) => message::send(a).await,
-            message::MessageAction::Recv(a) => message::recv(a).await,
+            message::MessageAction::Send(a) => message::send(a, &label).await,
+            message::MessageAction::Recv(a) => message::recv(a, &label).await,
         },
         Some(Command::Ui(args)) => match args.action {
-            ui::UiAction::Render(a) => ui::render(a).await,
-            ui::UiAction::Update(a) => ui::update(a).await,
-            ui::UiAction::Delete(a) => ui::delete(a).await,
-            ui::UiAction::Catalog(a) => ui::catalog(a),
+            ui::UiAction::Render(a) => ui::render(a, &label).await,
+            ui::UiAction::Update(a) => ui::update(a, &label).await,
+            ui::UiAction::Delete(a) => ui::delete(a, &label).await,
+            ui::UiAction::Catalog(a) => {
+                reject_session_label(&label, "ui catalog")?;
+                ui::catalog(a)
+            }
         },
         Some(Command::File(args)) => match args.action {
-            file::FileAction::Send(a) => file::send(a).await,
+            file::FileAction::Send(a) => file::send(a, &label).await,
         },
-        Some(Command::Watch(args)) => watch_cmd::run(args).await,
-        Some(Command::Status(args)) => status_cmd::run(args),
+        Some(Command::Watch(args)) => watch_cmd::run(args, &label).await,
+        Some(Command::Status(args)) => {
+            reject_session_label(&label, "status")?;
+            status_cmd::run(args)
+        }
         Some(Command::Relay(args)) => relay_cmd::cmd_relay(args).await,
 
-        Some(Command::Pair(args)) => legacy::cmd_pair(args),
-        Some(Command::Devices { json }) => legacy::cmd_devices(json),
-        Some(Command::Qr(args)) => legacy::cmd_qr(args),
-        Some(Command::Invite(args)) => match args.action {
-            Some(legacy::InviteAction::Revoke(r)) => legacy::cmd_invite_revoke(r),
-            None => legacy::cmd_invite_mint(args.mint).await,
-        },
-        Some(Command::Invites) => legacy::cmd_invites(),
-        Some(Command::Link(args)) => legacy::cmd_link(args).await,
+        Some(Command::Pair(args)) => {
+            reject_session_label(&label, "pair")?;
+            legacy::cmd_pair(args)
+        }
+        Some(Command::Devices { json }) => {
+            reject_session_label(&label, "devices")?;
+            legacy::cmd_devices(json)
+        }
+        Some(Command::Qr(args)) => {
+            reject_session_label(&label, "qr")?;
+            legacy::cmd_qr(args)
+        }
+        Some(Command::Invite(args)) => {
+            reject_session_label(&label, "invite")?;
+            match args.action {
+                Some(legacy::InviteAction::Revoke(r)) => legacy::cmd_invite_revoke(r),
+                None => legacy::cmd_invite_mint(args.mint).await,
+            }
+        }
+        Some(Command::Invites) => {
+            reject_session_label(&label, "invites")?;
+            legacy::cmd_invites()
+        }
+        Some(Command::Link(args)) => {
+            reject_session_label(&label, "link")?;
+            legacy::cmd_link(args).await
+        }
 
         Some(Command::Serve(args)) => {
             print_deprecation_notice("serve", "azula (bare invocation), or a future `azula terminal`");
-            legacy::serve(args).await
+            legacy::serve(args, &label).await
         }
         Some(Command::ServeMcp(args)) => mcp_cmd::run_serve_mcp_alias(args).await,
         Some(Command::Mailbox(args)) => {
@@ -250,13 +326,62 @@ async fn dispatch(cli: Cli) -> Result<()> {
 
         // Bare `azula` (no subcommand): unchanged pre-restructure default —
         // no deprecation notice, since nothing named "serve" was typed.
-        None => legacy::serve(cli.serve).await,
+        None => legacy::serve(cli.serve, &label).await,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(argv: &[&str]) -> Cli {
+        Cli::from_arg_matches(&build_command().get_matches_from(argv)).expect("parse")
+    }
+
+    /// The defect: `--name` parsed at the root (it was flattened in from
+    /// `ServeArgs`) and then every subcommand dropped it on the floor. It has
+    /// to reach the verb now.
+    #[test]
+    fn session_label_before_a_subcommand_reaches_the_verb() {
+        let cli = parse(&["azula", "--name", "deploy", "--description", "prod push", "message", "send", "hi"]);
+        assert_eq!(cli.session.name.as_deref(), Some("deploy"));
+        assert_eq!(cli.session.description.as_deref(), Some("prod push"));
+        assert!(matches!(cli.command, Some(Command::Message(_))));
+    }
+
+    /// `pair --name` names *the device being paired* — a different noun from
+    /// the session label. Promoting the globals must not have changed it,
+    /// which is why `SessionLabel` is not a clap global.
+    #[test]
+    fn pair_keeps_its_own_name_option() {
+        let cli = parse(&["azula", "pair", "https://azula.app/i/abc", "--name", "my-phone"]);
+        assert!(cli.session.name.is_none(), "must not bind to the session label");
+        match cli.command {
+            Some(Command::Pair(args)) => assert_eq!(args.name.as_deref(), Some("my-phone")),
+            other => panic!("expected pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_invocation_still_takes_the_label() {
+        let cli = parse(&["azula", "--name", "laptop"]);
+        assert!(cli.command.is_none(), "bare azula still serves");
+        assert_eq!(cli.session.name.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn a_verb_that_opens_no_session_rejects_the_label() {
+        let label = SessionLabel { name: Some("deploy".into()), description: None };
+        let err = reject_session_label(&label, "devices").expect_err("must reject");
+        assert!(err.to_string().contains("--name"), "names the offending flag: {err}");
+        assert!(err.to_string().contains("devices"), "names the verb: {err}");
+    }
+
+    #[test]
+    fn an_unset_label_is_never_rejected() {
+        let label = SessionLabel { name: None, description: None };
+        assert!(reject_session_label(&label, "devices").is_ok());
+    }
 
     #[test]
     fn explicit_session_flag_wins_over_the_cli_default() {

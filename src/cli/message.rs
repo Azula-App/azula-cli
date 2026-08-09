@@ -44,9 +44,10 @@ pub(super) struct MessageRecvArgs {
     json: bool,
 }
 
-pub(super) async fn send(args: MessageSendArgs) -> Result<()> {
+pub(super) async fn send(args: MessageSendArgs, label: &super::SessionLabel) -> Result<()> {
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
+    let est =
+        crate::core::establish("cli", vec![], label.name.clone(), label.description.clone(), Some(session_name)).await?;
     let core = est.core;
     let device = super::resolve_or_exit(&core, args.device.device.as_deref()).await;
 
@@ -70,9 +71,10 @@ pub(super) async fn send(args: MessageSendArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn recv(args: MessageRecvArgs) -> Result<()> {
+pub(super) async fn recv(args: MessageRecvArgs, label: &super::SessionLabel) -> Result<()> {
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
+    let est =
+        crate::core::establish("cli", vec![], label.name.clone(), label.description.clone(), Some(session_name)).await?;
     let core = est.core;
 
     match args.wait {

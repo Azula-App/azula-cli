@@ -75,7 +75,9 @@ pub async fn run(
     session_name: Option<String>,
 ) -> Result<()> {
     let Established { core, session: _session, router: _router } =
-        core::establish(&bind, device_urls, name, session_name).await?;
+        // No description: a long-lived bridge carries session identity via the
+        // `set_name` tool instead (mcp-bridge's "Conversation Naming" rule).
+        core::establish(&bind, device_urls, name, None, session_name).await?;
 
     // MCP server over Streamable HTTP, mounted at /mcp.
     let ep_svc = core.endpoint.clone();
@@ -129,7 +131,7 @@ pub async fn run_stdio(
     session_name: Option<String>,
 ) -> Result<()> {
     let Established { core, session: _session, router: _router } =
-        core::establish("stdio", device_urls, name, session_name).await?;
+        core::establish("stdio", device_urls, name, None, session_name).await?;
 
     eprintln!("azula MCP bridge (stdio) online as \"{}\"", core.own_name);
     match startup_invite(&core, legacy_ticket).await {

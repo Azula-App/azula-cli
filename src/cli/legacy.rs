@@ -147,17 +147,9 @@ pub(super) struct ServeArgs {
     #[arg(long = "legacy-ticket")]
     legacy_ticket: bool,
 
-    /// Override the name a connecting terminal announces to the app (sent as
-    /// `Frame::Profile.name`, becomes the conversation title). Defaults to
-    /// this machine's hostname.
-    #[arg(long, value_name = "NAME")]
-    name: Option<String>,
-
-    /// Override the description a connecting terminal announces to the app
-    /// (sent as `Frame::Profile.description`, becomes the conversation
-    /// sub-line). Defaults to the shell's launch working directory.
-    #[arg(long, value_name = "DESCRIPTION")]
-    description: Option<String>,
+    // `--name`/`--description` used to live here. They are `SessionLabel` on
+    // the root parser now: flattening them into `ServeArgs` made clap accept
+    // them for every subcommand while only this one ever read them.
 
     /// How long (in minutes) a detached persistent terminal session's shell
     /// stays alive waiting for a `term_attach` reattach before it's killed.
@@ -183,9 +175,31 @@ pub(super) fn cmd_pair(args: PairArgs) -> Result<()> {
         }
     };
 
-    let name = args.name.unwrap_or_else(|| {
-        token.chars().take(8).collect()
-    });
+    // The default name comes from the endpoint id the ticket *resolves to*,
+    // never from the ticket's serialized text. Those were the same string
+    // when a ticket was a bare endpoint id, but `EndpointTicket` serializes
+    // with a constant `endpoint…` prefix, so truncating the text named every
+    // invite-paired device alike — and same-named rows used to overwrite each
+    // other. Bare 8 hex, matching what the old derivation produced for a
+    // pre-rename device, so re-pairing one still finds its existing row.
+    let name = match args.name {
+        Some(n) => n,
+        None => {
+            let id = registry::endpoint_id_of(&token).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not read an endpoint id out of ticket {token:?}; \
+                     pass --name to register it under a name you choose"
+                )
+            })?;
+            match registry::find_by_endpoint_id(&id) {
+                // Already know this device — keep the name it's stored under.
+                // The user may have renamed it by hand; re-pairing through a
+                // fresh invite shouldn't undo that.
+                Some(known) => known.name,
+                None => id.to_string().chars().take(8).collect(),
+            }
+        }
+    };
 
     let device = registry::Device {
         name: name.clone(),
@@ -199,11 +213,63 @@ pub(super) fn cmd_pair(args: PairArgs) -> Result<()> {
         invite: invite_str,
     };
 
-    let path = registry::add(device, args.global)?;
+    let added = registry::add(device, args.global)?;
 
-    println!("Paired device '{}' (ticket: {}…)", name, token.chars().take(8).collect::<String>());
-    println!("Saved to: {}", path.display());
+    // Report what was actually stored: `add` disambiguates a name already held
+    // by a different device, so `added.name` can differ from what we asked
+    // for. The identifier shown is the endpoint id, not the head of the ticket
+    // text — that is a constant prefix and tells the user nothing.
+    match registry::endpoint_id_of(&token) {
+        Some(id) => {
+            let short: String = id.to_string().chars().take(8).collect();
+            println!("Paired device '{}' (endpoint: {short}…)", added.name);
+        }
+        // No endpoint id to show — an explicit `--name` got us here, since the
+        // derived path requires one. Fall back to the ticket head.
+        None => {
+            let short: String = token.chars().take(8).collect();
+            println!("Paired device '{}' (ticket: {short}…)", added.name);
+        }
+    }
+    println!("Saved to: {}", added.path.display());
     Ok(())
+}
+
+/// The name every invite-paired device used to get, before the default came
+/// from the endpoint id: the head of a serialized `EndpointTicket`.
+const PLACEHOLDER_NAME: &str = "endpoint";
+
+/// Warn about rows left behind by the old naming, which named every
+/// invite-paired device `endpoint` — and, because rows de-duplicated by name,
+/// let a second pairing overwrite the first.
+///
+/// Read-side only: the row is reported, never rewritten. `devices.json` is a
+/// file the shipped README invites people to edit, and a rename we chose could
+/// silently undo one they made. To stderr so `--json` stays parseable.
+fn warn_about_placeholder_names(known: &[registry::Device], json: bool) {
+    let affected: Vec<&registry::Device> = known.iter().filter(|d| d.name == PLACEHOLDER_NAME).collect();
+    let Some(d) = affected.first() else { return };
+
+    let _ = json; // stderr either way — kept explicit so it isn't "fixed" into stdout.
+    eprintln!(
+        "warning: a device is registered as '{PLACEHOLDER_NAME}' (endpoint {}…).\n\
+         \x20 That name came from a defect: every device paired from an invite got it, and\n\
+         \x20 same-named rows replaced each other — so an earlier pairing may have been lost.\n\
+         \x20 Rename it with `azula pair <url> --name <name>`, or edit devices.json directly.\n\
+         \x20 Pairing it again now derives a distinct name.",
+        fingerprint(&d.ticket)
+    );
+}
+
+/// A device's short identifier for display: the head of its endpoint id.
+///
+/// Not the head of the ticket text — that used to be the same thing, but an
+/// `EndpointTicket` serializes with a constant prefix, so it would print
+/// `endpoint…` for every invite-paired device and identify nothing.
+fn fingerprint(ticket: &str) -> String {
+    registry::endpoint_id_of(ticket)
+        .map(|id| id.to_string().chars().take(8).collect())
+        .unwrap_or_else(|| ticket.chars().take(8).collect())
 }
 
 pub(super) fn cmd_devices(json: bool) -> Result<()> {
@@ -213,6 +279,8 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
         println!("No devices registered. Use `azula pair <URL>` to add one.");
         return Ok(());
     }
+
+    warn_about_placeholder_names(&known, json);
 
     if json {
         let global: Vec<String> = registry::global_path()
@@ -233,7 +301,7 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
                 };
                 serde_json::json!({
                     "name": d.name,
-                    "fingerprint": d.ticket.chars().take(8).collect::<String>(),
+                    "fingerprint": fingerprint(&d.ticket),
                     "source": source,
                     "relay": registry::relay_for(&d.name).is_some(),
                 })
@@ -255,7 +323,7 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
     println!("{:<20} {:<12} SOURCE", "NAME", "FINGERPRINT");
     println!("{}", "-".repeat(48));
     for d in &known {
-        let fingerprint: String = d.ticket.chars().take(8).collect();
+        let fingerprint = fingerprint(&d.ticket);
         let source = if project_devices.contains(&d.name) {
             "project"
         } else if global_devices.contains(&d.name) {
@@ -507,7 +575,7 @@ pub(super) async fn cmd_mailbox(_args: MailboxArgs) -> Result<()> {
 /// restructure (both the explicit, now-hidden-and-deprecated `azula serve`
 /// alias and the bare `azula` invocation call this); term/LLM serve code is
 /// not being deleted this release.
-pub(super) async fn serve(args: ServeArgs) -> Result<()> {
+pub(super) async fn serve(args: ServeArgs, label: &super::SessionLabel) -> Result<()> {
     // Bind with the n0 defaults (public discovery + relays), reusing a persisted
     // key so the endpoint id (and connect code) stays stable across restarts.
     let (endpoint, ticket) = endpoint::bind_server_endpoint("serve").await?;
@@ -600,7 +668,7 @@ pub(super) async fn serve(args: ServeArgs) -> Result<()> {
         Router::builder(endpoint)
             .accept(
                 TERM_ALPN,
-                TermHandler::new(endpoint_id, args.name.clone(), args.description.clone(), session_ttl),
+                TermHandler::new(endpoint_id, label.name.clone(), label.description.clone(), session_ttl),
             )
             .spawn()
     } else {
@@ -608,7 +676,7 @@ pub(super) async fn serve(args: ServeArgs) -> Result<()> {
             .accept(LLM_ALPN, LlmHandler::new(mcp, endpoint_id))
             .accept(
                 TERM_ALPN,
-                TermHandler::new(endpoint_id, args.name.clone(), args.description.clone(), session_ttl),
+                TermHandler::new(endpoint_id, label.name.clone(), label.description.clone(), session_ttl),
             )
             .spawn()
     };
@@ -630,6 +698,114 @@ mod tests {
     use super::*;
     use crate::certs::DeviceCert;
     use iroh::SecretKey;
+    use iroh_tickets::endpoint::EndpointTicket;
+
+    fn pair_args(url: &str, name: Option<&str>) -> PairArgs {
+        PairArgs { url: url.to_string(), name: name.map(String::from), global: false }
+    }
+
+    /// Point the registry at a scratch dir for one test. `cmd_pair` writes
+    /// through `registry::add`, which would otherwise hit the real file.
+    async fn with_registry<F: FnOnce()>(tag: &str, f: F) {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("azula-pair-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+        f();
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The regression this change exists for: an `EndpointTicket` serializes
+    /// with a constant `endpoint…` prefix, so naming a device after the head
+    /// of its ticket text named every invite-paired device alike.
+    #[tokio::test]
+    async fn pair_names_a_device_after_its_endpoint_id_not_its_ticket_text() {
+        with_registry("derives", || {
+            let id = SecretKey::generate().public();
+            let ticket = EndpointTicket::new(iroh::EndpointAddr::from(id)).to_string();
+            assert!(ticket.starts_with("endpoint"), "guards the premise: {ticket}");
+
+            cmd_pair(pair_args(&ticket, None)).expect("pair");
+
+            let devices = registry::load();
+            assert_eq!(devices.len(), 1);
+            let expected: String = id.to_string().chars().take(8).collect();
+            assert_eq!(devices[0].name, expected, "named from the endpoint id");
+        })
+        .await;
+    }
+
+    /// A device registered before the `EndpointTicket` rename was named after
+    /// its ticket — which *was* its endpoint id. Deriving from the endpoint id
+    /// reproduces that exact name, so re-pairing an old device matches its own
+    /// row instead of forking a duplicate.
+    #[tokio::test]
+    async fn pair_reproduces_the_pre_rename_name_for_a_bare_endpoint_id() {
+        with_registry("pre_rename", || {
+            let id = SecretKey::generate().public();
+            let bare = id.to_string();
+            let old_derivation: String = bare.chars().take(8).collect();
+
+            cmd_pair(pair_args(&bare, None)).expect("pair");
+
+            let devices = registry::load();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].name, old_derivation, "same name the old code produced");
+        })
+        .await;
+    }
+
+    /// Failing loudly beats falling back to a derivation that may collide.
+    #[tokio::test]
+    async fn pair_rejects_a_ticket_with_no_readable_endpoint_id() {
+        with_registry("undecodable", || {
+            // Parses as a token, but names no endpoint id.
+            let err = cmd_pair(pair_args("not-a-real-ticket", None)).expect_err("must fail");
+            assert!(
+                err.to_string().contains("endpoint id"),
+                "error should say what's wrong: {err}"
+            );
+            assert!(registry::load().is_empty(), "no row written on failure");
+        })
+        .await;
+    }
+
+    /// A registry damaged by the old naming is reported, never rewritten:
+    /// `devices.json` is a file the shipped README invites people to edit, so
+    /// a rename we chose could silently undo one they made.
+    #[tokio::test]
+    async fn listing_devices_leaves_a_damaged_registry_untouched() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("azula-pair-test-{}-warn", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        let id = SecretKey::generate().public();
+        let ticket = EndpointTicket::new(iroh::EndpointAddr::from(id)).to_string();
+        registry::add(registry::Device { name: "endpoint".into(), ticket, added_at: None, invite: None }, false)
+            .expect("seed");
+
+        let path = registry::project_path().expect("registry path");
+        let before = std::fs::read(&path).expect("read before");
+        cmd_devices(false).expect("list");
+        assert_eq!(before, std::fs::read(&path).expect("read after"), "listing must not rewrite the registry");
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit `--name` is still honoured, undecodable ticket or not.
+    #[tokio::test]
+    async fn pair_accepts_an_explicit_name_without_decoding_the_ticket() {
+        with_registry("explicit", || {
+            cmd_pair(pair_args("not-a-real-ticket", Some("laptop"))).expect("pair");
+            let devices = registry::load();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].name, "laptop");
+        })
+        .await;
+    }
 
     // Fixed, deterministic seeds -- same convention as certs.rs/sync.rs.
     fn seed(start: u8) -> [u8; 32] {
