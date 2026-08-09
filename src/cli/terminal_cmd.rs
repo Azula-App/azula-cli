@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::BufReader;
 use tracing::warn;
 
-use crate::identity;
 use crate::invite;
 use crate::link::{self, Parsed};
 use crate::mcp::{LlmHandler, LLM_ALPN};
@@ -225,9 +224,8 @@ pub(super) async fn host_session(
         )
         .spawn();
 
-    let machine_secret = identity::load_machine_secret_if_exists();
     let invite_url =
-        match crate::core::mint_pairing_invite(machine_secret.as_ref(), &ticket, router.endpoint().secret_key()).await {
+        match crate::core::mint_pairing_invite(&ticket, router.endpoint().secret_key()) {
             Some(encoded) => qr::invite_url(&encoded),
             None => qr::pairing_url(&ticket),
         };
