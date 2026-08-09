@@ -85,13 +85,6 @@ pub(super) struct RunArgs {
     #[arg(long = "hold-secs", hide = true)]
     pub(super) hold_secs: Option<u64>,
 
-    /// Admit invite-less unknown strangers into the handoff session as
-    /// unverified instead of requiring the connect block's invite. Off by
-    /// default — unlike `azula serve`, a fresh handoff session has nothing
-    /// else guarding it.
-    #[arg(long = "allow-legacy")]
-    pub(super) allow_legacy: bool,
-
     /// The command to run, and its arguments.
     #[arg(required = true, trailing_var_arg = true, num_args = 1..)]
     pub(super) command: Vec<String>,
@@ -146,7 +139,7 @@ async fn run_inner(args: RunArgs) -> Result<i32> {
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(args.hold * 60));
 
-    if let Err(e) = handoff(wrapped.captured, args.name, args.desc, args.allow_legacy, hold).await {
+    if let Err(e) = handoff(wrapped.captured, args.name, args.desc, hold).await {
         warn!(error = %e, "run: handoff failed; exiting with the wrapped command's own exit code");
     }
 
@@ -295,7 +288,6 @@ async fn start_handoff(
     captured: &[u8],
     name: Option<String>,
     desc: Option<String>,
-    allow_legacy: bool,
     shell_argv: Option<&[String]>,
 ) -> Result<Handoff> {
     let session = SessionKey::resolve(None).context("resolving the handoff session's ephemeral identity")?;
@@ -308,10 +300,10 @@ async fn start_handoff(
         .context("spawning the handoff shell")?;
 
     let router = iroh::protocol::Router::builder(endpoint)
-        .accept(LLM_ALPN, LlmHandler::new(None, my_endpoint_id, allow_legacy))
+        .accept(LLM_ALPN, LlmHandler::new(None, my_endpoint_id))
         .accept(
             TERM_ALPN,
-            TermHandler::new(my_endpoint_id, allow_legacy, name, desc, Some(HANDOFF_SESSION_TTL))
+            TermHandler::new(my_endpoint_id, name, desc, Some(HANDOFF_SESSION_TTL))
                 .with_default_session(session_id.clone()),
         )
         .spawn();
@@ -330,10 +322,9 @@ async fn handoff(
     captured: Vec<u8>,
     name: Option<String>,
     desc: Option<String>,
-    allow_legacy: bool,
     hold: Duration,
 ) -> Result<()> {
-    let h = start_handoff(&captured, name, desc, allow_legacy, None).await?;
+    let h = start_handoff(&captured, name, desc, None).await?;
     print_connect_block(&h.endpoint_id.to_string(), &h.invite_url);
     wait_for_session_end_or_hold(&h.session_id, hold).await;
     // Kill sessions BEFORE router shutdown: a live session's PTY-reader
@@ -418,7 +409,6 @@ mod tests {
             name: None,
             desc: None,
             hold_secs: None,
-            allow_legacy: true,
             command: vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
         };
         let code = run(args).await;
@@ -435,7 +425,6 @@ mod tests {
             name: None,
             desc: None,
             hold_secs: None,
-            allow_legacy: true,
             command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
         };
         let code = run(args).await;
@@ -510,7 +499,7 @@ mod tests {
         // and (on macOS zsh setups) can survive the polite kill signal — the
         // test must be hermetic and prompt-fast.
         let sh = vec!["/bin/sh".to_string()];
-        let h = start_handoff(&wrapped.captured, None, None, true, Some(&sh)).await.expect("start handoff");
+        let h = start_handoff(&wrapped.captured, None, None, Some(&sh)).await.expect("start handoff");
         let addr = h.router.endpoint().addr();
 
         let client_ep = iroh::Endpoint::bind(iroh::endpoint::presets::Minimal).await.expect("client bind");

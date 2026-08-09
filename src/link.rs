@@ -1,16 +1,18 @@
 //! Ticket / URL parsing for `azula pair` and `--device`.
 //!
-//! [`parse_ticket`] accepts four **legacy** forms (kept forever for outbound
-//! dialing per the invitations transition policy):
-//!   - `https://azula.app/s/<token>`
-//!   - `https://azula.app/connect/<token>`
-//!   - `azula://connect?code=<token>`
-//!   - a bare token (anything else)
+//! [`parse_ticket`] accepts a **bare token** — a raw `EndpointTicket` with no
+//! URL wrapper, which is what `--device` and `azula qr` are given.
 //!
 //! [`parse`] additionally recognizes the **invite** forms
 //! (`https://azula.app/i/<payload>`, `azula://i?c=<payload>`, a bare
 //! `azi…` payload) and tags the result so callers can tell an invite from a
 //! raw ticket — see `azula-docs/openspec/specs/invitations/design.md`.
+//!
+//! The legacy share-link forms (`https://azula.app/s/<token>`,
+//! `https://azula.app/connect/<token>`, `azula://connect?code=<token>`) are
+//! **no longer parsed** — the transition escape hatch they belonged to is
+//! closed. They are rejected rather than falling through to the bare-token
+//! path, so a legacy link cannot be mistaken for a dialable ticket.
 //!
 //! In all cases the token/payload is returned with no query-string, fragment,
 //! or trailing slash. No network access is performed; nothing is validated
@@ -240,7 +242,8 @@ pub enum Parsed {
 /// Parse any supported link or bare token and classify it as an invite or a
 /// raw ticket. Tries the invite forms first
 /// (`https://azula.app/i/<payload>`, `azula://i?c=<payload>`, bare `azi…`),
-/// then falls back to [`parse_ticket`]'s four legacy ticket forms.
+/// then falls back to [`parse_ticket`]'s bare-token form. The retired legacy
+/// share-link forms match neither and yield `None`.
 pub fn parse(input: &str) -> Option<Parsed> {
     let s = input.trim();
     if s.is_empty() {
@@ -276,58 +279,27 @@ pub fn parse(input: &str) -> Option<Parsed> {
         }
     }
 
-    // --- legacy forms: /s/, /connect/, azula://connect?code=, bare token ---
+    // --- bare ticket token ---
     parse_ticket(s).map(Parsed::Ticket)
 }
 
-/// Parse a ticket from any supported **legacy** URL / bare-token form.
+/// Parse a ticket from its **bare token** form — a raw `EndpointTicket` with
+/// no URL wrapper.
 ///
-/// Returns `None` only if the input is completely empty after trimming.
+/// Returns `None` for empty input and for anything URL-shaped. The latter
+/// matters: the retired legacy forms (`/s/`, `/connect/`,
+/// `azula://connect?code=`) must be rejected outright, and without this guard
+/// they would fall through here and be handed back as a "ticket" that is
+/// really a whole URL.
 pub fn parse_ticket(input: &str) -> Option<String> {
     let s = input.trim();
     if s.is_empty() {
         return None;
     }
 
-    // --- azula://connect?code=<token> ---
-    if let Some(rest) = s.strip_prefix("azula://connect") {
-        // rest is either "" or "?..." or "#..."
-        let query = rest.trim_start_matches('?');
-        for part in query.split('&') {
-            if let Some(v) = part.strip_prefix("code=") {
-                let token = strip_fragment(v).trim_end_matches('/');
-                if !token.is_empty() {
-                    return Some(token.to_string());
-                }
-            }
-        }
-        // If we had the scheme but no code= param, treat rest as bare token
-        // (should not happen in practice, but be defensive).
-        return None;
-    }
-
-    // --- https://azula.app/s/<token> ---
-    if let Some(rest) = s.strip_prefix("https://azula.app/s/") {
-        let token = strip_query_and_fragment(rest).trim_end_matches('/');
-        if !token.is_empty() {
-            return Some(token.to_string());
-        }
-        return None;
-    }
-
-    // --- https://azula.app/connect/<token> ---
-    if let Some(rest) = s.strip_prefix("https://azula.app/connect/") {
-        let token = strip_query_and_fragment(rest).trim_end_matches('/');
-        if !token.is_empty() {
-            return Some(token.to_string());
-        }
-        return None;
-    }
-
-    // --- bare token ---
     // Strip any trailing fragment/query that might have crept in.
     let token = strip_query_and_fragment(s).trim_end_matches('/');
-    if token.is_empty() {
+    if token.is_empty() || token.contains("://") || token.contains('/') {
         None
     } else {
         Some(token.to_string())
@@ -349,49 +321,33 @@ fn strip_fragment(s: &str) -> &str {
 mod tests {
     use super::*;
 
+    // --- retired legacy forms: rejected, never coerced into a ticket ---
+
     #[test]
-    fn slash_s_url() {
-        assert_eq!(
-            parse_ticket("https://azula.app/s/abc123"),
-            Some("abc123".into())
-        );
+    fn slash_s_url_is_rejected() {
+        assert_eq!(parse_ticket("https://azula.app/s/abc123"), None);
+        assert_eq!(parse_ticket("https://azula.app/s/abc123/"), None);
     }
 
     #[test]
-    fn slash_s_url_with_trailing_slash() {
-        assert_eq!(
-            parse_ticket("https://azula.app/s/abc123/"),
-            Some("abc123".into())
-        );
+    fn connect_url_is_rejected() {
+        assert_eq!(parse_ticket("https://azula.app/connect/mytoken"), None);
     }
 
     #[test]
-    fn connect_url() {
-        assert_eq!(
-            parse_ticket("https://azula.app/connect/mytoken"),
-            Some("mytoken".into())
-        );
-    }
-
-    #[test]
-    fn azula_scheme() {
-        assert_eq!(
-            parse_ticket("azula://connect?code=phonetok"),
-            Some("phonetok".into())
-        );
-    }
-
-    #[test]
-    fn azula_scheme_extra_params() {
-        assert_eq!(
-            parse_ticket("azula://connect?code=phonetok&v=2"),
-            Some("phonetok".into())
-        );
+    fn azula_connect_scheme_is_rejected() {
+        assert_eq!(parse_ticket("azula://connect?code=phonetok"), None);
+        assert_eq!(parse_ticket("azula://connect?code=phonetok&v=2"), None);
     }
 
     #[test]
     fn bare_token() {
         assert_eq!(parse_ticket("testtoken123"), Some("testtoken123".into()));
+    }
+
+    #[test]
+    fn bare_token_with_trailing_slash() {
+        assert_eq!(parse_ticket("testtoken123/"), Some("testtoken123".into()));
     }
 
     #[test]
@@ -443,24 +399,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_legacy_slash_s_is_ticket() {
-        assert_eq!(parse("https://azula.app/s/abc123"), Some(Parsed::Ticket("abc123".into())));
+    fn parse_legacy_slash_s_is_unrecognized() {
+        assert_eq!(parse("https://azula.app/s/abc123"), None);
     }
 
     #[test]
-    fn parse_legacy_connect_is_ticket() {
-        assert_eq!(
-            parse("https://azula.app/connect/mytoken"),
-            Some(Parsed::Ticket("mytoken".into()))
-        );
+    fn parse_legacy_connect_is_unrecognized() {
+        assert_eq!(parse("https://azula.app/connect/mytoken"), None);
     }
 
     #[test]
-    fn parse_legacy_custom_scheme_is_ticket() {
-        assert_eq!(
-            parse("azula://connect?code=phonetok"),
-            Some(Parsed::Ticket("phonetok".into()))
-        );
+    fn parse_legacy_custom_scheme_is_unrecognized() {
+        assert_eq!(parse("azula://connect?code=phonetok"), None);
     }
 
     #[test]

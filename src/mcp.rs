@@ -199,36 +199,30 @@ fn extract_text(result: &CallToolResult) -> String {
 /// Gated the same way `term.rs`'s `TermHandler` is (see
 /// `accept_gate::gate_stranger`): a known device (registry endpoint-id match)
 /// connects unchanged; a stranger's first stream must open with a valid
-/// `Hello.invite`, or `allow_legacy` admits it unverified.
+/// `Hello.invite` or the connection is closed.
 #[derive(Clone)]
 pub struct LlmHandler {
     /// `None` => no/failed MCP session; use the canned fallback responder.
     mcp: Option<Arc<McpHandle>>,
     /// Our own endpoint id — the invite-verification audience and signature key.
     my_endpoint_id: EndpointId,
-    /// Admit invite-less strangers as unverified instead of closing the
-    /// connection (`--allow-legacy`, default on for one release).
-    allow_legacy: bool,
 }
 
 impl LlmHandler {
-    pub fn new(mcp: Option<Arc<McpHandle>>, my_endpoint_id: EndpointId, allow_legacy: bool) -> Self {
+    pub fn new(mcp: Option<Arc<McpHandle>>, my_endpoint_id: EndpointId) -> Self {
         if mcp.is_none() {
             warn!(
                 "no MCP server configured (or connect failed); the LLM relay will reply with a \
                  canned notice. Pass --mcp-stdio or --mcp-url to enable real responses."
             );
         }
-        LlmHandler { mcp, my_endpoint_id, allow_legacy }
+        LlmHandler { mcp, my_endpoint_id }
     }
 }
 
 impl std::fmt::Debug for LlmHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmHandler")
-            .field("mcp", &self.mcp.is_some())
-            .field("allow_legacy", &self.allow_legacy)
-            .finish()
+        f.debug_struct("LlmHandler").field("mcp", &self.mcp.is_some()).finish()
     }
 }
 
@@ -266,15 +260,13 @@ impl LlmHandler {
             };
 
             let mut reader = BufReader::new(recv);
-            let mut first_frame: Option<Frame> = None;
 
             if first_stream && !known {
                 let device_name = format!("llm-{}", &remote[..8.min(remote.len())]);
-                match gate_stranger(&mut reader, self.my_endpoint_id, self.allow_legacy, &remote, &device_name, "llm").await
+                match gate_stranger(&mut reader, self.my_endpoint_id, &remote, &device_name, "llm").await
                 {
-                    GateOutcome::Admit { replay } => {
+                    GateOutcome::Admit => {
                         known = true; // don't re-gate later streams on this connection
-                        first_frame = replay.map(|b| *b);
                     }
                     GateOutcome::Close => return Ok(()),
                 }
@@ -284,7 +276,7 @@ impl LlmHandler {
             let this = self.clone();
             let remote = remote.clone();
             tokio::spawn(async move {
-                if let Err(e) = this.session(send, reader, first_frame, remote.clone()).await {
+                if let Err(e) = this.session(send, reader, remote.clone()).await {
                     warn!(%remote, error = %e, "llm: session error");
                 }
             });
@@ -292,30 +284,26 @@ impl LlmHandler {
     }
 
     /// Handle one LLM session bi stream: read prompts, stream answers.
-    /// `first_frame`, if present, is a frame the accept-gate already
-    /// consumed off `reader` (e.g. a legacy client's `Chat` sent with no
-    /// preceding `Hello`) and must be processed before the read loop starts,
-    /// so gating never silently drops a stranger's first message.
+    ///
+    /// Nothing is ever left over from the accept gate: it admits only a
+    /// `Hello`, which it consumes whole. (It used to be able to hand back a
+    /// legacy client's `Chat` sent with no preceding `Hello`; that path went
+    /// away with the legacy escape hatch.)
     async fn session(
         self,
         send: SendStream,
         mut reader: BufReader<RecvStream>,
-        first_frame: Option<Frame>,
         remote: String,
     ) -> Result<()> {
         let mut send = send;
-        let mut pending = first_frame;
 
         loop {
-            let frame = match pending.take() {
+            let frame = match read_frame(&mut reader).await? {
                 Some(f) => f,
-                None => match read_frame(&mut reader).await? {
-                    Some(f) => f,
-                    None => {
-                        debug!(%remote, "llm: stream closed by client");
-                        break;
-                    }
-                },
+                None => {
+                    debug!(%remote, "llm: stream closed by client");
+                    break;
+                }
             };
 
             match frame {
@@ -447,20 +435,42 @@ mod tests {
         use iroh::Endpoint;
         use tokio::time::timeout;
 
-        let server_ep = Endpoint::bind(presets::Minimal).await.expect("server endpoint bind");
+        // Mints a real invite, so it touches the issued-invite store and must
+        // isolate AZULA_INVITES_DIR under ENV_TEST_LOCK — same convention as
+        // `accept_gate::valid_invite_admits_with_no_replay`.
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        let base = std::env::temp_dir()
+            .join(format!("azula-mcp-test-{}", std::process::id()))
+            .join("llm_session_real_quic");
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("AZULA_INVITES_DIR", base.join("invites"));
+
+        let server_secret = iroh::SecretKey::generate();
+        let server_ep = Endpoint::builder(presets::Minimal)
+            .secret_key(server_secret.clone())
+            .bind()
+            .await
+            .expect("server endpoint bind");
         let server_addr = server_ep.addr();
         let server_id = server_ep.id();
-        let router = Router::builder(server_ep)
-            .accept(LLM_ALPN, LlmHandler::new(None, server_id, true))
-            .spawn();
+        let router =
+            Router::builder(server_ep).accept(LLM_ALPN, LlmHandler::new(None, server_id)).spawn();
+
+        // The stranger must present an invite this endpoint issued — there is
+        // no invite-less path any more.
+        let ticket_str = iroh_tickets::endpoint::EndpointTicket::new(server_addr.clone()).to_string();
+        let (payload, _) =
+            crate::invite::mint(&ticket_str, crate::invite::Expiry::Never, false, false, None, &server_secret)
+                .expect("mint invite");
+        let token = payload.encode();
 
         let client_ep = Endpoint::bind(presets::Minimal).await.expect("client endpoint bind");
         let conn = client_ep.connect(server_addr, LLM_ALPN).await.expect("client connect");
         let (mut send, recv) = conn.open_bi().await.expect("open_bi");
 
-        // A legacy client's opener: a bare `Chat` with no preceding `Hello`
-        // — admitted by `allow_legacy` and replayed into the session by the
-        // gate, so the prompt must not be lost.
+        write_frame(&mut send, &Frame::Hello { name: "peer".into(), invite: Some(token), cert: None })
+            .await
+            .expect("write hello");
         write_frame(&mut send, &Frame::Chat { text: "ping".into(), id: None })
             .await
             .expect("write chat");
@@ -489,5 +499,7 @@ mod tests {
         conn.close(0u32.into(), b"done");
         let _ = router.shutdown().await;
         client_ep.close().await;
+
+        std::env::remove_var("AZULA_INVITES_DIR");
     }
 }

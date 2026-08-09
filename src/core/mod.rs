@@ -213,9 +213,7 @@ pub struct Established {
 /// any `--device` flags), and start the background dial + redelivery loops.
 ///
 /// `label` is a human tag written into the runtime state file (the HTTP
-/// bind, "stdio", or a CLI verb's own label). `allow_legacy` admits
-/// invite-less unknown strangers as unverified instead of closing the
-/// connection. `session_name` is `--session`/`AZULA_SESSION`: `Some` selects
+/// bind, "stdio", or a CLI verb's own label). `session_name` is `--session`/`AZULA_SESSION`: `Some` selects
 /// a persistent named session key, `None` mints a fresh ephemeral one per
 /// process (design.md D2) — `azula mcp` passes the raw `--session` value
 /// (ephemeral by default); one-shot CLI verbs pass `Some("cli")` unless the
@@ -224,7 +222,6 @@ pub async fn establish(
     label: &str,
     device_urls: Vec<String>,
     name: Option<String>,
-    allow_legacy: bool,
     session_name: Option<String>,
 ) -> Result<Established> {
     let session = SessionKey::resolve(session_name.as_deref())?;
@@ -256,7 +253,6 @@ pub async fn establish(
         label.to_string(),
         own_name.clone(),
         my_endpoint_id,
-        allow_legacy,
         session_cert.clone(),
     );
     let iroh_router = Router::builder(raw_endpoint).accept(LLM_ALPN, accept_handler).spawn();

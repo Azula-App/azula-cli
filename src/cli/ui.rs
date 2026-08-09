@@ -128,7 +128,7 @@ pub(super) async fn render(args: UiRenderArgs) -> Result<()> {
     };
 
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, true, Some(session_name)).await?;
+    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
     let core = est.core;
     let device = super::resolve_or_exit(&core, args.device.device.as_deref()).await;
 
@@ -155,7 +155,7 @@ pub(super) async fn update(args: UiUpdateArgs) -> Result<()> {
     };
 
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, true, Some(session_name)).await?;
+    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
     let core = est.core;
     let device = super::resolve_or_exit(&core, args.device.device.as_deref()).await;
 
@@ -176,7 +176,7 @@ pub(super) async fn update(args: UiUpdateArgs) -> Result<()> {
 
 pub(super) async fn delete(args: UiDeleteArgs) -> Result<()> {
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, true, Some(session_name)).await?;
+    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
     let core = est.core;
     let device = super::resolve_or_exit(&core, args.device.device.as_deref()).await;
 

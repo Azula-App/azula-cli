@@ -108,14 +108,10 @@ pub(super) struct LinkArgs {
     relay: bool,
 }
 
-/// Options for the deprecated `azula mailbox` alias.
+/// Options for the deprecated `azula mailbox` alias. Takes none — the
+/// invite gate is unconditional since the legacy escape hatch was retired.
 #[derive(Debug, Clone, clap::Args)]
-pub(super) struct MailboxArgs {
-    /// Admit invite-less unverified strangers instead of closing the
-    /// connection (same convention as `serve`/`serve-mcp`).
-    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
-    pub(super) allow_legacy: bool,
-}
+pub(super) struct MailboxArgs {}
 
 /// Options for the `serve` command (also used when run with no subcommand).
 #[derive(Debug, Clone, clap::Args)]
@@ -145,14 +141,6 @@ pub(super) struct ServeArgs {
     /// Docker shell container.
     #[arg(long, env = "AZULA_TERM_ONLY")]
     term_only: bool,
-
-    /// Admit invite-less unknown strangers into the remote-shell ALPN as
-    /// unverified instead of closing the connection. Transition escape hatch
-    /// — default on for one release, then off (see
-    /// azula-docs/openspec/specs/invitations/design.md). Does not affect the LLM relay ALPN,
-    /// which has no device-registry concept.
-    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
-    allow_legacy: bool,
 
     /// Print the raw dial ticket in the startup pairing QR instead of minting
     /// a signed 24h invite.
@@ -510,8 +498,8 @@ fn default_link_name() -> String {
     }
 }
 
-pub(super) async fn cmd_mailbox(args: MailboxArgs) -> Result<()> {
-    mailbox_role::run(args.allow_legacy).await
+pub(super) async fn cmd_mailbox(_args: MailboxArgs) -> Result<()> {
+    mailbox_role::run().await
 }
 
 /// `azula serve` — bind the iroh endpoint, print the ticket, and serve until
@@ -612,15 +600,15 @@ pub(super) async fn serve(args: ServeArgs) -> Result<()> {
         Router::builder(endpoint)
             .accept(
                 TERM_ALPN,
-                TermHandler::new(endpoint_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
+                TermHandler::new(endpoint_id, args.name.clone(), args.description.clone(), session_ttl),
             )
             .spawn()
     } else {
         Router::builder(endpoint)
-            .accept(LLM_ALPN, LlmHandler::new(mcp, endpoint_id, args.allow_legacy))
+            .accept(LLM_ALPN, LlmHandler::new(mcp, endpoint_id))
             .accept(
                 TERM_ALPN,
-                TermHandler::new(endpoint_id, args.allow_legacy, args.name.clone(), args.description.clone(), session_ttl),
+                TermHandler::new(endpoint_id, args.name.clone(), args.description.clone(), session_ttl),
             )
             .spawn()
     };

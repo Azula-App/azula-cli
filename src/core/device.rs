@@ -372,10 +372,6 @@ pub(crate) struct BridgeAcceptHandler {
     /// Our own endpoint id — the invite-verification audience (rule 2: the
     /// invite's embedded ticket must name *us*) and signature-verification key.
     my_endpoint_id: EndpointId,
-    /// Admit invite-less strangers as unverified pending devices instead of
-    /// closing the connection (transition escape hatch; `--allow-legacy`,
-    /// default on for one release per the invitations spec).
-    allow_legacy: bool,
     /// This session's own `azd…` certificate (design.md D1/D3), sent back to
     /// an app that dials in so it can recognise our machine root on future
     /// connections without an invite.
@@ -390,7 +386,6 @@ impl BridgeAcceptHandler {
         bind: String,
         own_name: String,
         my_endpoint_id: EndpointId,
-        allow_legacy: bool,
         own_cert: String,
     ) -> Self {
         Self {
@@ -398,7 +393,6 @@ impl BridgeAcceptHandler {
             bind,
             own_name,
             my_endpoint_id,
-            allow_legacy,
             own_cert,
             scan_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
@@ -414,7 +408,6 @@ impl ProtocolHandler for BridgeAcceptHandler {
             self.own_name.clone(),
             self.scan_counter.clone(),
             self.my_endpoint_id,
-            self.allow_legacy,
             self.own_cert.clone(),
         )
         .await
@@ -434,7 +427,6 @@ async fn accept_incoming(
     own_name: String,
     counter: Arc<std::sync::atomic::AtomicU32>,
     my_endpoint_id: EndpointId,
-    allow_legacy: bool,
     own_cert: String,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
@@ -493,19 +485,13 @@ async fn accept_incoming(
                     info!(%fallback_name, invite_id = %v.invite_id, "bridge: stranger presented a valid invite");
                     verified = Some(v);
                 }
-                Err(e) if allow_legacy => {
-                    warn!(%fallback_name, error = %e, "bridge: invite verification failed; admitting as unverified (--allow-legacy)");
-                }
                 Err(e) => {
-                    warn!(%fallback_name, error = %e, "bridge: invite verification failed; closing (pass --allow-legacy to admit anyway)");
+                    warn!(%fallback_name, error = %e, "bridge: invite verification failed; closing");
                     return Ok(());
                 }
             },
-            None if allow_legacy => {
-                info!(%fallback_name, "bridge: stranger connected without an invite; admitting as unverified (--allow-legacy)");
-            }
             None => {
-                warn!(%fallback_name, "bridge: stranger connected without a valid invite; closing (pass --allow-legacy to admit anyway)");
+                warn!(%fallback_name, "bridge: stranger connected without a valid invite; closing");
                 return Ok(());
             }
         }

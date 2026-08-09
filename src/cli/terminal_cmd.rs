@@ -78,10 +78,6 @@ pub(super) struct TerminalArgs {
     #[arg(long = "session-ttl", value_name = "MINUTES", default_value_t = 60)]
     session_ttl: u64,
 
-    /// Admit invite-less unknown strangers as unverified instead of
-    /// requiring the connect block's invite.
-    #[arg(long = "allow-legacy", default_value_t = true, action = clap::ArgAction::Set)]
-    allow_legacy: bool,
 
     /// Internal: re-exec target for `terminal new`'s detached host process.
     /// Not part of the public CLI surface.
@@ -199,7 +195,6 @@ pub(super) async fn host_session(
     name_override: Option<String>,
     description_override: Option<String>,
     session_ttl_minutes: u64,
-    allow_legacy: bool,
 ) -> Result<HostedTerminal> {
     let session = SessionKey::resolve(session_name)?;
     let (endpoint, ticket) = crate::endpoint::bind_endpoint_with_secret(session.secret.clone())
@@ -222,10 +217,10 @@ pub(super) async fn host_session(
     }
 
     let router = Router::builder(endpoint)
-        .accept(LLM_ALPN, LlmHandler::new(None, my_endpoint_id, allow_legacy))
+        .accept(LLM_ALPN, LlmHandler::new(None, my_endpoint_id))
         .accept(
             TERM_ALPN,
-            TermHandler::new(my_endpoint_id, allow_legacy, name_override, description_override, session_ttl)
+            TermHandler::new(my_endpoint_id, name_override, description_override, session_ttl)
                 .with_default_session(session_id.clone()),
         )
         .spawn();
@@ -241,7 +236,7 @@ pub(super) async fn host_session(
 }
 
 async fn cmd_bare(args: TerminalArgs) -> Result<()> {
-    let hosted = host_session(None, None, args.name, args.desc, args.session_ttl, args.allow_legacy).await?;
+    let hosted = host_session(None, None, args.name, args.desc, args.session_ttl).await?;
     print_connect_block(&hosted.endpoint_id.to_string(), &hosted.invite_url);
     wait_until_session_ends_or_ctrl_c(&hosted.session_id).await;
     term::kill_all_sessions();
@@ -258,7 +253,6 @@ async fn cmd_host_detached(args: TerminalArgs) -> Result<()> {
         Some(name.clone()),
         args.desc.clone(),
         args.session_ttl,
-        args.allow_legacy,
     )
     .await?;
 
