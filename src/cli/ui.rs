@@ -98,7 +98,7 @@ fn parse_and_validate_components(raw: &str) -> std::result::Result<serde_json::V
     Ok(value)
 }
 
-pub(super) async fn render(args: UiRenderArgs) -> Result<()> {
+pub(super) async fn render(args: UiRenderArgs, label: &super::SessionLabel) -> Result<()> {
     let raw = match read_input(&args.file) {
         Ok(s) => s,
         Err(e) => {
@@ -128,7 +128,8 @@ pub(super) async fn render(args: UiRenderArgs) -> Result<()> {
     };
 
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
+    let est =
+        crate::core::establish("cli", vec![], label.name.clone(), label.description.clone(), Some(session_name)).await?;
     let core = est.core;
     let device = super::resolve_or_exit(&core, args.device.device.as_deref()).await;
 
@@ -145,7 +146,7 @@ pub(super) async fn render(args: UiRenderArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn update(args: UiUpdateArgs) -> Result<()> {
+pub(super) async fn update(args: UiUpdateArgs, label: &super::SessionLabel) -> Result<()> {
     let value: serde_json::Value = match serde_json::from_str(&args.value) {
         Ok(v) => v,
         Err(e) => {
@@ -155,7 +156,8 @@ pub(super) async fn update(args: UiUpdateArgs) -> Result<()> {
     };
 
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
+    let est =
+        crate::core::establish("cli", vec![], label.name.clone(), label.description.clone(), Some(session_name)).await?;
     let core = est.core;
     let device = super::resolve_or_exit(&core, args.device.device.as_deref()).await;
 
@@ -174,9 +176,10 @@ pub(super) async fn update(args: UiUpdateArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn delete(args: UiDeleteArgs) -> Result<()> {
+pub(super) async fn delete(args: UiDeleteArgs, label: &super::SessionLabel) -> Result<()> {
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
+    let est =
+        crate::core::establish("cli", vec![], label.name.clone(), label.description.clone(), Some(session_name)).await?;
     let core = est.core;
     let device = super::resolve_or_exit(&core, args.device.device.as_deref()).await;
 

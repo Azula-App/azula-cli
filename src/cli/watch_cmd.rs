@@ -23,9 +23,10 @@ pub(super) struct WatchArgs {
 /// How often `watch` polls the device map / inboxes for changes.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
-pub(super) async fn run(args: WatchArgs) -> Result<()> {
+pub(super) async fn run(args: WatchArgs, label: &super::SessionLabel) -> Result<()> {
     let session_name = super::resolve_cli_session_name(args.session.session.clone());
-    let est = crate::core::establish("cli", vec![], None, Some(session_name)).await?;
+    let est =
+        crate::core::establish("cli", vec![], label.name.clone(), label.description.clone(), Some(session_name)).await?;
     let core = est.core;
 
     // If a specific --device was requested, it must be known up front —

@@ -5,7 +5,10 @@
 //!   - **global**:  `~/.azula/devices.json`
 //!   - **runtime**: `<tempdir>/azula/bridge.json`      (live state, managed by bridge)
 //!
-//! `load()` merges both; project entries win on name collision.
+//! `load()` merges both. A row is identified by the endpoint id its ticket
+//! resolves to, not by its display name, so re-pairing a device updates its
+//! own row and two different devices never collide; project entries win when
+//! both files hold the same device.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -113,35 +116,147 @@ pub fn read_file(path: &Path) -> Vec<Device> {
     }
 }
 
-/// Load all known devices.  Global entries come first; project entries replace
-/// any global entry with the same name.
+/// Resolve a stored `ticket` to the endpoint id it names, for either shape the
+/// registry holds: a dialable `EndpointTicket` string (written by `azula pair`
+/// and outbound dial), or a bare endpoint-id hex string (written by
+/// accept-side registration, which has no dialable address to store — see
+/// `accept_gate::gate_stranger`).
+///
+/// `None` when the ticket is in neither shape — a hand-edited row, or a
+/// format we don't recognize. Those rows stay identified by name alone, so
+/// editing `devices.json` by hand (which the shipped README invites) can't
+/// make a row unreachable.
+pub fn endpoint_id_of(ticket: &str) -> Option<EndpointId> {
+    if let Ok(id) = EndpointId::from_str(ticket) {
+        return Some(id);
+    }
+    EndpointTicket::from_str(ticket).ok().map(|t| t.endpoint_addr().id)
+}
+
+/// The value that identifies a registry row. A device *is* its endpoint id;
+/// the display name is a mutable label on top. Rows whose ticket doesn't
+/// resolve fall back to name identity — see [`endpoint_id_of`].
+///
+/// The `id:`/`name:` prefixes keep an endpoint-id string from ever colliding
+/// with a device someone named after one.
+fn identity_key(d: &Device) -> String {
+    match endpoint_id_of(&d.ticket) {
+        Some(id) => format!("id:{id}"),
+        None => format!("name:{}", d.name),
+    }
+}
+
+/// Load all known devices, merging global then project.
+///
+/// Rows are identified by endpoint id (see [`identity_key`]), so the same
+/// device present in both files merges to one row with the project entry
+/// winning — regardless of what either file calls it.
 pub fn load() -> Vec<Device> {
+    let global = global_path().map(|p| read_file(&p)).unwrap_or_default();
+    let project = project_path().map(|p| read_file(&p)).unwrap_or_default();
+    merge(global, project)
+}
+
+/// Merge two registry files into the view every caller sees.
+///
+/// Split out from [`load`] so it can be tested without touching the
+/// filesystem or the process-global registry-dir env var.
+fn merge(global: Vec<Device>, project: Vec<Device>) -> Vec<Device> {
     let mut map: indexmap::IndexMap<String, Device> = indexmap::IndexMap::new();
+    let mut from_project: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    if let Some(g) = global_path() {
-        for d in read_file(&g) {
-            map.insert(d.name.clone(), d);
+    for d in global {
+        map.insert(identity_key(&d), d);
+    }
+    for d in project {
+        let key = identity_key(&d);
+        from_project.insert(key.clone());
+        map.insert(key, d);
+    }
+
+    // A display name has to resolve to exactly one device — it's the handle
+    // `--device` and `ensure_device` look up. Two *different* devices can only
+    // end up sharing a name across the two files (a hand edit, or rows written
+    // before `add` disambiguated). The project registry's device keeps the
+    // name, which is the precedence that applied when rows were keyed by name
+    // outright; the other is shadowed, exactly as it was before this keying.
+    let mut owner: indexmap::IndexMap<String, String> = indexmap::IndexMap::new();
+    for (key, d) in map.iter() {
+        let take = match owner.get(&d.name) {
+            None => true,
+            Some(held) => !from_project.contains(held) && from_project.contains(key),
+        };
+        if take {
+            owner.insert(d.name.clone(), key.clone());
         }
     }
 
-    if let Some(p) = project_path() {
-        for d in read_file(&p) {
-            map.insert(d.name.clone(), d);
+    let kept: std::collections::HashSet<String> = owner.into_values().collect();
+    map.into_iter().filter(|(k, _)| kept.contains(k)).map(|(_, d)| d).collect()
+}
+
+/// Pick a display name for `device` that no *other* device in `existing` is
+/// already using.
+///
+/// Silent overwrite was the bug this change exists to fix; a silent name
+/// collision would just relocate it, since a name that resolves to two
+/// devices makes `--device` ambiguous. So when the derived name is taken by a
+/// different endpoint id, extend the hex run it came from — `198896c5` →
+/// `198896c52` → `198896c52f` — which keeps the name derived from the device
+/// rather than from an arbitrary counter, and preserves any role prefix
+/// (`term-`, `mailbox-peer-`) the caller put in front of it.
+///
+/// Falls back to numeric suffixes for names not derived from the endpoint id,
+/// and gives up extending at 16 hex chars: two endpoint ids sharing a 16-hex
+/// prefix isn't a collision anyone will hit, and the loop needs a defined end.
+fn disambiguate(device: &Device, existing: &[Device]) -> String {
+    let taken = |candidate: &str| {
+        existing.iter().any(|d| d.name == candidate && identity_key(d) != identity_key(device))
+    };
+
+    if !taken(&device.name) {
+        return device.name.clone();
+    }
+
+    if let Some(id) = endpoint_id_of(&device.ticket) {
+        let full = id.to_string();
+        // Keep whatever precedes the 8-hex run (a role prefix, or nothing).
+        if let Some(prefix) = full.get(..8).and_then(|short| device.name.strip_suffix(short)) {
+            for len in 9..=16.min(full.len()) {
+                if let Some(run) = full.get(..len) {
+                    let candidate = format!("{prefix}{run}");
+                    if !taken(&candidate) {
+                        return candidate;
+                    }
+                }
+            }
         }
     }
 
-    map.into_values().collect()
+    (2..)
+        .map(|n| format!("{}-{n}", device.name))
+        .find(|candidate| !taken(candidate))
+        .expect("an unused numeric suffix always exists")
 }
 
 // ---------------------------------------------------------------------------
 // Add / write
 // ---------------------------------------------------------------------------
 
+/// What [`add`] persisted.
+pub struct Added {
+    /// The registry file written.
+    pub path: PathBuf,
+    /// The name the device is stored under. Not always the name passed in: a
+    /// name already held by a *different* device is disambiguated, so callers
+    /// that report back to the user must report this rather than what they
+    /// asked for.
+    pub name: String,
+}
+
 /// Persist `device` to the project registry (inside git tree, when `!global`)
 /// or the global registry, whichever is appropriate.
-///
-/// Returns the path written.
-pub fn add(device: Device, global: bool) -> Result<PathBuf> {
+pub fn add(device: Device, global: bool) -> Result<Added> {
     let path = if !global {
         project_path().unwrap_or_else(|| {
             global_path().expect("neither project nor HOME path available")
@@ -164,35 +279,47 @@ pub fn add(device: Device, global: bool) -> Result<PathBuf> {
         );
     }
 
-    // Read existing, replace same-name entry, write back.
+    // Read existing, replace this device's own row, write back.
+    //
+    // The row is matched by endpoint id, not by display name: re-pairing a
+    // device through a fresh invite carries different ticket text but the
+    // same endpoint id, and must update its own row rather than fork a
+    // duplicate — while two *different* devices must never collide, whatever
+    // they happen to be called. Rows on either side that don't resolve to an
+    // endpoint id fall back to name equality.
     let mut existing = read_file(&path);
-    if let Some(pos) = existing.iter().position(|d| d.name == device.name) {
-        existing[pos] = device;
-    } else {
-        existing.push(device);
+    let pos = existing.iter().position(|d| match (endpoint_id_of(&device.ticket), endpoint_id_of(&d.ticket)) {
+        (Some(incoming), Some(known)) => incoming == known,
+        _ => d.name == device.name,
+    });
+
+    // Check the merged view, not just this file: a name has to be unambiguous
+    // across both registries, since that's what callers resolve against.
+    // `disambiguate` ignores this device's own row, so replacing it in place
+    // never counts as colliding with itself.
+    let mut device = device;
+    let mut seen = load();
+    seen.extend(existing.iter().cloned());
+    device.name = disambiguate(&device, &seen);
+    let name = device.name.clone();
+
+    match pos {
+        Some(pos) => existing[pos] = device,
+        None => existing.push(device),
     }
 
     let content = serde_json::to_string_pretty(&RegistryFile { devices: existing })?;
     fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
 
-    Ok(path)
+    Ok(Added { path, name })
 }
 
 /// Find a registered device whose ticket's embedded endpoint id matches
 /// `endpoint_id`. Used by accept-side gates (`term.rs`, `mcp.rs`,
 /// `accept_gate.rs`) to recognize a reconnecting known peer regardless of
-/// what name it announces. Matches two `ticket` shapes: a dialable
-/// `EndpointTicket` string (from `azula pair` / outbound dial), or a bare
-/// endpoint-id hex string (from accept-side registration, which has no
-/// dialable address to store — see `accept_gate::gate_stranger`).
+/// what name it announces.
 pub fn find_by_endpoint_id(endpoint_id: &EndpointId) -> Option<Device> {
-    let endpoint_id_str = endpoint_id.to_string();
-    load().into_iter().find(|d| {
-        d.ticket == endpoint_id_str
-            || EndpointTicket::from_str(&d.ticket)
-                .map(|t| &t.endpoint_addr().id == endpoint_id)
-                .unwrap_or(false)
-    })
+    load().into_iter().find(|d| endpoint_id_of(&d.ticket) == Some(*endpoint_id))
 }
 
 /// Remove `name` from both the project and global registry files (whichever
@@ -312,6 +439,126 @@ mod tests {
 
     fn isolated_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("azula-registry-test-{}-{name}", std::process::id()))
+    }
+
+    /// A fresh endpoint id, and a dialable ticket naming it — the two shapes a
+    /// `Device.ticket` can hold.
+    fn endpoint() -> (EndpointId, String) {
+        let id = iroh::SecretKey::generate().public();
+        (id, EndpointTicket::new(iroh::EndpointAddr::from(id)).to_string())
+    }
+
+    fn dev(name: &str, ticket: &str) -> Device {
+        Device { name: name.into(), ticket: ticket.into(), added_at: None, invite: None }
+    }
+
+    /// The bug this change fixes: two phones paired from invites both derived
+    /// the name `endpoint`, and the second silently replaced the first.
+    #[tokio::test]
+    async fn two_devices_sharing_a_name_both_survive() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let dir = isolated_dir("no_collision");
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        let (first_id, first_ticket) = endpoint();
+        let (second_id, second_ticket) = endpoint();
+        add(dev("endpoint", &first_ticket), false).unwrap();
+        let second = add(dev("endpoint", &second_ticket), false).unwrap();
+
+        let loaded = load();
+        assert_eq!(loaded.len(), 2, "second pairing must not replace the first");
+        assert_ne!(second.name, "endpoint", "the contested name must be disambiguated");
+        assert!(find_by_endpoint_id(&first_id).is_some(), "first device still registered");
+        assert!(find_by_endpoint_id(&second_id).is_some(), "second device registered");
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-pairing through a fresh invite carries different ticket text but the
+    /// same endpoint id: it must update that device's own row, not fork one —
+    /// and must not disturb a name the user chose.
+    #[tokio::test]
+    async fn re_pairing_updates_the_devices_own_row() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let dir = isolated_dir("re_pair");
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        let (id, ticket) = endpoint();
+        add(dev("my-phone", &id.to_string()), false).unwrap();
+        // Same device, now as a dialable ticket rather than a bare id.
+        add(dev("my-phone", &ticket), false).unwrap();
+
+        let loaded = load();
+        assert_eq!(loaded.len(), 1, "same endpoint id must occupy one row");
+        assert_eq!(loaded[0].ticket, ticket, "row updated to the newer ticket");
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Hand-edited rows whose ticket names no endpoint id keep matching by
+    /// name, so editing `devices.json` can't strand a row.
+    #[tokio::test]
+    async fn unresolvable_rows_still_match_by_name() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let dir = isolated_dir("unresolvable");
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("AZULA_REGISTRY_DIR", &dir);
+
+        add(dev("phone", "hand-written"), false).unwrap();
+        add(dev("phone", "hand-written-again"), false).unwrap();
+
+        let loaded = load();
+        assert_eq!(loaded.len(), 1, "same name, unresolvable ticket: one row");
+        assert_eq!(loaded[0].ticket, "hand-written-again");
+        assert!(remove("phone").unwrap(), "and it stays forgettable");
+
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_collapses_one_device_present_in_both_files() {
+        let (_, ticket) = endpoint();
+        let merged = merge(vec![dev("phone", &ticket)], vec![dev("renamed-phone", &ticket)]);
+        assert_eq!(merged.len(), 1, "same endpoint id is one device");
+        assert_eq!(merged[0].name, "renamed-phone", "project registry wins");
+    }
+
+    #[test]
+    fn merge_keeps_distinct_devices_that_share_a_name() {
+        let (_, a) = endpoint();
+        let (_, b) = endpoint();
+        let merged = merge(vec![dev("phone", &a)], vec![dev("phone", &b)]);
+        // Both are real devices, but a name has to resolve to one of them.
+        assert_eq!(merged.len(), 1, "a contested name resolves to a single device");
+        assert_eq!(merged[0].ticket, b, "project registry wins the name");
+    }
+
+    #[test]
+    fn disambiguate_extends_the_hex_run_and_keeps_any_prefix() {
+        let (id, ticket) = endpoint();
+        let short: String = id.to_string().chars().take(8).collect();
+        let (_, other) = endpoint();
+
+        let device = dev(&format!("term-{short}"), &ticket);
+        let taken = vec![dev(&format!("term-{short}"), &other)];
+        let picked = disambiguate(&device, &taken);
+
+        assert_ne!(picked, device.name, "must not reuse a name another device holds");
+        assert!(picked.starts_with(&format!("term-{short}")), "extends rather than replaces: {picked}");
+    }
+
+    #[test]
+    fn disambiguate_leaves_a_devices_own_row_alone() {
+        let (_, ticket) = endpoint();
+        let device = dev("phone", &ticket);
+        // The same device already on disk isn't a collision with itself.
+        let existing = vec![dev("phone", &ticket)];
+        assert_eq!(disambiguate(&device, &existing), "phone");
     }
 
     /// A `devices.json` written before `relay-hints.json` existed (i.e. the
