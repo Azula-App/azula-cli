@@ -27,7 +27,6 @@ use portable_pty::PtySize;
 use tracing::warn;
 
 use crate::cli::terminal_cmd::print_connect_block;
-use crate::identity;
 use crate::mcp::{LlmHandler, LLM_ALPN};
 use crate::qr;
 use crate::session::SessionKey;
@@ -308,9 +307,8 @@ async fn start_handoff(
         )
         .spawn();
 
-    let machine_secret = identity::load_machine_secret_if_exists();
     let invite_url =
-        match crate::core::mint_pairing_invite(machine_secret.as_ref(), &ticket, router.endpoint().secret_key()).await {
+        match crate::core::mint_pairing_invite(&ticket, router.endpoint().secret_key()) {
             Some(encoded) => qr::invite_url(&encoded),
             None => qr::pairing_url(&ticket),
         };

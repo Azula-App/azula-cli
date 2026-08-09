@@ -377,26 +377,26 @@ pub(crate) fn mint_bridge_invite(ticket: &str, secret_key: &SecretKey) -> Option
 }
 
 /// Mint the pairing invite shown by the startup banner / `start_pairing` /
-/// `SessionCore::pairing_url` (design.md D1/D3): against the **machine**
-/// identity when one already exists on disk, or the session's own when it
-/// doesn't (the headless case, or a machine-identity bind failure).
-pub(crate) async fn mint_pairing_invite(
-    machine_secret: Option<&SecretKey>,
-    session_ticket: &str,
-    session_secret: &SecretKey,
-) -> Option<String> {
-    if let Some(machine_secret) = machine_secret {
-        match crate::endpoint::bind_endpoint_with_secret(machine_secret.clone()).await {
-            Ok((_ep, machine_ticket)) => {
-                if let Some(encoded) = mint_bridge_invite(&machine_ticket, machine_secret) {
-                    return Some(encoded);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "core: could not bind the machine identity for a pairing invite; falling back to the session identity");
-            }
-        }
-    }
+/// `SessionCore::pairing_url`, always against the **session** identity — the
+/// endpoint that actually accepts the dial the invite invites.
+///
+/// This used to mint against the machine identity when `machine.key` existed
+/// (design.md D1/D3), binding that endpoint just long enough to read its
+/// ticket. The endpoint was dropped at the end of that expression, so the
+/// advertised endpoint had no listener: a scanner resolved the peer from the
+/// discovery record published during the bind and then hung forever "opening
+/// direct path". The gate would have rejected the invite even if the dial had
+/// landed — [`invite::verify_inbound`] requires both that the embedded
+/// ticket's endpoint id *is* the verifying endpoint's own and that the
+/// signature is by that same key, and [`crate::accept_gate`]'s gates verify as
+/// the session endpoint.
+///
+/// The machine identity is still the trust anchor; it just isn't the dial
+/// target. The session presents a `Hello.cert` chaining to the machine root,
+/// and the app pins *that* root when it accepts (session-identity spec,
+/// "Accepting a certified stranger pins the root"), so a machine paired
+/// through any one session auto-admits its later sessions.
+pub(crate) fn mint_pairing_invite(session_ticket: &str, session_secret: &SecretKey) -> Option<String> {
     mint_bridge_invite(session_ticket, session_secret)
 }
 
@@ -1172,7 +1172,7 @@ impl SessionCore {
         if legacy_ticket {
             qr::pairing_url(&self.ticket)
         } else {
-            match mint_pairing_invite(self.machine_secret.as_ref(), &self.ticket, self.endpoint.secret_key()).await {
+            match mint_pairing_invite(&self.ticket, self.endpoint.secret_key()) {
                 Some(encoded) => qr::invite_url(&encoded),
                 None => qr::pairing_url(&self.ticket),
             }
@@ -1230,6 +1230,55 @@ fn set_at_json_pointer(root: &mut serde_json::Value, path: &str, value: serde_js
         *cursor = serde_json::Value::Object(serde_json::Map::new());
     }
     cursor.as_object_mut().expect("just ensured this is an object").insert(last.clone(), value);
+}
+
+/// A pairing invite is only useful if the endpoint that *accepts* the dial it
+/// advertises can also redeem it. Minting against the machine identity broke
+/// both halves at once: the machine endpoint was bound just long enough to
+/// read its ticket and then dropped, so a scanner resolved the peer from the
+/// discovery record and hung forever "opening direct path" — and had the dial
+/// landed, the gate would have rejected the invite anyway, since
+/// [`invite::verify_inbound`] checks the embedded ticket's endpoint id and the
+/// signature against the *verifying* endpoint's own key.
+///
+/// Asserting through `verify_inbound` — the exact call
+/// [`crate::accept_gate`]'s gates make — covers ticket binding, signing key,
+/// and store membership in one go. A test that only asserted "an `/i/` link
+/// came back" (as `bridge::tests::start_pairing_mints_invite_unless_legacy_ticket`
+/// does) passes happily against the broken version.
+#[cfg(test)]
+mod pairing_invite_tests {
+    use super::*;
+
+    use iroh::endpoint::presets;
+    use iroh::Endpoint;
+    use iroh_tickets::endpoint::EndpointTicket;
+
+    #[tokio::test]
+    async fn pairing_invite_is_redeemable_by_the_accepting_endpoint() {
+        // Holds ENV_TEST_LOCK: this mutates the process-global
+        // AZULA_INVITES_DIR, which concurrent tests also mutate.
+        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        let invites_dir = std::env::temp_dir()
+            .join(format!("azula-core-test-{}", std::process::id()))
+            .join("pairing_invite_binds_to_accepting_endpoint");
+        let _ = std::fs::remove_dir_all(&invites_dir);
+        std::env::set_var("AZULA_INVITES_DIR", &invites_dir);
+
+        let ep = Endpoint::bind(presets::Minimal).await.unwrap();
+        let ticket = EndpointTicket::new(ep.addr()).to_string();
+
+        let encoded =
+            mint_pairing_invite(&ticket, ep.secret_key()).expect("minting the pairing invite succeeds");
+
+        let my_id = ep.id();
+        let verified = invite::verify_inbound(&encoded, my_id, &my_id)
+            .expect("the accepting endpoint must be able to redeem its own pairing invite");
+        assert!(!verified.invite_id.is_empty(), "a redeemed invite carries its id");
+
+        std::env::remove_var("AZULA_INVITES_DIR");
+        ep.close().await;
+    }
 }
 
 #[cfg(test)]
