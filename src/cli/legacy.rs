@@ -39,7 +39,9 @@ pub(super) struct PairArgs {
 /// Options for `azula qr`.
 #[derive(Debug, Clone, clap::Args)]
 pub(super) struct QrArgs {
-    /// A ticket, `https://azula.app/s/<token>`, or `azula://connect?code=<token>` URL.
+    /// Any azula link (`https://azula.app/i/<payload>`, `azula://i?c=<payload>`,
+    /// `https://azula.app/l/<payload>`), which is encoded as-is, or a bare
+    /// `azi...` invite payload / ticket, which is wrapped in a link first.
     pub(super) code: String,
 }
 
@@ -337,14 +339,17 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
 }
 
 pub(super) fn cmd_qr(args: QrArgs) -> Result<()> {
-    let token = match link::parse_ticket(&args.code) {
-        Some(t) => t,
+    // `qr_target` passes an already-complete azula link through untouched and
+    // only builds a wrapper for a bare token — see its docs for why re-wrapping
+    // the link `azula terminal new` prints was the bug.
+    let url = match qr::qr_target(&args.code) {
+        Some(u) => u,
         None => {
-            eprintln!("error: could not extract a token from {:?}", args.code);
+            eprintln!("error: {:?} is not an azula link, invite payload, or ticket", args.code);
             std::process::exit(1);
         }
     };
-    qr::print_pairing("Pairing code:", &token);
+    qr::print_pairing_url("Pairing code:", &url);
     Ok(())
 }
 
