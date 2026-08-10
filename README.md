@@ -299,10 +299,14 @@ azula invites
 azula link [--name NAME] [--relay]
 ```
 
-`<URL>`/`<CODE>` accept any of: `https://azula.app/s/<token>`,
-`https://azula.app/connect/<token>`, `azula://connect?code=<token>`, an
-invite link (`https://azula.app/i/<payload>`, `azula://i?c=<payload>`, or a
-bare `azi…` payload), or a bare token. `--global` writes to
+`<URL>` accepts an invite link (`https://azula.app/i/<payload>`,
+`azula://i?c=<payload>`, or a bare `azi…` payload) or a bare ticket. The
+retired session-link wrappers (`https://azula.app/s/<token>`,
+`https://azula.app/connect/<token>`, `azula://connect?code=<token>`) are no
+longer parsed. `<CODE>` is more permissive, since `azula qr` only renders a
+link rather than dialing it: any `https://azula.app/…` or `azula://…` URL is
+encoded as-is, and a bare payload/ticket is wrapped in a link first.
+`--global` writes to
 `~/.azula/devices.json` instead of the project-local `.azula/devices.json`
 (used automatically inside a git tree; project entries win on name
 collision). `azula invite --bridge` mints against this machine's stable
