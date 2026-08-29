@@ -1,0 +1,12 @@
+# Toolchain for azula-cli. Exact pins only — see azula-docs' openspec/specs/
+# toolchain/ and the Build / verify section of openspec/project.md.
+#
+# node is here only for the npm-publish leg of release.yml (@azula-app/cli);
+# nothing in the Rust build needs it.
+#
+# mise does not manage rustup *targets*. Cross-compile targets are added
+# explicitly in release.yml with `rustup target add`.
+
+[tools]
+rust = "1.98.0"
+node = "24.20.0"
