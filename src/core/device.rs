@@ -15,6 +15,7 @@
 //! so both the MCP tool layer (`bridge::tools`) and the CLI verbs (`cli::*`)
 //! share one connection-management implementation via [`super::SessionCore`].
 
+use super::watch::InboxEntry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -49,7 +50,7 @@ use super::state::write_state;
 // `ensure_device`, `lookup_device`), so anything that can see `SessionCore`
 // must also be able to name these types. The dial/accept machinery below
 // stays `pub(crate)` — only used by `core::establish` and same-crate tests.
-pub type Inbox = Arc<std::sync::Mutex<VecDeque<String>>>;
+pub type Inbox = Arc<std::sync::Mutex<VecDeque<InboxEntry>>>;
 pub type AppSend = Arc<AsyncMutex<Option<SendStream>>>;
 
 /// Per-device live state.
@@ -188,10 +189,10 @@ struct PendingFile {
 /// which shares the same map) ever touches it.
 type Transfers = HashMap<String, PendingFile>;
 
-fn push_line(inbox: &Inbox, line: String) {
+fn push_entry(inbox: &Inbox, entry: InboxEntry) {
     // A poisoned inbox mutex (a prior holder panicked mid-push) shouldn't cascade
     // into every subsequent frame for this device — recover the inner value.
-    inbox.lock().unwrap_or_else(|e| e.into_inner()).push_back(line);
+    inbox.lock().unwrap_or_else(|e| e.into_inner()).push_back(entry);
 }
 
 /// Push a single frame into an inbox (Chat → text, A2uiAction → `ui-event:`
@@ -200,9 +201,12 @@ fn push_line(inbox: &Inbox, line: String) {
 /// `[received file: ...]` text line.
 fn push_frame(inbox: &Inbox, transfers: &mut Transfers, frame: Frame) {
     match frame {
-        Frame::Chat { text, .. } => push_line(inbox, text),
+        Frame::Chat { text, .. } => push_entry(inbox, InboxEntry::Message(text)),
         Frame::A2uiAction { action } => {
-            push_line(inbox, format!("ui-event: {}", serde_json::to_string(&action).unwrap_or_default()));
+            // Kept as the payload itself, not a rendered line: this is the
+            // difference between a tap and a user typing "ui-event: {...}".
+            let payload = serde_json::to_value(&action).unwrap_or(serde_json::Value::Null);
+            push_entry(inbox, InboxEntry::UiEvent(payload));
         }
         Frame::FileBegin { id, name, mime, size, encoding, caption } => {
             if encoding != filexfer::ENCODING_BASE64 {
@@ -213,10 +217,10 @@ fn push_frame(inbox: &Inbox, transfers: &mut Transfers, frame: Frame) {
             }
             if size > filexfer::MAX_FILE_BYTES {
                 warn!(id = %id, %name, size, "bridge: incoming file exceeds max size; rejecting");
-                push_line(inbox, format!(
+                push_entry(inbox, InboxEntry::Notice(format!(
                     "[rejected file: {name} ({size} bytes) exceeds the {} byte (64 MiB) limit]",
                     filexfer::MAX_FILE_BYTES
-                ));
+                )));
                 return;
             }
             transfers.insert(id, PendingFile { name, mime, caption, assembler: FileAssembler::new() });
@@ -240,20 +244,23 @@ fn push_frame(inbox: &Inbox, transfers: &mut Transfers, frame: Frame) {
             let size = bytes.len();
             match filexfer::save_received_file(&filexfer::received_dir(), &pending.name, &bytes) {
                 Ok(path) => {
-                    let mut line = format!(
-                        "[received file: {} ({}, {size} bytes) -> {}]",
-                        pending.name,
-                        pending.mime,
-                        path.display()
+                    push_entry(
+                        inbox,
+                        InboxEntry::File {
+                            name: pending.name,
+                            mime: pending.mime,
+                            size: size as u64,
+                            path: path.display().to_string(),
+                            caption: pending.caption,
+                        },
                     );
-                    if let Some(caption) = &pending.caption {
-                        line.push_str(&format!(" caption: {caption}"));
-                    }
-                    push_line(inbox, line);
                 }
                 Err(e) => {
                     warn!(id = %id, name = %pending.name, error = %e, "bridge: failed to save received file");
-                    push_line(inbox, format!("[failed to save received file '{}': {e}]", pending.name));
+                    push_entry(
+                        inbox,
+                        InboxEntry::Notice(format!("[failed to save received file '{}': {e}]", pending.name)),
+                    );
                 }
             }
         }
@@ -637,7 +644,7 @@ mod tests {
         writer.shutdown().await.unwrap();
         handle.await.unwrap();
 
-        let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+        let got: Vec<String> = inbox.lock().unwrap().drain(..).map(|e| e.human_line()).collect();
         assert_eq!(got, vec!["hello".to_string()], "the RelayHint must not be surfaced as an inbox line");
         assert_eq!(registry::relay_for("phone").as_deref(), Some("relay-ticket-xyz"));
 

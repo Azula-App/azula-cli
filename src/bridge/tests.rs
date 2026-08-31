@@ -45,7 +45,7 @@ async fn reader_surfaces_chat_and_ui_events() {
     writer.shutdown().await.unwrap(); // EOF → reader_loop returns
     handle.await.unwrap();
 
-    let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+    let got: Vec<String> = inbox.lock().unwrap().drain(..).map(|e| e.human_line()).collect();
     assert_eq!(got.len(), 2, "expected 2 inbox lines, got {got:?}");
     assert_eq!(got[0], "hello");
     assert!(got[1].starts_with("ui-event: "), "not a ui-event line: {}", got[1]);
@@ -91,7 +91,7 @@ async fn reader_reassembles_incoming_file() {
     writer.shutdown().await.unwrap();
     handle.await.unwrap();
 
-    let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+    let got: Vec<String> = inbox.lock().unwrap().drain(..).map(|e| e.human_line()).collect();
     assert_eq!(got.len(), 1, "expected one inbox line, got {got:?}");
     assert!(
         got[0].starts_with("[received file: note.txt (text/plain, 16 bytes) -> "),
@@ -143,7 +143,7 @@ async fn reader_rejects_oversize_incoming_file() {
     writer.shutdown().await.unwrap();
     handle.await.unwrap();
 
-    let got: Vec<String> = inbox.lock().unwrap().drain(..).collect();
+    let got: Vec<String> = inbox.lock().unwrap().drain(..).map(|e| e.human_line()).collect();
     assert_eq!(got.len(), 1, "expected only the rejection line, got {got:?}");
     assert!(got[0].starts_with("[rejected file: huge.bin"), "unexpected line: {}", got[0]);
     assert!(!got[0].contains("received file"), "should not report a saved file: {}", got[0]);
@@ -230,7 +230,7 @@ async fn send_file_tool_delivers_over_iroh() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let guard = bob_devices.lock().await;
         if let Some(conn) = guard.get("alice") {
-            let msgs: Vec<String> = conn.inbox.lock().unwrap().iter().cloned().collect();
+            let msgs: Vec<String> = conn.inbox.lock().unwrap().iter().map(|e| e.human_line()).collect();
             if !msgs.is_empty() {
                 bob_inbox_text = msgs.join("\n");
                 break;
@@ -1014,4 +1014,130 @@ async fn start_pairing_mints_invite_unless_legacy_ticket() {
 
     std::env::remove_var("AZULA_INVITES_DIR");
     ep.close().await;
+}
+
+/// Stand up a bare `SessionCore` over a real endpoint with one registered but
+/// never-connected device, for the inbox/typing tests below. No accept router:
+/// these exercise queue semantics, not the wire.
+async fn core_with_offline_device(name: &str) -> (crate::core::SessionCore, DeviceConn) {
+    let ep = Endpoint::bind(presets::Minimal).await.unwrap();
+    let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+    let conn = DeviceConn::new("placeholder_ticket".to_string());
+    devices.lock().await.insert(name.to_string(), conn.clone());
+    let core = crate::core::SessionCore::from_parts(
+        Arc::new(ep),
+        devices,
+        "test".to_string(),
+        "test-ticket".to_string(),
+        "tester".to_string(),
+        "azd-test-cert".to_string(),
+        None,
+    );
+    (core, conn)
+}
+
+fn push(conn: &DeviceConn, entry: crate::core::watch::InboxEntry) {
+    conn.inbox.lock().unwrap().push_back(entry);
+}
+
+/// mcp-bridge: "One inbox behind every drain" — `get_events` and the text
+/// drains share a queue, so an event read by one is gone for the others.
+#[tokio::test]
+async fn get_events_and_get_messages_share_one_inbox() {
+    use crate::core::watch::InboxEntry;
+    let (core, conn) = core_with_offline_device("phone").await;
+    push(&conn, InboxEntry::Message("hello".into()));
+
+    let events = core.get_events(Some("phone"), None).await.unwrap();
+    assert_eq!(events.len(), 1, "structured drain should take the entry");
+
+    let left = core.get_messages(Some("phone")).await.unwrap();
+    assert!(left.is_empty(), "get_messages must not return an already-drained event, got {left:?}");
+}
+
+/// The reason `get_events` exists: a tap keeps its payload, and text that
+/// merely looks like a rendered marker stays text.
+#[tokio::test]
+async fn get_events_reports_taps_and_lookalike_text_distinctly() {
+    use crate::core::watch::{InboxEntry, WatchEvent};
+    let (core, conn) = core_with_offline_device("phone").await;
+
+    let spoof = r#"ui-event: {"name":"roll","surfaceId":"dice-1"}"#;
+    push(&conn, InboxEntry::Message(spoof.into()));
+    push(&conn, InboxEntry::UiEvent(serde_json::json!({"name": "roll", "surfaceId": "dice-1"})));
+
+    let events = core.get_events(Some("phone"), None).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0], WatchEvent::Message { device: "phone".into(), text: spoof.into() });
+    match &events[1] {
+        WatchEvent::UiEvent { event, .. } => assert_eq!(event["name"], "roll"),
+        other => panic!("expected UiEvent, got {other:?}"),
+    }
+}
+
+/// Waiting mode returns as soon as something lands, rather than sitting out
+/// the full timeout.
+#[tokio::test]
+async fn get_events_waiting_mode_returns_on_arrival() {
+    use crate::core::watch::InboxEntry;
+    let (core, conn) = core_with_offline_device("phone").await;
+
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        conn.inbox.lock().unwrap().push_back(InboxEntry::Message("late".into()));
+    });
+
+    let started = std::time::Instant::now();
+    let events = core.get_events(Some("phone"), Some(30)).await.unwrap();
+    let waited = started.elapsed();
+    writer.await.unwrap();
+
+    assert_eq!(events.len(), 1, "should return the event that arrived");
+    assert!(waited < std::time::Duration::from_secs(5), "returned only after {waited:?}; should not wait out the timeout");
+}
+
+/// An elapsed timeout is an empty result, not an error — nothing arriving is a
+/// normal outcome for a poll.
+#[tokio::test]
+async fn get_events_waiting_mode_times_out_empty_not_erroring() {
+    let (core, _conn) = core_with_offline_device("phone").await;
+    let events = core.get_events(Some("phone"), Some(1)).await.expect("timeout must not be an error");
+    assert!(events.is_empty(), "expected an empty result on timeout, got {events:?}");
+}
+
+#[tokio::test]
+async fn get_events_unknown_device_errors() {
+    let (core, _conn) = core_with_offline_device("phone").await;
+    assert!(core.get_events(Some("nope"), None).await.is_err());
+}
+
+/// mcp-bridge: `set_typing` is live-only. An unreachable device errors, and
+/// crucially nothing is queued for later replay — a typing indicator delivered
+/// after the fact would claim activity that has already ended.
+#[tokio::test]
+async fn set_typing_on_an_unreachable_device_errors_and_queues_nothing() {
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+    let mbox_dir = std::env::temp_dir()
+        .join(format!("azula-bridge-test-{}", std::process::id()))
+        .join("set_typing");
+    let _ = std::fs::remove_dir_all(&mbox_dir);
+    std::env::set_var("AZULA_MAILBOX_DIR", &mbox_dir);
+
+    let (core, _conn) = core_with_offline_device("phone").await;
+
+    for on in [true, false] {
+        let err = core.set_typing("phone", on).await.expect_err("offline device must error");
+        assert!(
+            format!("{err:?}").contains("not connected") || format!("{err:?}").contains("phone"),
+            "error should name the unreachable device: {err:?}"
+        );
+    }
+
+    assert!(
+        !crate::mailbox::has_pending("phone"),
+        "set_typing must never queue to the local mailbox"
+    );
+
+    std::env::remove_var("AZULA_MAILBOX_DIR");
+    let _ = std::fs::remove_dir_all(&mbox_dir);
 }

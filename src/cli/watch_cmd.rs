@@ -63,13 +63,19 @@ pub(super) async fn run(args: WatchArgs, label: &super::SessionLabel) -> Result<
             }
         }
 
-        // The only failure `get_messages` can return is "unknown device",
+        // The only failure `get_events` can return is "unknown device",
         // and that was already validated above — a live failure here (e.g.
         // the device was `disconnect --forget`-ed mid-watch) shouldn't kill
         // a long-running watcher.
-        if let Ok(lines) = core.get_messages(args.device.device.as_deref()).await {
-            for line in lines {
-                emit(&crate::core::watch::classify_inbox_line(&line.device, &line.text), args.json);
+        //
+        // Immediate mode (no timeout): this loop already has its own poll
+        // interval and a Ctrl-C arm, so it must not block inside the drain.
+        // Events come typed from the reader rather than being recovered by
+        // re-parsing rendered lines, so a tap keeps its payload and text that
+        // merely looks like a marker stays text.
+        if let Ok(events) = core.get_events(args.device.device.as_deref(), None).await {
+            for event in events {
+                emit(&event, args.json);
             }
         }
     }

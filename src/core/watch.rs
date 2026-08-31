@@ -23,7 +23,18 @@ pub enum WatchEvent {
     #[serde(rename = "ui_event")]
     UiEvent { device: String, event: serde_json::Value },
     #[serde(rename = "file")]
-    File { device: String, name: String, mime: String, size: u64, path: String },
+    File {
+        device: String,
+        name: String,
+        mime: String,
+        size: u64,
+        path: String,
+        /// The sender's caption, when the transfer carried one. Skipped
+        /// entirely when absent, so the documented event shape for an
+        /// uncaptioned file is byte-identical to before.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
     #[serde(rename = "connected")]
     Connected { device: String },
     #[serde(rename = "disconnected")]
@@ -52,8 +63,13 @@ impl WatchEvent {
             WatchEvent::UiEvent { device, event } => {
                 format!("\u{300a}{device}\u{300b} ui-event: {}", serde_json::to_string(event).unwrap_or_default())
             }
-            WatchEvent::File { device, name, mime, size, path } => {
-                format!("\u{300a}{device}\u{300b} [received file: {name} ({mime}, {size} bytes) -> {path}]")
+            WatchEvent::File { device, name, mime, size, path, caption } => {
+                let mut line =
+                    format!("\u{300a}{device}\u{300b} [received file: {name} ({mime}, {size} bytes) -> {path}]");
+                if let Some(caption) = caption {
+                    line.push_str(&format!(" caption: {caption}"));
+                }
+                line
             }
             WatchEvent::Connected { device } => format!("\u{300a}{device}\u{300b} connected"),
             WatchEvent::Disconnected { device } => format!("\u{300a}{device}\u{300b} disconnected"),
@@ -84,6 +100,7 @@ pub fn classify_inbox_line(device: &str, line: &str) -> WatchEvent {
                 mime: parsed.1,
                 size: parsed.2,
                 path: parsed.3,
+                caption: None,
             };
         }
     }
@@ -118,9 +135,168 @@ fn parse_received_file(rest: &str) -> Option<(String, String, u64, String)> {
     Some((name, mime, size, path))
 }
 
+/// One inbox entry as the reader loop actually observed it, before any
+/// rendering.
+///
+/// The inbox used to hold pre-rendered `String`s, and `azula watch --json`
+/// recovered structure by parsing them back with [`classify_inbox_line`].
+/// That round-trip is lossy in a way that matters: a user who literally types
+/// `ui-event: {"name":"x"}` is indistinguishable from a real A2UI tap, and a
+/// file's caption is only recoverable by string-splitting. Carrying the type
+/// from the reader means `get_events` — and `watch --json` with it — reports a
+/// tap as a tap and that user's text as text.
+///
+/// [`Self::human_line`] reproduces exactly the string that used to be pushed,
+/// so `get_messages`/`wait_for_reply` output is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboxEntry {
+    /// Chat text from the peer, verbatim.
+    Message(String),
+    /// An A2UI action payload from a tap on a rendered surface.
+    UiEvent(serde_json::Value),
+    /// A completed inbound file transfer, already written to disk.
+    File { name: String, mime: String, size: u64, path: String, caption: Option<String> },
+    /// A bracketed operational notice the reader emits about a transfer it
+    /// could not complete (rejected for size, failed to save). Rendered and
+    /// reported as ordinary message text, matching how `classify_inbox_line`
+    /// has always treated these lines.
+    Notice(String),
+}
+
+impl InboxEntry {
+    /// The exact line this entry used to be stored as — what
+    /// `get_messages`/`wait_for_reply` still print.
+    pub fn human_line(&self) -> String {
+        match self {
+            InboxEntry::Message(text) => text.clone(),
+            InboxEntry::UiEvent(action) => {
+                format!("ui-event: {}", serde_json::to_string(action).unwrap_or_default())
+            }
+            InboxEntry::File { name, mime, size, path, caption } => {
+                let mut line = format!("[received file: {name} ({mime}, {size} bytes) -> {path}]");
+                if let Some(caption) = caption {
+                    line.push_str(&format!(" caption: {caption}"));
+                }
+                line
+            }
+            InboxEntry::Notice(text) => text.clone(),
+        }
+    }
+
+    /// Attach the source device and become the event `get_events` and
+    /// `watch --json` emit.
+    pub fn into_event(self, device: &str) -> WatchEvent {
+        match self {
+            InboxEntry::Message(text) => WatchEvent::Message { device: device.to_string(), text },
+            InboxEntry::UiEvent(event) => WatchEvent::UiEvent { device: device.to_string(), event },
+            InboxEntry::File { name, mime, size, path, caption } => {
+                WatchEvent::File { device: device.to_string(), name, mime, size, path, caption }
+            }
+            // A notice is not a distinct wire event: it is text about the
+            // conversation, and every existing consumer already reads it that way.
+            InboxEntry::Notice(text) => WatchEvent::Message { device: device.to_string(), text },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn entry_human_line_matches_what_the_inbox_used_to_store() {
+        assert_eq!(InboxEntry::Message("hey there".into()).human_line(), "hey there");
+
+        let action = serde_json::json!({"name": "roll", "surfaceId": "dice-1"});
+        assert_eq!(
+            InboxEntry::UiEvent(action.clone()).human_line(),
+            format!("ui-event: {}", serde_json::to_string(&action).unwrap())
+        );
+
+        let file = InboxEntry::File {
+            name: "note.txt".into(),
+            mime: "text/plain".into(),
+            size: 16,
+            path: "/tmp/azula/received/note.txt".into(),
+            caption: None,
+        };
+        assert_eq!(
+            file.human_line(),
+            "[received file: note.txt (text/plain, 16 bytes) -> /tmp/azula/received/note.txt]"
+        );
+
+        let captioned = InboxEntry::File {
+            name: "photo.png".into(),
+            mime: "image/png".into(),
+            size: 51200,
+            path: "/tmp/photo.png".into(),
+            caption: Some("a test image".into()),
+        };
+        assert_eq!(
+            captioned.human_line(),
+            "[received file: photo.png (image/png, 51200 bytes) -> /tmp/photo.png] caption: a test image"
+        );
+    }
+
+    /// The reason the inbox carries structure at all: re-parsing a rendered
+    /// line cannot tell a real tap from a user typing the same characters.
+    #[test]
+    fn typed_entry_distinguishes_a_tap_from_text_that_looks_like_one() {
+        let spoof = r#"ui-event: {"name":"roll","surfaceId":"dice-1"}"#;
+
+        // What the old round-trip did: the user's literal text becomes a tap.
+        assert!(matches!(classify_inbox_line("phone", spoof), WatchEvent::UiEvent { .. }));
+
+        // What the typed entry does: text stays text...
+        let as_text = InboxEntry::Message(spoof.to_string()).into_event("phone");
+        assert_eq!(as_text, WatchEvent::Message { device: "phone".into(), text: spoof.to_string() });
+
+        // ...and a real tap is still a tap, payload intact.
+        let real = InboxEntry::UiEvent(serde_json::json!({"name": "roll"})).into_event("phone");
+        match real {
+            WatchEvent::UiEvent { device, event } => {
+                assert_eq!(device, "phone");
+                assert_eq!(event["name"], "roll");
+            }
+            other => panic!("expected UiEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_notice_reports_as_message_text() {
+        let line = "[rejected file: huge.bin (99999999 bytes) exceeds the 67108864 byte (64 MiB) limit]";
+        assert_eq!(
+            InboxEntry::Notice(line.into()).into_event("phone"),
+            WatchEvent::Message { device: "phone".into(), text: line.into() }
+        );
+    }
+
+    #[test]
+    fn uncaptioned_file_event_shape_is_unchanged_and_caption_is_additive() {
+        let plain = InboxEntry::File {
+            name: "a.png".into(),
+            mime: "image/png".into(),
+            size: 10,
+            path: "/tmp/a.png".into(),
+            caption: None,
+        }
+        .into_event("phone");
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"type":"file","device":"phone","name":"a.png","mime":"image/png","size":10,"path":"/tmp/a.png"}"#
+        );
+
+        let captioned = InboxEntry::File {
+            name: "a.png".into(),
+            mime: "image/png".into(),
+            size: 10,
+            path: "/tmp/a.png".into(),
+            caption: Some("hi".into()),
+        }
+        .into_event("phone");
+        assert!(serde_json::to_string(&captioned).unwrap().contains(r#""caption":"hi""#));
+    }
 
     #[test]
     fn plain_chat_text_is_a_message_event() {
@@ -154,6 +330,7 @@ mod tests {
                 mime: "text/plain".into(),
                 size: 16,
                 path: "/tmp/azula/received/note.txt".into(),
+                caption: None,
             }
         );
     }
@@ -170,6 +347,7 @@ mod tests {
                 mime: "image/png".into(),
                 size: 51200,
                 path: "/tmp/photo.png".into(),
+                caption: None,
             }
         );
     }
@@ -197,6 +375,7 @@ mod tests {
             mime: "image/png".into(),
             size: 10,
             path: "/tmp/a.png".into(),
+            caption: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(
