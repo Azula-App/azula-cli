@@ -7,7 +7,9 @@
 //! - `send_message`   — send text to an azula app device (streamed assistant reply)
 //! - `send_file`      — send a local file (e.g. an image) to a device as an inline attachment
 //! - `get_messages`   — drain the inbox: user chat text + `ui-event:` lines + peer messages + received files
+//! - `get_events`     — drain the inbox as structured JSON events (typed, not rendered)
 //! - `wait_for_reply` — long-poll until a device has new inbound activity, then drain it
+//! - `set_typing`     — show/clear the thinking indicator without sending text
 //! - `set_name`       — set the conversation's name/description shown in the app
 //! - `say`            — send a peer-to-peer chat message to another bridge
 //! - `render_ui`      — render an A2UI declarative surface on a device
@@ -137,6 +139,25 @@ struct DeleteUiArgs {
     device: String,
     /// The surface id to remove.
     surface_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(super) struct GetEventsArgs {
+    /// If specified, drain only this device; otherwise drain all devices.
+    pub(super) device: Option<String>,
+    /// Wait up to this many seconds for something to arrive before draining.
+    /// Omit to take whatever is pending and return immediately.
+    pub(super) timeout_s: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(super) struct SetTypingArgs {
+    /// The device whose conversation should show (or stop showing) activity.
+    pub(super) device: String,
+    /// `true` to show the thinking indicator, `false` to clear it.
+    pub(super) on: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -309,6 +330,36 @@ impl AzulaBridge {
                         .join("\n")
                 };
                 Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(e) => core_err_to_tool_result(e),
+        }
+    }
+
+    /// Structured sibling of `get_messages`, for programmatic consumers.
+    #[tool(description = "Drain this session's inbox as structured JSON events instead of rendered text: one object per event with a `type` of `message`, `ui_event`, `file`, `connected` or `disconnected`, plus the source `device`. A `ui_event` carries the A2UI tap payload verbatim and a `file` carries the attachment's facts, neither of which survive `get_messages`' one-line rendering. Set `timeout_s` to wait for the inbox to become non-empty before draining (an elapsed timeout returns an empty list, not an error); omit it to take whatever is pending and return at once. Shares one queue with `get_messages`/`wait_for_reply` — an event drained here is not returned by those. Prefer this when a program, rather than a person, reads the result.")]
+    pub(super) async fn get_events(&self, Parameters(args): Parameters<GetEventsArgs>) -> Result<CallToolResult, ErrorData> {
+        match self.core.get_events(args.device.as_deref(), args.timeout_s).await {
+            Ok(events) => {
+                // A JSON array, one object per event — the same vocabulary
+                // `azula watch --json` streams, so a consumer can move between
+                // the two without re-learning the shape.
+                let json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string());
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => core_err_to_tool_result(e),
+        }
+    }
+
+    /// Show or clear the conversation's thinking indicator, with no message.
+    #[tool(description = "Turn the azula conversation's thinking indicator on or off without sending any text, so a long agent turn looks alive before it has anything to say. `send_message` already brackets its own text with this state; this exposes it on its own. Requires a live connection and errors immediately if the device is unreachable — it is never queued to the relay or the local mailbox, because an indicator replayed later would claim activity that has already ended. Always clear it (`on: false`) when the turn finishes, including when it fails.")]
+    pub(super) async fn set_typing(&self, Parameters(args): Parameters<SetTypingArgs>) -> Result<CallToolResult, ErrorData> {
+        match self.core.set_typing(&args.device, args.on).await {
+            Ok(()) => {
+                let state = if args.on { "on" } else { "off" };
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "typing indicator {state} for '{}'",
+                    args.device
+                ))]))
             }
             Err(e) => core_err_to_tool_result(e),
         }

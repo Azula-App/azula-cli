@@ -434,6 +434,16 @@ pub struct FileSent {
     pub size: usize,
 }
 
+/// Take everything currently queued on a device's inbox.
+///
+/// One place so `get_messages`, `wait_for_reply` and `get_events` cannot drift
+/// apart on the poisoned-mutex recovery, and so it stays obvious that they
+/// share a single queue.
+fn drain_inbox(conn: &device::DeviceConn) -> Vec<watch::InboxEntry> {
+    conn.inbox.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
+}
+
+#[derive(Debug)]
 pub struct InboxLine {
     pub device: String,
     pub text: String,
@@ -678,6 +688,32 @@ impl SessionCore {
         Ok(SendOutcome::Sent)
     }
 
+
+    /// Turn the conversation's thinking indicator on or off, sending nothing
+    /// else.
+    ///
+    /// `send_message` already brackets its text with `thinking(true)`/
+    /// `thinking(false)`, but that is the only thing that emits the frame, so
+    /// there is no way to show activity *before* any text exists — which is
+    /// exactly what an agent's long turn needs.
+    ///
+    /// Deliberately live-only: unlike `send_message` this never falls back to
+    /// the relay or the local mailbox. A typing indicator replayed from a queue
+    /// minutes or hours later is worse than none, because the state it claims
+    /// ended when the turn that set it did. This puts it in the same class as
+    /// `send_file` under mcp-bridge's "Live-Connection-Only Tools Fail Fast,
+    /// Never Queue".
+    pub async fn set_typing(&self, device_name: &str, on: bool) -> Result<(), CoreError> {
+        let conn = self.ensure_device(device_name).await?;
+        let mut send_guard = conn.send.lock().await;
+        let Some(send) = send_guard.as_mut() else {
+            return Err(CoreError::Operational(format!(
+                "device '{device_name}' is not connected; a typing indicator is not queued"
+            )));
+        };
+        write_frame(send, &Frame::thinking(on)).await.map_err(|e| CoreError::Transport(e.to_string()))
+    }
+
     /// Delivery-chain step 2 (relay spec / design.md D6): if `device_name`
     /// has a known relay ticket, dial it (LLM ALPN, this session's own
     /// `Hello{cert}`) and deliver `text` as a `Chat` frame — the relay
@@ -770,14 +806,13 @@ impl SessionCore {
                 None => return Err(CoreError::Operational(format!("unknown device '{name}'"))),
             };
             drop(guard);
-            let msgs: Vec<String> = conn.inbox.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
-            Ok(msgs.into_iter().map(|text| InboxLine { device: name.to_string(), text }).collect())
+            let msgs = drain_inbox(&conn);
+            Ok(msgs.into_iter().map(|e| InboxLine { device: name.to_string(), text: e.human_line() }).collect())
         } else {
             let mut all = Vec::new();
             for (name, conn) in guard.iter() {
-                let msgs: Vec<String> = conn.inbox.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
-                for text in msgs {
-                    all.push(InboxLine { device: name.clone(), text });
+                for entry in drain_inbox(conn) {
+                    all.push(InboxLine { device: name.clone(), text: entry.human_line() });
                 }
             }
             Ok(all)
@@ -796,14 +831,69 @@ impl SessionCore {
         };
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_s);
         loop {
-            let msgs: Vec<String> = conn.inbox.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+            let msgs = drain_inbox(&conn);
             if !msgs.is_empty() {
-                return Ok(WaitOutcome::Lines(msgs));
+                return Ok(WaitOutcome::Lines(msgs.iter().map(|e| e.human_line()).collect()));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok(WaitOutcome::TimedOut);
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    }
+
+
+    /// Drain one device's inbox as structured events, or every device's when
+    /// `device_name` is `None`.
+    ///
+    /// This is the same queue `get_messages`/`wait_for_reply` drain — an entry
+    /// read here is gone for all of them — but it reports what the reader
+    /// actually saw rather than a rendered line, so a tap keeps its payload and
+    /// a file keeps its facts.
+    ///
+    /// With `timeout_s` set it waits for the inbox to become non-empty before
+    /// draining, returning an empty vec if the timeout elapses first; with
+    /// `None` it takes whatever is pending and returns immediately. Both modes
+    /// live here rather than being composed from `wait_for_reply`, because that
+    /// drains the queue as text and would consume the events before a
+    /// structured read could see them.
+    pub async fn get_events(
+        &self,
+        device_name: Option<&str>,
+        timeout_s: Option<u64>,
+    ) -> Result<Vec<watch::WatchEvent>, CoreError> {
+        // Resolve targets once; a device that disappears mid-wait simply stops
+        // producing, which is the same behaviour the text drains have.
+        let targets: Vec<(String, device::DeviceConn)> = {
+            let guard = self.devices.lock().await;
+            match device_name {
+                Some(name) => match guard.get(name) {
+                    Some(c) => vec![(name.to_string(), c.clone())],
+                    None => return Err(CoreError::Operational(format!("unknown device '{name}'"))),
+                },
+                None => guard.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
+            }
+        };
+
+        let deadline = timeout_s.map(|s| tokio::time::Instant::now() + tokio::time::Duration::from_secs(s));
+        loop {
+            let mut out = Vec::new();
+            for (name, conn) in &targets {
+                for entry in drain_inbox(conn) {
+                    out.push(entry.into_event(name));
+                }
+            }
+            if !out.is_empty() {
+                return Ok(out);
+            }
+            match deadline {
+                // Immediate mode: whatever was pending (possibly nothing).
+                None => return Ok(Vec::new()),
+                // Waiting mode: an elapsed timeout is an empty result, not an
+                // error — nothing arriving is a normal outcome for a poll.
+                Some(d) if tokio::time::Instant::now() >= d => return Ok(Vec::new()),
+                Some(_) => tokio::time::sleep(tokio::time::Duration::from_millis(200)).await,
+            }
         }
     }
 
