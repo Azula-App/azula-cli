@@ -4,3 +4,7 @@ target/
 # local cross-built binary for the hot-swap dev loop (docker cp into azula-shell)
 .azula-linux
 .clibuild.log
+
+# Project-scoped azula runtime state (device registry, session keys).
+# Written by any azula command run from this repo; never source.
+.azula/
