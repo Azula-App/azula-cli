@@ -1348,7 +1348,7 @@ mod pairing_invite_tests {
     async fn pairing_invite_is_redeemable_by_the_accepting_endpoint() {
         // Holds ENV_TEST_LOCK: this mutates the process-global
         // AZULA_INVITES_DIR, which concurrent tests also mutate.
-        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
         let invites_dir = std::env::temp_dir()
             .join(format!("azula-core-test-{}", std::process::id()))
             .join("pairing_invite_binds_to_accepting_endpoint");

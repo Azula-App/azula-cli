@@ -1134,7 +1134,7 @@ async fn set_typing_on_an_unreachable_device_errors_and_queues_nothing() {
     }
 
     assert!(
-        !crate::mailbox::has_pending("phone"),
+        !mailbox::has_pending("phone"),
         "set_typing must never queue to the local mailbox"
     );
 
