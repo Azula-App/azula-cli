@@ -2,7 +2,7 @@
 //! the accept-side handler (inbound) that registers azula app / peer-bridge
 //! connections, and reconnect-by-endpoint-id matching.
 //!
-//! Both directions converge on the same [`DeviceMap`]: `connect_device` fills
+//! Both directions converge on the same [`DeviceMap`]: a [`Dialer`] fills
 //! in an entry when a [`super::SessionCore`] dials out, and
 //! [`BridgeAcceptHandler`] fills in (or updates) an entry when a device dials
 //! in. Each entry's [`Inbox`] is fed by a background reader task for the
@@ -10,6 +10,13 @@
 //! `file_begin`/`file_chunk`/`file_end` sequences (see [`crate::filexfer`]),
 //! writing completed files to disk and surfacing a `[received file: ...]`
 //! text line into the inbox.
+//!
+//! A connection's reader task also owns the *end* of that connection: when the
+//! stream ends (EOF, error, the connection closing) it marks the device
+//! disconnected, drops the dead send handle, and tells the inbox, so the next
+//! send or presence tick redials rather than writing into a link that is gone.
+//! Every successful dial or accept likewise reports `connected`. Both reach
+//! consumers as `connected`/`disconnected` events from `get_events`.
 //!
 //! Moved here from the old `bridge::device` (cli-multi-session-relay phase 2)
 //! so both the MCP tool layer (`bridge::tools`) and the CLI verbs (`cli::*`)
@@ -26,11 +33,11 @@ use std::time::Duration;
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::io::BufReader;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::filexfer::{self, FileAssembler};
 use crate::invite;
@@ -68,6 +75,34 @@ pub struct DeviceConn {
     pub turns: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this conversation has been closed (turn limit or explicit done).
     pub closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Which connection currently owns this entry (`0` = none yet). Every
+    /// dial/accept takes a fresh one from [`next_generation`]; a connection's
+    /// reader compares it when its stream ends, so a *superseded* connection
+    /// winding down can never mark its live replacement disconnected.
+    pub(crate) generation: u64,
+    /// Serialises dials to this device. Lives in the shared map entry (not in
+    /// any one `SessionCore`) so the startup dial, `ensure_device`, the
+    /// presence loop and `azula mcp`'s separate tool-layer core all queue
+    /// behind each other instead of racing out two connections.
+    pub(crate) dial_lock: Arc<AsyncMutex<()>>,
+    /// Bumped each time a dial to this device finishes, whether it connected or
+    /// not. A caller that queued behind someone else's dial sees it changed and
+    /// shares that outcome instead of immediately dialing again — otherwise a
+    /// one-shot verb whose device is unreachable would sit out the startup
+    /// dial's failure and then its own, twice the wait it had when they ran in
+    /// parallel.
+    pub(crate) dial_seq: u64,
+    /// Set by an explicit `disconnect`: the presence loop leaves a held device
+    /// alone (the operator asked for it to be down) until something connects it
+    /// again — a send's lazy redial, or the device dialing in.
+    pub(crate) held: bool,
+}
+
+/// Source of connection generations. `0` is reserved for "never connected".
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Relaxed)
 }
 
 impl DeviceConn {
@@ -80,7 +115,28 @@ impl DeviceConn {
             connected: false,
             turns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            generation: 0,
+            dial_lock: Arc::new(AsyncMutex::new(())),
+            dial_seq: 0,
+            held: false,
         }
+    }
+
+    /// Make `send` this entry's live stream on a brand-new connection: take a
+    /// fresh generation (returned), lift any explicit-disconnect hold, and — if
+    /// the device was down — put a `connected` event in the inbox. The inbox
+    /// itself is *kept* across reconnects: a consumer long-polling it must see
+    /// the reconnect and what follows, and whatever the peer sent just before a
+    /// drop must not vanish with a swapped-out queue.
+    async fn attach(&mut self, send: SendStream) -> u64 {
+        *self.send.lock().await = Some(send);
+        let was_connected = std::mem::replace(&mut self.connected, true);
+        self.held = false;
+        self.generation = next_generation();
+        if !was_connected {
+            push_entry(&self.inbox, InboxEntry::Connected);
+        }
+        self.generation
     }
 
     pub fn with_invite(mut self, invite: Option<String>) -> Self {
@@ -101,78 +157,300 @@ pub type DeviceMap = Arc<AsyncMutex<HashMap<String, DeviceConn>>>;
 // iroh dial helper
 // ---------------------------------------------------------------------------
 
+/// Resolve a stored device ticket to an address iroh can dial.
+///
+/// The registry holds two shapes (see [`registry::endpoint_id_of`]): a full
+/// `EndpointTicket` — written by `azula pair` and by an outbound `connect`,
+/// carrying whatever addresses were known — and a *bare endpoint id*, which is
+/// all accept-side registration has for a phone that scanned this session's QR
+/// and dialed in. The second used to fail to parse here, so a phone paired that
+/// way could never be dialed back: after any restart of the session it stayed
+/// offline until the phone itself dialed in. A bare id is dialed by id alone and
+/// left to iroh's address lookup (DNS + relay) to find.
+pub(crate) fn dial_target(ticket_str: &str) -> Result<EndpointAddr> {
+    match EndpointTicket::from_str(ticket_str) {
+        Ok(ticket) => Ok(ticket.endpoint_addr().clone()),
+        Err(ticket_err) => match EndpointId::from_str(ticket_str.trim()) {
+            Ok(id) => Ok(EndpointAddr::from(id)),
+            Err(_) => Err(ticket_err.into()),
+        },
+    }
+}
+
 pub(crate) async fn dial_device(
     endpoint: &Endpoint,
     ticket_str: &str,
 ) -> Result<(SendStream, RecvStream)> {
-    use std::str::FromStr;
-    let ticket = EndpointTicket::from_str(ticket_str)?;
-    let addr = ticket.endpoint_addr().clone();
+    let addr = dial_target(ticket_str)?;
     let conn = endpoint.connect(addr, LLM_ALPN).await?;
     Ok(conn.open_bi().await?)
 }
 
-/// Dial and register a device in the map.  Returns whether it connected.
-/// Sends `Frame::Hello { name: own_name, invite, cert }` as the very first
-/// frame (presenting `invite` — the encoded invite string, if this device
-/// was paired via one, so an unknown-to-the-peer dial can pass its accept
-/// gate — and `cert` — this session's own `azd…` certificate, so a peer that
-/// already trusts our machine root can auto-admit us without an invite at
-/// all, see `certs.rs`/design.md D1), then the `thinking(false)` handshake.
-/// Calls `reset_conversation()` on the DeviceConn.
-pub(crate) async fn connect_device(
-    endpoint: &Endpoint,
-    name: &str,
-    ticket: &str,
-    devices: &DeviceMap,
-    own_name: &str,
-    invite: Option<&str>,
-    cert: Option<&str>,
-) -> bool {
-    match dial_device(endpoint, ticket).await {
-        Ok((mut send, recv)) => {
-            // Send hello so the peer can name us (and verify our invite/cert, if any).
-            let hello = Frame::Hello { name: own_name.into(), invite: invite.map(String::from), cert: cert.map(String::from) };
-            if let Err(e) = write_frame(&mut send, &hello).await {
-                warn!(device=%name, error=%e, "bridge: hello write failed");
-                return false;
-            }
-            // Legacy handshake frame for azula app clients.
-            if let Err(e) = write_frame(&mut send, &Frame::thinking(false)).await {
-                warn!(device=%name, error=%e, "bridge: handshake write failed");
-                return false;
-            }
-            // Flush any queued mailbox frames before handing off the stream.
-            if let Err(e) = flush_mailbox(name, &mut send).await {
-                warn!(device=%name, error=%e, "bridge: mailbox flush failed (continuing)");
-            }
-            let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-            let inbox_reader = inbox.clone();
-            let device_name_owned = name.to_string();
-            tokio::spawn(async move { reader_loop(recv, inbox_reader, device_name_owned).await });
+/// How a dial request relates to a connection that may already exist or be in
+/// progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialPolicy {
+    /// Dial regardless (an explicit `connect`). Still queues behind an
+    /// in-flight dial to the same device rather than racing it.
+    Always,
+    /// Dial unless the device is connected by the time this caller holds the
+    /// dial lock. A caller that arrives mid-dial waits for it and reuses its
+    /// result — the lazy-redial paths (`ensure_device`, startup).
+    IfDisconnected,
+    /// Background maintenance: skip — never wait — if the device is connected,
+    /// held, mid-dial, or no longer known. Never creates an entry.
+    IfIdle,
+}
 
-            let mut guard = devices.lock().await;
-            let conn = guard
-                .entry(name.to_string())
-                .or_insert_with(|| DeviceConn::new(ticket.to_string()).with_invite(invite.map(String::from)));
-            *conn.send.lock().await = Some(send);
-            conn.inbox = inbox;
-            conn.connected = true;
-            conn.ticket = ticket.to_string();
-            conn.invite = invite.map(String::from);
-            conn.reset_conversation();
-            info!(device=%name, "bridge: connected");
-            true
-        }
-        Err(e) => {
-            warn!(device=%name, error=%e, "bridge: could not connect; device shows disconnected");
-            false
-        }
+/// What a [`Dialer`] request came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialOutcome {
+    /// A new connection was established and registered.
+    Connected,
+    /// Nothing to do: the device was already connected.
+    AlreadyConnected,
+    /// The dial failed (unreachable, refused, or the handshake write failed).
+    Failed,
+    /// [`DialPolicy::IfIdle`] declined: a dial is in flight, the device is held,
+    /// or it is gone.
+    Skipped,
+}
+
+impl DialOutcome {
+    /// Whether the device is up as a result of this request.
+    pub(crate) fn is_up(self) -> bool {
+        matches!(self, DialOutcome::Connected | DialOutcome::AlreadyConnected)
     }
 }
 
-async fn reader_loop(recv: RecvStream, inbox: Inbox, device_name: String) {
-    read_frames_into(BufReader::new(recv), inbox, &device_name).await
+/// Everything needed to dial peers *as this session*: the endpoint, the device
+/// map it fills in, the identity presented in `Hello`, and the runtime-state
+/// label refreshed whenever a link comes up or goes down. Cheap to clone; the
+/// presence loop holds one.
+#[derive(Clone)]
+pub(crate) struct Dialer {
+    pub(crate) endpoint: Arc<Endpoint>,
+    pub(crate) devices: DeviceMap,
+    pub(crate) own_name: String,
+    /// This session's `azd…` certificate, presented in every `Hello`.
+    pub(crate) cert: Option<String>,
+    /// The operator's `--description` (the conversation sub-line), announced as
+    /// a `Frame::Profile` on every connection this dialer makes. `Hello` carries
+    /// only a name, so the sub-line needs its own frame; sending it here means
+    /// every path that dials — startup, a verb's lazy redial, the presence
+    /// loop — gets it, not just whichever one thought to.
+    pub(crate) description: Option<String>,
+    /// The runtime-state label (`bridge.json`'s `bind`); `None` skips the
+    /// state-file refresh (the relay's connection cache has no state file).
+    pub(crate) label: Option<String>,
+}
+
+impl Dialer {
+    /// Dial `name` at `ticket` and register it, whether or not it is already
+    /// connected. Returns whether a connection was established.
+    pub(crate) async fn connect(&self, name: &str, ticket: &str, invite: Option<&str>) -> bool {
+        self.run(name, Some((ticket, invite)), DialPolicy::Always).await == DialOutcome::Connected
+    }
+
+    /// Make sure `name` is connected, dialing it if not. Creates the map entry
+    /// from `ticket`/`invite` when the device isn't in the map yet; an existing
+    /// entry's own ticket and invite win. Returns whether the device is up.
+    pub(crate) async fn ensure(&self, name: &str, ticket: &str, invite: Option<&str>) -> bool {
+        self.run(name, Some((ticket, invite)), DialPolicy::IfDisconnected).await.is_up()
+    }
+
+    /// One background redial attempt at a device that is already in the map.
+    pub(crate) async fn redial_idle(&self, name: &str) -> DialOutcome {
+        self.run(name, None, DialPolicy::IfIdle).await
+    }
+
+    async fn run(&self, name: &str, seed: Option<(&str, Option<&str>)>, policy: DialPolicy) -> DialOutcome {
+        // One entry per device from the first dial on, so concurrent callers
+        // share one dial lock.
+        let (dial_lock, seq_before) = {
+            let mut guard = self.devices.lock().await;
+            let conn = match (guard.contains_key(name), seed) {
+                (true, _) => guard.get_mut(name).expect("contains_key just checked"),
+                (false, Some((ticket, invite))) => guard
+                    .entry(name.to_string())
+                    .or_insert_with(|| DeviceConn::new(ticket.to_string()).with_invite(invite.map(String::from))),
+                (false, None) => return DialOutcome::Skipped,
+            };
+            if policy != DialPolicy::Always && conn.connected {
+                return DialOutcome::AlreadyConnected;
+            }
+            if policy == DialPolicy::IfIdle && conn.held {
+                return DialOutcome::Skipped;
+            }
+            (conn.dial_lock.clone(), conn.dial_seq)
+        };
+
+        let _dialing = if policy == DialPolicy::IfIdle {
+            match dial_lock.try_lock_owned() {
+                Ok(held) => held,
+                Err(_) => return DialOutcome::Skipped,
+            }
+        } else {
+            dial_lock.lock_owned().await
+        };
+
+        // Re-check now that we hold the lock: whoever we queued behind may have
+        // connected the device, and an explicit `connect` may have changed its
+        // ticket. Read what to dial from the entry, not from the caller's
+        // (possibly stale) snapshot.
+        let (ticket, invite) = {
+            let guard = self.devices.lock().await;
+            match guard.get(name) {
+                None => return DialOutcome::Skipped,
+                Some(conn) if policy != DialPolicy::Always => {
+                    if conn.connected {
+                        return DialOutcome::AlreadyConnected;
+                    }
+                    if conn.dial_seq != seq_before {
+                        // A dial finished while we waited and left the device
+                        // down: that is our answer too. (Dialing again here is
+                        // what the next presence tick, or the caller's next
+                        // attempt, is for.)
+                        return DialOutcome::Failed;
+                    }
+                    if policy == DialPolicy::IfIdle && conn.held {
+                        return DialOutcome::Skipped;
+                    }
+                    (conn.ticket.clone(), conn.invite.clone())
+                }
+                Some(conn) => match seed {
+                    Some((ticket, invite)) => (ticket.to_string(), invite.map(String::from)),
+                    None => (conn.ticket.clone(), conn.invite.clone()),
+                },
+            }
+        };
+
+        let connected = self.dial_registered(name, &ticket, invite.as_deref(), policy == DialPolicy::IfIdle).await;
+        // Still holding the dial lock, so a waiter sees this before it runs.
+        if let Some(conn) = self.devices.lock().await.get_mut(name) {
+            conn.dial_seq += 1;
+        }
+        if connected {
+            DialOutcome::Connected
+        } else {
+            DialOutcome::Failed
+        }
+    }
+
+    /// The dial itself. Sends `Frame::Hello { name: own_name, invite, cert }`
+    /// as the very first frame (presenting `invite` — the encoded invite string,
+    /// if this device was paired via one, so an unknown-to-the-peer dial can
+    /// pass its accept gate — and `cert` — this session's own `azd…`
+    /// certificate, so a peer that already trusts our machine root can
+    /// auto-admit us without an invite at all, see `certs.rs`/design.md D1),
+    /// then the `thinking(false)` handshake, then flushes the mailbox. On
+    /// success it registers the connection (resetting the conversation) and
+    /// starts its reader. Every dial path goes through here, so a presence
+    /// redial does exactly what the startup dial does.
+    ///
+    /// `quiet` demotes the failure log from warn to debug: a background retry
+    /// of a phone that is asleep fails every minute, and that is not news.
+    async fn dial_registered(&self, name: &str, ticket: &str, invite: Option<&str>, quiet: bool) -> bool {
+        let (mut send, recv) = match dial_device(&self.endpoint, ticket).await {
+            Ok(streams) => streams,
+            Err(e) => {
+                if quiet {
+                    debug!(device=%name, error=%e, "bridge: redial failed; device stays disconnected");
+                } else {
+                    warn!(device=%name, error=%e, "bridge: could not connect; device shows disconnected");
+                }
+                return false;
+            }
+        };
+        // Send hello so the peer can name us (and verify our invite/cert, if any).
+        let hello = Frame::Hello { name: self.own_name.clone(), invite: invite.map(String::from), cert: self.cert.clone() };
+        if let Err(e) = write_frame(&mut send, &hello).await {
+            warn!(device=%name, error=%e, "bridge: hello write failed");
+            return false;
+        }
+        // Legacy handshake frame for azula app clients.
+        if let Err(e) = write_frame(&mut send, &Frame::thinking(false)).await {
+            warn!(device=%name, error=%e, "bridge: handshake write failed");
+            return false;
+        }
+        // Flush any queued mailbox frames before handing off the stream.
+        if let Err(e) = flush_mailbox(name, &mut send).await {
+            warn!(device=%name, error=%e, "bridge: mailbox flush failed (continuing)");
+        }
+        if let Some(description) = &self.description {
+            let profile = Frame::Profile {
+                name: self.own_name.clone(),
+                description: Some(description.clone()),
+                avatar: None,
+                mime: None,
+            };
+            if let Err(e) = write_frame(&mut send, &profile).await {
+                warn!(device=%name, error=%e, "bridge: profile write failed (continuing)");
+            }
+        }
+
+        let (generation, inbox) = {
+            let mut guard = self.devices.lock().await;
+            let conn = guard
+                .entry(name.to_string())
+                .or_insert_with(|| DeviceConn::new(ticket.to_string()).with_invite(invite.map(String::from)));
+            let generation = conn.attach(send).await;
+            conn.ticket = ticket.to_string();
+            conn.invite = invite.map(String::from);
+            conn.reset_conversation();
+            (generation, conn.inbox.clone())
+        };
+        tokio::spawn(reader_task(recv, inbox, self.devices.clone(), name.to_string(), generation, self.label.clone()));
+        info!(device=%name, "bridge: connected");
+        if let Some(label) = &self.label {
+            write_state(label, &self.devices).await;
+        }
+        true
+    }
+}
+
+/// Drive one connection's inbound half, then record that it ended.
+async fn reader_task(
+    recv: RecvStream,
+    inbox: Inbox,
+    devices: DeviceMap,
+    device_name: String,
+    generation: u64,
+    state_label: Option<String>,
+) {
+    read_frames_into(BufReader::new(recv), inbox, &device_name).await;
+    connection_ended(&devices, &device_name, generation, state_label.as_deref()).await;
+}
+
+/// A connection's stream has ended (EOF, error, or the connection closing).
+///
+/// If it is still the device's *current* connection, mark the device
+/// disconnected, drop the dead send handle (best effort — a writer mid-flight
+/// holds that lock, and its write fails on its own), and queue a `disconnected`
+/// event; the next send then redials via `ensure_device`, and the presence loop
+/// picks the device up. A connection that was already superseded or explicitly
+/// disconnected changes nothing, so it can't take a live replacement down.
+pub(crate) async fn connection_ended(devices: &DeviceMap, name: &str, generation: u64, state_label: Option<&str>) {
+    let went_down = {
+        let mut guard = devices.lock().await;
+        match guard.get_mut(name) {
+            Some(conn) if conn.connected && conn.generation == generation => {
+                conn.connected = false;
+                if let Ok(mut send) = conn.send.try_lock() {
+                    *send = None;
+                }
+                push_entry(&conn.inbox, InboxEntry::Disconnected);
+                true
+            }
+            _ => false,
+        }
+    };
+    if went_down {
+        info!(device=%name, "bridge: connection ended; device shows disconnected");
+        if let Some(label) = state_label {
+            write_state(label, devices).await;
+        }
+    }
 }
 
 /// State for one in-flight inbound file transfer, keyed by `FileBegin.id`.
@@ -354,10 +632,11 @@ pub(crate) fn match_known_device(
     };
 
     for (name, ticket) in ticket_iter {
-        if let Ok(et) = EndpointTicket::from_str(&ticket) {
-            if et.endpoint_addr().id.to_string() == remote_str {
-                return Some(name);
-            }
+        // Both stored shapes: a dialable `EndpointTicket` and the bare endpoint
+        // id accept-side registration writes. Only the first used to match, so a
+        // phone paired by dialing in was not recognised when it came back.
+        if registry::endpoint_id_of(&ticket).is_some_and(|id| id.to_string() == remote_str) {
+            return Some(name);
         }
     }
     None
@@ -563,53 +842,235 @@ async fn accept_incoming(
         let _ = write_frame(&mut send, &Frame::Hello { name: own_name.clone(), invite: None, cert: Some(own_cert.clone()) }).await;
     }
 
-    let inbox: Inbox = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    let mut transfers = Transfers::new();
-
-    // Replay a non-hello first frame if present.
-    if let Some(frame) = pending_frame {
-        push_frame(&inbox, &mut transfers, frame);
-    }
-
     // Flush any queued mailbox frames before moving send into the map.
     if let Err(e) = flush_mailbox(&peer_name, &mut send).await {
         warn!(%peer_name, error=%e, "bridge: mailbox flush failed on accept (continuing)");
     }
 
-    {
+    let (generation, inbox) = {
         let mut guard = devices.lock().await;
-        let entry = guard.entry(peer_name.clone()).or_insert_with(|| DeviceConn {
-            send: Arc::new(AsyncMutex::new(None)),
-            inbox: inbox.clone(),
-            ticket: remote_id_str.clone(),
-            invite: None,
-            connected: false,
-            turns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
-        // Update the send stream and status; preserve turns/closed so an
-        // ongoing conversation is not interrupted by a re-dial from the peer.
-        *entry.send.lock().await = Some(send);
-        entry.connected = true;
-        entry.ticket = remote_id_str.clone();
-        // Update inbox to point at our newly created one so the reader below
-        // drains into the same Inbox the entry holds.
-        entry.inbox = inbox.clone();
+        let entry = guard.entry(peer_name.clone()).or_insert_with(|| DeviceConn::new(remote_id_str.clone()));
+        // Install the stream and mark the device live; preserve turns/closed so
+        // an ongoing conversation is not interrupted by a re-dial from the peer.
+        // The entry's inbox is kept (not swapped for a fresh one) so a consumer
+        // already waiting on it sees this reconnect and what follows.
+        let generation = entry.attach(send).await;
+        // Don't downgrade a dialable ticket we already hold for this very
+        // endpoint to the bare id — it carries addresses the bare id lacks.
+        if registry::endpoint_id_of(&entry.ticket) != Some(remote_id) {
+            entry.ticket = remote_id_str.clone();
+        }
+        (generation, entry.inbox.clone())
+    };
+
+    // Replay a non-hello first frame if present.
+    let mut transfers = Transfers::new();
+    if let Some(frame) = pending_frame {
+        push_frame(&inbox, &mut transfers, frame);
     }
 
     write_state(&bind, &devices).await;
     info!(%peer_name, "bridge: peer registered");
 
-    // Continue draining frames; reader already consumed the hello.
+    // Continue draining frames; reader already consumed the hello. When the
+    // peer goes away, record it so the device stops reading as connected.
     read_frames_into_with(reader, inbox, transfers, &peer_name).await;
+    connection_ended(&devices, &peer_name, generation, Some(&bind)).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::test_support::{core_knowing, eventually, isolate, unisolate, PhoneStub};
     use crate::proto::write_frame;
+    use iroh::address_lookup::memory::MemoryLookup;
+    use iroh::endpoint::presets;
     use tokio::io::AsyncWriteExt;
+
+    const WITHIN: Duration = Duration::from_secs(10);
+
+    /// The registry holds a dialable ticket *or* a bare endpoint id; both must
+    /// resolve to the same peer, and nonsense must still be an error.
+    #[tokio::test]
+    async fn dial_target_accepts_a_ticket_or_a_bare_endpoint_id() {
+        let ep = Endpoint::bind(presets::Minimal).await.unwrap();
+        let ticket = EndpointTicket::new(ep.addr()).to_string();
+
+        let from_ticket = dial_target(&ticket).expect("a full ticket resolves");
+        assert_eq!(from_ticket.id, ep.id());
+        assert!(!from_ticket.addrs.is_empty(), "a ticket's addresses are kept");
+
+        let bare = ep.id().to_string();
+        let from_bare = dial_target(&bare).expect("a bare endpoint id resolves");
+        assert_eq!(from_bare.id, ep.id());
+        assert!(from_bare.addrs.is_empty(), "a bare id carries no addresses; iroh looks them up");
+        assert_eq!(dial_target(&format!("  {bare}\n")).unwrap().id, ep.id(), "stray whitespace is tolerated");
+
+        assert!(dial_target("definitely not a ticket").is_err());
+        assert!(dial_target("").is_err());
+        ep.close().await;
+    }
+
+    /// The root cause behind a phone that stayed offline after the session
+    /// restarted: a phone paired by dialing in is registered by its bare
+    /// endpoint id, which the dial used to reject outright ("could not
+    /// connect") so it was never retried. Here the only thing the session knows
+    /// is the id; iroh's address lookup supplies the rest.
+    #[tokio::test]
+    async fn a_phone_registered_by_bare_endpoint_id_can_be_dialed() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        isolate("bare_id_dial");
+
+        let mut stub = PhoneStub::listening().await;
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(stub.endpoint.addr());
+        let session_ep = Endpoint::builder(presets::Minimal).address_lookup(lookup).bind().await.unwrap();
+
+        let devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+        let bare_id = stub.endpoint.id().to_string();
+        devices.lock().await.insert("phone".into(), DeviceConn::new(bare_id));
+        let dialer = Dialer {
+            endpoint: Arc::new(session_ep.clone()),
+            devices: devices.clone(),
+            own_name: "session".into(),
+            cert: Some("azd-test-cert".into()),
+            description: None,
+            label: None,
+        };
+
+        assert!(dialer.ensure("phone", "ignored: the entry's own ticket wins", None).await);
+        let mut link = stub.next_link(WITHIN).await.expect("the phone should receive the dial");
+        assert!(matches!(link.next_frame().await, Some(Frame::Hello { .. })));
+
+        session_ep.close().await;
+        stub.shutdown().await;
+        unisolate();
+    }
+
+    /// `match_known_device` must recognise a returning phone whichever shape its
+    /// registry row has — it only understood full tickets, so a phone paired by
+    /// dialing in (a bare endpoint id) came back as a stranger.
+    #[test]
+    fn match_known_device_recognises_a_bare_endpoint_id_row() {
+        let phone = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let rows = vec![
+            Device { name: "phone".into(), ticket: phone.to_string(), added_at: None, invite: None },
+            Device { name: "hand-edited".into(), ticket: "not a ticket".into(), added_at: None, invite: None },
+        ];
+        assert_eq!(match_known_device(&phone, &HashMap::new(), &rows).as_deref(), Some("phone"));
+        assert_eq!(match_known_device(&other, &HashMap::new(), &rows), None);
+
+        // And a live entry whose ticket is the bare id (what accept-side
+        // registration stores in the map).
+        let mut live = HashMap::new();
+        live.insert("scanned".to_string(), DeviceConn::new(other.to_string()));
+        assert_eq!(match_known_device(&other, &live, &[]).as_deref(), Some("scanned"));
+    }
+
+    /// A connection winding down after it was superseded must not take its
+    /// replacement down with it; only the current connection's end counts.
+    #[tokio::test]
+    async fn a_superseded_connections_end_does_not_disconnect_its_replacement() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        isolate("generation_guard");
+
+        let mut stub = PhoneStub::listening().await;
+        let core = core_knowing("phone", &stub.ticket).await;
+        let dialer = core.dialer();
+
+        assert!(dialer.connect("phone", &stub.ticket, None).await);
+        let first_gen = core.devices.lock().await.get("phone").unwrap().generation;
+        let _first = stub.next_link(WITHIN).await.expect("first link");
+        assert!(dialer.connect("phone", &stub.ticket, None).await, "an explicit connect dials again");
+        let second_gen = core.devices.lock().await.get("phone").unwrap().generation;
+        let _second = stub.next_link(WITHIN).await.expect("second link");
+        assert_ne!(first_gen, second_gen);
+
+        connection_ended(&core.devices, "phone", first_gen, None).await;
+        assert!(core.devices.lock().await.get("phone").unwrap().connected, "the old connection's end is not the device's");
+
+        connection_ended(&core.devices, "phone", second_gen, None).await;
+        let events = core.get_events(Some("phone"), None).await.unwrap();
+        assert!(!core.devices.lock().await.get("phone").unwrap().connected);
+        // One `connected` (the second connect replaced a live link: no
+        // transition), one `disconnected`.
+        assert_eq!(
+            events,
+            vec![
+                crate::core::watch::WatchEvent::Connected { device: "phone".into() },
+                crate::core::watch::WatchEvent::Disconnected { device: "phone".into() },
+            ]
+        );
+
+        stub.shutdown().await;
+        unisolate();
+    }
+
+    /// A caller that queued behind someone else's dial takes that dial's result
+    /// -- here a failure -- instead of starting its own: dialing again straight
+    /// away would make a one-shot verb against an unreachable phone wait out the
+    /// startup dial's failure and then its own.
+    #[tokio::test]
+    async fn a_caller_queued_behind_a_failed_dial_shares_its_failure() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        isolate("shared_failure");
+
+        // The phone *is* listening, so a (wrong) second dial would succeed and show.
+        let stub = PhoneStub::listening().await;
+        let core = Arc::new(core_knowing("phone", &stub.ticket).await);
+        let dialer = core.dialer();
+
+        let dial_lock = core.devices.lock().await.get("phone").unwrap().dial_lock.clone();
+        let in_flight = dial_lock.lock_owned().await;
+
+        let waiting = tokio::spawn({
+            let dialer = dialer.clone();
+            async move { dialer.ensure("phone", "unused", None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+
+        // The dial we are queued behind finishes, leaving the device down.
+        core.devices.lock().await.get_mut("phone").unwrap().dial_seq += 1;
+        drop(in_flight);
+
+        assert!(!waiting.await.unwrap(), "the waiter shares the failed dial's outcome");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(stub.accepted(), 0, "and does not dial for itself");
+
+        stub.shutdown().await;
+        unisolate();
+    }
+
+    /// The background redial never creates, resurrects or queues: an unknown
+    /// device, a held one, and one that is already up are all left alone.
+    #[tokio::test]
+    async fn background_redial_skips_unknown_held_and_connected_devices() {
+        let _guard = registry::ENV_TEST_LOCK.lock().await;
+        isolate("redial_skips");
+
+        let mut stub = PhoneStub::listening().await;
+        let core = core_knowing("phone", &stub.ticket).await;
+        let dialer = core.dialer();
+
+        assert_eq!(dialer.redial_idle("nobody").await, DialOutcome::Skipped);
+        assert!(!core.devices.lock().await.contains_key("nobody"), "must not resurrect a forgotten device");
+
+        core.devices.lock().await.get_mut("phone").unwrap().held = true;
+        assert_eq!(dialer.redial_idle("phone").await, DialOutcome::Skipped);
+        assert_eq!(stub.accepted(), 0);
+
+        core.devices.lock().await.get_mut("phone").unwrap().held = false;
+        assert_eq!(dialer.redial_idle("phone").await, DialOutcome::Connected);
+        eventually("the dial to land", WITHIN, || async { stub.accepted() == 1 }).await;
+        let _link = stub.next_link(WITHIN).await.expect("link");
+        assert_eq!(dialer.redial_idle("phone").await, DialOutcome::AlreadyConnected);
+
+        stub.shutdown().await;
+        unisolate();
+    }
 
     /// relay spec: "Sessions SHALL learn the relay's ticket from a relay
     /// hint the phone shares at machine pairing time, persisted per device

@@ -18,9 +18,12 @@
 //! deleting its key file).
 
 pub mod device;
+pub(crate) mod presence;
 pub mod relay_a2ui;
 pub mod state;
 pub mod status;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod watch;
 
 use std::collections::HashMap;
@@ -44,7 +47,7 @@ use crate::qr;
 use crate::registry::{self, Device};
 use crate::session::SessionKey;
 
-use device::DeviceMap;
+use device::{DeviceMap, Dialer};
 use state::write_state;
 
 /// The A2UI basic catalog id this session targets when creating a surface —
@@ -126,7 +129,7 @@ fn now_secs() -> u64 {
 /// The shared connection-management state for one session identity: a bound
 /// endpoint, the live device map, and this process's own certificate
 /// material. Constructed via [`establish`] (full setup: accept router,
-/// registry preload, background dial/redelivery) or [`SessionCore::from_parts`]
+/// registry preload, background dial, presence loop) or [`SessionCore::from_parts`]
 /// (tests, and anywhere the caller already holds its own router — see
 /// `bridge::tools::AzulaBridge::new`).
 pub struct SessionCore {
@@ -165,6 +168,10 @@ pub struct SessionCore {
     /// SHALL coalesce its render_ui/update_ui/delete_ui calls into
     /// full-surface snapshots"). See [`Self::render_ui_outcome`].
     surface_state: Arc<AsyncMutex<HashMap<(String, String), SurfaceState>>>,
+    /// The presence loop (see [`presence`]), when this core owns one — only
+    /// [`establish`] starts it. Held for its `Drop`: the loop and any dial it has
+    /// in flight stop with the session, so a one-shot verb never waits on it.
+    presence: Option<presence::PresenceGuard>,
 }
 
 /// A session's retained copy of one A2UI surface — see
@@ -200,7 +207,27 @@ impl SessionCore {
             machine_secret,
             relay_conns: Arc::new(AsyncMutex::new(HashMap::new())),
             surface_state: Arc::new(AsyncMutex::new(HashMap::new())),
+            presence: None,
         }
+    }
+
+    /// A dialer that connects peers as this session, filling in `devices`.
+    fn dialer(&self) -> Dialer {
+        Dialer {
+            endpoint: self.endpoint.clone(),
+            devices: self.devices.clone(),
+            own_name: self.own_name.clone(),
+            cert: Some(self.session_cert.clone()),
+            description: self.own_description.clone(),
+            label: Some(self.label.clone()),
+        }
+    }
+
+    /// Start keeping this session's known devices connected (see [`presence`]).
+    /// The loop ends when this core is dropped.
+    pub(crate) fn with_presence(mut self, timings: presence::PresenceTimings) -> Self {
+        self.presence = Some(presence::spawn(self.dialer(), timings));
+        self
     }
 }
 
@@ -215,7 +242,8 @@ pub struct Established {
 }
 
 /// Bind the endpoint, stand up the accept router, preload known devices (+
-/// any `--device` flags), and start the background dial + redelivery loops.
+/// any `--device` flags), and start the background dial and the presence loop
+/// (see [`presence`]) that keeps every known device connected.
 ///
 /// `label` is a human tag written into the runtime state file (the HTTP
 /// bind, "stdio", or a CLI verb's own label). `session_name` is `--session`/`AZULA_SESSION`: `Some` selects
@@ -271,7 +299,12 @@ pub async fn establish(
     {
         let mut guard = devices.lock().await;
         for d in &known {
-            guard.insert(d.name.clone(), device::DeviceConn::new(d.ticket.clone()).with_invite(d.invite.clone()));
+            // `or_insert_with`, not `insert`: the accept router is already up, so
+            // a phone that dialed in during startup has an entry (and a live
+            // connection) that a fresh one would silently replace.
+            guard
+                .entry(d.name.clone())
+                .or_insert_with(|| device::DeviceConn::new(d.ticket.clone()).with_invite(d.invite.clone()));
         }
     }
 
@@ -286,75 +319,44 @@ pub async fn establish(
 
     write_state(label, &devices).await;
 
+    let core = SessionCore {
+        endpoint,
+        devices,
+        label: label.to_string(),
+        ticket: bridge_ticket,
+        own_name,
+        own_description: description,
+        session_cert,
+        machine_secret,
+        relay_conns: Arc::new(AsyncMutex::new(HashMap::new())),
+        surface_state: Arc::new(AsyncMutex::new(HashMap::new())),
+        presence: None,
+    };
+
     // Best-effort dial all known devices in the background.
     {
-        let guard = devices.lock().await;
-        let entries: Vec<(String, String, Option<String>)> = guard
+        let entries: Vec<(String, String, Option<String>)> = core
+            .devices
+            .lock()
+            .await
             .iter()
             .map(|(n, c)| (n.clone(), c.ticket.clone(), c.invite.clone()))
             .collect();
-        drop(guard);
-
-        let own_name_clone = own_name.clone();
-        let label_owned = label.to_string();
-        let cert_owned = session_cert.clone();
+        let dialer = core.dialer();
         for (dev_name, ticket, invite) in entries {
-            let ep = endpoint.clone();
-            let devs = devices.clone();
-            let label_str = label_owned.clone();
-            let my_name = own_name_clone.clone();
-            let my_cert = cert_owned.clone();
+            let dialer = dialer.clone();
             tokio::spawn(async move {
-                device::connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref(), Some(&my_cert)).await;
-                write_state(&label_str, &devs).await;
+                dialer.ensure(&dev_name, &ticket, invite.as_deref()).await;
             });
         }
     }
 
-    // Periodic redelivery: every 25 s, try to reconnect any offline device
-    // that has queued mail.
-    {
-        let ep = endpoint.clone();
-        let devs = devices.clone();
-        let label_owned = label.to_string();
-        let my_name = own_name.clone();
-        let my_cert = session_cert.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(25)).await;
-                let pending: Vec<(String, String, Option<String>)> = {
-                    let guard = devs.lock().await;
-                    guard
-                        .iter()
-                        .filter(|(name, conn)| !conn.connected && mailbox::has_pending(name))
-                        .map(|(name, conn)| (name.clone(), conn.ticket.clone(), conn.invite.clone()))
-                        .collect()
-                };
-                for (dev_name, ticket, invite) in pending {
-                    info!(device=%dev_name, "core: attempting redelivery of queued mail");
-                    device::connect_device(&ep, &dev_name, &ticket, &devs, &my_name, invite.as_deref(), Some(&my_cert)).await;
-                    write_state(&label_owned, &devs).await;
-                }
-            }
-        });
-    }
+    // Presence: keep retrying any known device that isn't connected, for the
+    // life of the session. (This is also what retries a device with queued
+    // mail; see `presence` for how the two cadences relate.)
+    let core = core.with_presence(presence::PresenceTimings::default());
 
-    Ok(Established {
-        core: SessionCore {
-            endpoint,
-            devices,
-            label: label.to_string(),
-            ticket: bridge_ticket,
-            own_name,
-            own_description: description,
-            session_cert,
-            machine_secret,
-            relay_conns: Arc::new(AsyncMutex::new(HashMap::new())),
-            surface_state: Arc::new(AsyncMutex::new(HashMap::new())),
-        },
-        session,
-        router: iroh_router,
-    })
+    Ok(Established { core, session, router: iroh_router })
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +445,18 @@ fn drain_inbox(conn: &device::DeviceConn) -> Vec<watch::InboxEntry> {
     conn.inbox.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
 }
 
+/// As [`drain_inbox`], for the text-line tools (`get_messages`,
+/// `wait_for_reply`): the same queue, but the `connected`/`disconnected`
+/// presence entries are consumed and dropped rather than returned. They are not
+/// something the peer said, `wait_for_reply` must not wake on one, and a session
+/// that only ever reads text would otherwise let them pile up. `get_events`
+/// reports them.
+fn drain_inbox_text(conn: &device::DeviceConn) -> Vec<watch::InboxEntry> {
+    let mut entries = drain_inbox(conn);
+    entries.retain(|e| !e.is_presence());
+    entries
+}
+
 #[derive(Debug)]
 pub struct InboxLine {
     pub device: String,
@@ -496,10 +510,7 @@ impl SessionCore {
             tracing::warn!(error=%e, "core: registry add failed; continuing");
         }
 
-        let connected = device::connect_device(
-            &self.endpoint, &name, &ticket, &self.devices, &self.own_name, invite_str.as_deref(), Some(&self.session_cert),
-        )
-        .await;
+        let connected = self.dialer().connect(&name, &ticket, invite_str.as_deref()).await;
 
         if connected {
             let guard = self.devices.lock().await;
@@ -594,42 +605,25 @@ impl SessionCore {
 
     /// Ensure the named device has a live connection (lazy-dialing a known
     /// device if needed), returning a clone of its connection state.
+    ///
+    /// A dial already in flight to the same device (the startup dial, the
+    /// presence loop) is waited for and its result reused, never raced with a
+    /// second one — see [`device::DeviceConn::dial_lock`].
     pub async fn ensure_device(&self, device_name: &str) -> Result<device::DeviceConn, CoreError> {
-        let needs_dial = {
+        let ticket_and_invite = {
             let guard = self.devices.lock().await;
-            match guard.get(device_name) {
-                Some(c) if c.connected => false,
-                Some(_) => true,
-                None => registry::load().iter().any(|d| d.name == device_name),
-            }
-        };
-
-        if needs_dial {
-            let ticket_and_invite = {
-                let guard = self.devices.lock().await;
-                guard.get(device_name).map(|c| (c.ticket.clone(), c.invite.clone()))
-            }
-            .or_else(|| {
-                registry::load()
-                    .into_iter()
-                    .find(|d| d.name == device_name)
-                    .map(|d| (d.ticket, d.invite))
-            });
-            if let Some((t, invite)) = ticket_and_invite {
-                let connected = device::connect_device(
-                    &self.endpoint, device_name, &t, &self.devices, &self.own_name, invite.as_deref(), Some(&self.session_cert),
-                )
-                .await;
-                // Announce the operator's `--description` on the fresh
-                // connection. `Hello` carries only a name, so the sub-line
-                // needs its own `Profile` frame; sending it here means every
-                // verb that dials gets it, not just the ones that thought to.
-                if connected && self.own_description.is_some() {
-                    let _ = self
-                        .set_name(Some(device_name), None, self.own_description.clone())
-                        .await;
-                }
-            }
+            guard.get(device_name).map(|c| (c.ticket.clone(), c.invite.clone()))
+        }
+        .or_else(|| {
+            registry::load()
+                .into_iter()
+                .find(|d| d.name == device_name)
+                .map(|d| (d.ticket, d.invite))
+        });
+        if let Some((t, invite)) = ticket_and_invite {
+            // (The operator's `--description` is announced by the dialer itself
+            // on whichever dial establishes the connection.)
+            self.dialer().ensure(device_name, &t, invite.as_deref()).await;
         }
 
         let guard = self.devices.lock().await;
@@ -741,16 +735,11 @@ impl SessionCore {
     /// [`Self::devices`] — so this never marks the phone device itself as
     /// connected.
     async fn ensure_relay(&self, ticket: &str) -> Result<device::DeviceConn, CoreError> {
-        let needs_dial = {
-            let guard = self.relay_conns.lock().await;
-            !matches!(guard.get(ticket), Some(c) if c.connected)
-        };
-        if needs_dial {
-            device::connect_device(
-                &self.endpoint, ticket, ticket, &self.relay_conns, &self.own_name, None, Some(&self.session_cert),
-            )
-            .await;
-        }
+        // The relay is dialed through its own cache, never `devices` (see
+        // `relay_conns`), and has no runtime-state file to refresh.
+        let relay_dialer =
+            Dialer { devices: self.relay_conns.clone(), description: None, label: None, ..self.dialer() };
+        relay_dialer.ensure(ticket, ticket, None).await;
         let guard = self.relay_conns.lock().await;
         match guard.get(ticket) {
             Some(c) if c.connected => Ok(c.clone()),
@@ -806,12 +795,12 @@ impl SessionCore {
                 None => return Err(CoreError::Operational(format!("unknown device '{name}'"))),
             };
             drop(guard);
-            let msgs = drain_inbox(&conn);
+            let msgs = drain_inbox_text(&conn);
             Ok(msgs.into_iter().map(|e| InboxLine { device: name.to_string(), text: e.human_line() }).collect())
         } else {
             let mut all = Vec::new();
             for (name, conn) in guard.iter() {
-                for entry in drain_inbox(conn) {
+                for entry in drain_inbox_text(conn) {
                     all.push(InboxLine { device: name.clone(), text: entry.human_line() });
                 }
             }
@@ -831,7 +820,7 @@ impl SessionCore {
         };
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_s);
         loop {
-            let msgs = drain_inbox(&conn);
+            let msgs = drain_inbox_text(&conn);
             if !msgs.is_empty() {
                 return Ok(WaitOutcome::Lines(msgs.iter().map(|e| e.human_line()).collect()));
             }
@@ -842,6 +831,19 @@ impl SessionCore {
         }
     }
 
+
+    /// The devices whose inboxes a `get_events` call drains: the named one
+    /// (unknown is an error), or every device currently in the map.
+    async fn event_targets(&self, device_name: Option<&str>) -> Result<Vec<(String, device::DeviceConn)>, CoreError> {
+        let guard = self.devices.lock().await;
+        match device_name {
+            Some(name) => match guard.get(name) {
+                Some(c) => Ok(vec![(name.to_string(), c.clone())]),
+                None => Err(CoreError::Operational(format!("unknown device '{name}'"))),
+            },
+            None => Ok(guard.iter().map(|(n, c)| (n.clone(), c.clone())).collect()),
+        }
+    }
 
     /// Drain one device's inbox as structured events, or every device's when
     /// `device_name` is `None`.
@@ -862,18 +864,13 @@ impl SessionCore {
         device_name: Option<&str>,
         timeout_s: Option<u64>,
     ) -> Result<Vec<watch::WatchEvent>, CoreError> {
-        // Resolve targets once; a device that disappears mid-wait simply stops
-        // producing, which is the same behaviour the text drains have.
-        let targets: Vec<(String, device::DeviceConn)> = {
-            let guard = self.devices.lock().await;
-            match device_name {
-                Some(name) => match guard.get(name) {
-                    Some(c) => vec![(name.to_string(), c.clone())],
-                    None => return Err(CoreError::Operational(format!("unknown device '{name}'"))),
-                },
-                None => guard.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
-            }
-        };
+        // A named device is resolved once, up front (unknown is an error); one
+        // that disappears mid-wait simply stops producing, which is the same
+        // behaviour the text drains have. With no name the targets are
+        // re-resolved on every pass, so a device that appears mid-wait — a phone
+        // dialing in for the first time — wakes the poll with its `connected`
+        // event instead of being missed until the next call.
+        let mut targets = self.event_targets(device_name).await?;
 
         let deadline = timeout_s.map(|s| tokio::time::Instant::now() + tokio::time::Duration::from_secs(s));
         loop {
@@ -892,7 +889,12 @@ impl SessionCore {
                 // Waiting mode: an elapsed timeout is an empty result, not an
                 // error — nothing arriving is a normal outcome for a poll.
                 Some(d) if tokio::time::Instant::now() >= d => return Ok(Vec::new()),
-                Some(_) => tokio::time::sleep(tokio::time::Duration::from_millis(200)).await,
+                Some(_) => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    if device_name.is_none() {
+                        targets = self.event_targets(None).await?;
+                    }
+                }
             }
         }
     }
@@ -1243,7 +1245,16 @@ impl SessionCore {
             let mut guard = self.devices.lock().await;
             if let Some(conn) = guard.get_mut(device_name) {
                 *conn.send.lock().await = None;
-                conn.connected = false;
+                if std::mem::replace(&mut conn.connected, false) {
+                    conn.inbox
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(watch::InboxEntry::Disconnected);
+                }
+                // The operator asked for this device to be down: the presence
+                // loop must not undo that. The next send (a lazy redial) or the
+                // device dialing in lifts the hold.
+                conn.held = true;
             }
         }
         if forget {
@@ -1406,7 +1417,7 @@ mod pointer_tests {
 
 /// `SessionCore`'s delivery-chain and relay-coalescing behavior (task 4.7).
 /// Uses real iroh endpoints on localhost (not duplexes) since `send_message`/
-/// `render_ui`'s relay path dials out via `device::connect_device`, the same
+/// `render_ui`'s relay path dials out via `device::Dialer`, the same
 /// production code path `establish` uses.
 #[cfg(test)]
 mod relay_tests {

@@ -161,11 +161,28 @@ pub enum InboxEntry {
     /// reported as ordinary message text, matching how `classify_inbox_line`
     /// has always treated these lines.
     Notice(String),
+    /// The device's link to this session came up (a dial of ours succeeded, or
+    /// the device dialed in). Presence, not content: see [`Self::is_presence`].
+    Connected,
+    /// The device's link to this session went down — its stream ended, errored,
+    /// or the connection closed. The mirror of [`Self::Connected`].
+    Disconnected,
 }
 
 impl InboxEntry {
+    /// Whether this entry reports the link going up or down rather than
+    /// something the peer said. The text drains (`get_messages`,
+    /// `wait_for_reply`) discard these — an LLM reading lines of chat has no use
+    /// for them and `wait_for_reply` must not wake on one — while `get_events`
+    /// and `watch --json` report them as `connected`/`disconnected`.
+    pub fn is_presence(&self) -> bool {
+        matches!(self, InboxEntry::Connected | InboxEntry::Disconnected)
+    }
+
     /// The exact line this entry used to be stored as — what
-    /// `get_messages`/`wait_for_reply` still print.
+    /// `get_messages`/`wait_for_reply` still print. The two presence entries
+    /// never reach those tools (see [`Self::is_presence`]); their lines here
+    /// are for debugging output only.
     pub fn human_line(&self) -> String {
         match self {
             InboxEntry::Message(text) => text.clone(),
@@ -180,6 +197,8 @@ impl InboxEntry {
                 line
             }
             InboxEntry::Notice(text) => text.clone(),
+            InboxEntry::Connected => "[connected]".to_string(),
+            InboxEntry::Disconnected => "[disconnected]".to_string(),
         }
     }
 
@@ -195,6 +214,8 @@ impl InboxEntry {
             // A notice is not a distinct wire event: it is text about the
             // conversation, and every existing consumer already reads it that way.
             InboxEntry::Notice(text) => WatchEvent::Message { device: device.to_string(), text },
+            InboxEntry::Connected => WatchEvent::Connected { device: device.to_string() },
+            InboxEntry::Disconnected => WatchEvent::Disconnected { device: device.to_string() },
         }
     }
 }
@@ -269,6 +290,26 @@ mod tests {
         assert_eq!(
             InboxEntry::Notice(line.into()).into_event("phone"),
             WatchEvent::Message { device: "phone".into(), text: line.into() }
+        );
+    }
+
+    /// The presence entries are what put `connected`/`disconnected` into
+    /// `get_events` (they used to exist only in `azula watch`'s own diff), and
+    /// they must stay out of the text drains.
+    #[test]
+    fn presence_entries_become_connected_and_disconnected_events() {
+        assert!(InboxEntry::Connected.is_presence());
+        assert!(InboxEntry::Disconnected.is_presence());
+        assert!(!InboxEntry::Message("hi".into()).is_presence());
+        assert!(!InboxEntry::Notice("[rejected file: x]".into()).is_presence());
+
+        assert_eq!(
+            InboxEntry::Connected.into_event("phone"),
+            WatchEvent::Connected { device: "phone".into() }
+        );
+        assert_eq!(
+            serde_json::to_string(&InboxEntry::Disconnected.into_event("phone")).unwrap(),
+            r#"{"type":"disconnected","device":"phone"}"#
         );
     }
 
