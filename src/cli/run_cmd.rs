@@ -483,6 +483,21 @@ mod tests {
     /// original exit code once the session ends.
     #[tokio::test]
     async fn failing_command_hands_off_with_scrollback_and_inherited_cwd_then_preserves_exit_code() {
+        // Holds ENV_TEST_LOCK for the whole body and points the invite store at a
+        // scratch dir. `start_handoff` mints a real invite (`mint_pairing_invite`)
+        // and the client below redeems it, so both the mint and the verification
+        // go through the issuer store -- `~/.azula/invites.json` unless
+        // overridden, which is where this test used to append an unconsumed
+        // invite on every run. The device registry is redirected too, as the
+        // accept gate registers peers that redeem an invite.
+        let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+        let scratch = std::env::temp_dir()
+            .join(format!("azula-run-cmd-test-{}", std::process::id()))
+            .join("failing_command_hands_off");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::env::set_var("AZULA_INVITES_DIR", scratch.join("invites"));
+        std::env::set_var("AZULA_REGISTRY_DIR", scratch.join("registry"));
+
         let wrapped = run_wrapped(&["sh".to_string(), "-c".to_string(), "echo AZULA_RUN_FAILURE_MARKER; exit 7".to_string()])
             .await
             .expect("run the wrapped command");
@@ -563,6 +578,10 @@ mod tests {
 
         term::kill_session(&h.session_id);
         let _ = tokio::time::timeout(Duration::from_secs(5), h.router.shutdown()).await;
+
+        std::env::remove_var("AZULA_INVITES_DIR");
+        std::env::remove_var("AZULA_REGISTRY_DIR");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// Reads frames off `reader` until `f` returns `Some`, bounded so a stuck
