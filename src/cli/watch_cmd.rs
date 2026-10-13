@@ -75,6 +75,13 @@ pub(super) async fn run(args: WatchArgs, label: &super::SessionLabel) -> Result<
         // merely looks like a marker stays text.
         if let Ok(events) = core.get_events(args.device.device.as_deref(), None).await {
             for event in events {
+                // The inbox carries `connected`/`disconnected` too (that is how
+                // `get_events` reports them), but this loop already reports each
+                // transition from its own diff above, which also covers the
+                // initial state — emitting both would print every one twice.
+                if matches!(event, WatchEvent::Connected { .. } | WatchEvent::Disconnected { .. }) {
+                    continue;
+                }
                 emit(&event, args.json);
             }
         }

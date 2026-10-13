@@ -30,7 +30,8 @@
 //! per-peer `max_turns` cap; `say done=true` ends the conversation early.
 //!
 //! On startup the bridge loads the registry and dials every known device in the
-//! background (failures are non-fatal).
+//! background (failures are non-fatal), then keeps retrying any that aren't
+//! connected -- and any that later drop -- for as long as it runs.
 //!
 //! `tools` is the `AzulaBridge` MCP tool surface, a thin wrapper over
 //! [`crate::core::SessionCore`] (connection/registry/relay/A2UI/inbox logic

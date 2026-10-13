@@ -230,7 +230,10 @@ async fn send_file_tool_delivers_over_iroh() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let guard = bob_devices.lock().await;
         if let Some(conn) = guard.get("alice") {
-            let msgs: Vec<String> = conn.inbox.lock().unwrap().iter().map(|e| e.human_line()).collect();
+            // (Presence entries -- Alice's `connected` -- share the inbox; only
+            // what she sent is of interest here.)
+            let msgs: Vec<String> =
+                conn.inbox.lock().unwrap().iter().filter(|e| !e.is_presence()).map(|e| e.human_line()).collect();
             if !msgs.is_empty() {
                 bob_inbox_text = msgs.join("\n");
                 break;
@@ -1140,4 +1143,147 @@ async fn set_typing_on_an_unreachable_device_errors_and_queues_nothing() {
 
     std::env::remove_var("AZULA_MAILBOX_DIR");
     let _ = std::fs::remove_dir_all(&mbox_dir);
+}
+
+/// mcp-bridge: presence is reported by `get_events` only. The text drains
+/// consume `connected`/`disconnected` entries without returning them, and
+/// `wait_for_reply` does not wake on one -- an LLM reading chat lines has no use
+/// for them.
+#[tokio::test]
+async fn text_drains_discard_presence_and_wait_for_reply_ignores_it() {
+    use crate::core::watch::{InboxEntry, WatchEvent};
+    let (core, conn) = core_with_offline_device("phone").await;
+
+    push(&conn, InboxEntry::Connected);
+    push(&conn, InboxEntry::Message("hi".into()));
+    push(&conn, InboxEntry::Disconnected);
+    let lines = core.get_messages(Some("phone")).await.unwrap();
+    assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["hi"]);
+    assert!(core.get_events(Some("phone"), None).await.unwrap().is_empty(), "the text drain consumed them");
+
+    push(&conn, InboxEntry::Connected);
+    match core.wait_for_reply("phone", 1).await.unwrap() {
+        crate::core::WaitOutcome::TimedOut => {}
+        crate::core::WaitOutcome::Lines(lines) => panic!("a presence entry must not wake wait_for_reply: {lines:?}"),
+    }
+
+    push(&conn, InboxEntry::Disconnected);
+    assert_eq!(
+        core.get_events(Some("phone"), None).await.unwrap(),
+        vec![WatchEvent::Disconnected { device: "phone".into() }],
+        "get_events reports presence"
+    );
+}
+
+/// With no device named, `get_events` waits on every device -- including one
+/// that appears while it waits (a phone dialing in for the first time), whose
+/// `connected` event must wake the poll rather than sit unseen until the next
+/// call. This is the plugin's "window before a device is known".
+#[tokio::test]
+async fn get_events_over_all_devices_sees_a_device_that_appears_mid_wait() {
+    use crate::core::watch::{InboxEntry, WatchEvent};
+    let (core, _conn) = core_with_offline_device("existing").await;
+    let devices = core.devices.clone();
+
+    let arrival = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let newcomer = DeviceConn::new("newcomer-ticket".to_string());
+        newcomer.inbox.lock().unwrap().push_back(InboxEntry::Connected);
+        devices.lock().await.insert("newcomer".to_string(), newcomer);
+    });
+
+    let started = std::time::Instant::now();
+    let events = core.get_events(None, Some(30)).await.unwrap();
+    arrival.await.unwrap();
+
+    assert_eq!(events, vec![WatchEvent::Connected { device: "newcomer".into() }]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "should wake on arrival, not wait out the timeout");
+}
+
+/// A phone that dials in is reported `connected`; when it goes away the device
+/// reads as disconnected and a `disconnected` event follows; when it dials in
+/// again it is `connected` once more, with the inbox -- and what the phone said
+/// before it left -- intact. (Before this, the reader ended silently: the
+/// device read as connected forever and no event ever fired.)
+#[tokio::test]
+async fn a_phone_dialing_in_is_reported_connected_then_disconnected_then_connected_again() {
+    use crate::core::watch::WatchEvent;
+    let _guard = crate::registry::ENV_TEST_LOCK.lock().await;
+    crate::core::test_support::isolate("accept_presence");
+
+    let bridge_raw_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+    let phone_ep = Endpoint::bind(presets::Minimal).await.unwrap();
+
+    // The phone is a known device, so its dial passes the accept gate.
+    let phone_ticket = EndpointTicket::new(phone_ep.addr()).to_string();
+    let bridge_devices: DeviceMap = Arc::new(AsyncMutex::new(HashMap::new()));
+    bridge_devices.lock().await.insert("phone".to_string(), DeviceConn::new(phone_ticket));
+
+    let accept = BridgeAcceptHandler::new(
+        bridge_devices.clone(),
+        "127.0.0.1:0".to_string(),
+        "Claude".to_string(),
+        bridge_raw_ep.id(),
+        "azd-test-cert-bridge".to_string(),
+    );
+    let router = Router::builder(bridge_raw_ep).accept(LLM_ALPN, accept).spawn();
+    let bridge_ep = Arc::new(router.endpoint().clone());
+    let bridge_ticket = EndpointTicket::new(bridge_ep.addr()).to_string();
+    let core = crate::core::SessionCore::from_parts(
+        bridge_ep.clone(),
+        bridge_devices.clone(),
+        "test".to_string(),
+        bridge_ticket.clone(),
+        "Claude".to_string(),
+        "azd-test-cert-bridge".to_string(),
+        None,
+    );
+
+    let phone_up = || async { bridge_devices.lock().await.get("phone").is_some_and(|c| c.connected) };
+    let wait_for = |want: bool| async move {
+        for _ in 0..200 {
+            if phone_up().await == want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("phone never became connected={want}");
+    };
+
+    // First visit: dial in, say something, leave.
+    let (mut phone_send, phone_recv) = dial_device(&phone_ep, &bridge_ticket).await.expect("dial in");
+    write_frame(&mut phone_send, &Frame::thinking(false)).await.unwrap();
+    write_frame(&mut phone_send, &Frame::Chat { text: "hello".into(), id: None }).await.unwrap();
+    wait_for(true).await;
+    for _ in 0..100 {
+        let said = bridge_devices.lock().await.get("phone").unwrap().inbox.lock().unwrap().len();
+        if said >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    drop(phone_send); // the phone's stream ends
+    drop(phone_recv);
+    wait_for(false).await;
+
+    // Second visit.
+    let (mut phone_send2, _phone_recv2) = dial_device(&phone_ep, &bridge_ticket).await.expect("dial in again");
+    write_frame(&mut phone_send2, &Frame::thinking(false)).await.unwrap();
+    wait_for(true).await;
+
+    let events = core.get_events(Some("phone"), Some(5)).await.unwrap();
+    assert_eq!(
+        events,
+        vec![
+            WatchEvent::Connected { device: "phone".into() },
+            WatchEvent::Message { device: "phone".into(), text: "hello".into() },
+            WatchEvent::Disconnected { device: "phone".into() },
+            WatchEvent::Connected { device: "phone".into() },
+        ],
+        "presence and what the phone said, in order, in one inbox that survived the reconnect"
+    );
+
+    router.shutdown().await.unwrap();
+    phone_ep.close().await;
+    crate::core::test_support::unisolate();
 }
