@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::thread;
 
-use crate::server::{handle, Config, Conn};
+use crate::server::{handle, Conn, Server};
 
 pub struct VsockStream(OwnedFd);
 
@@ -61,7 +61,7 @@ impl Conn for VsockStream {
 }
 
 /// Listen on `VMADDR_CID_ANY:port` and serve forever.
-pub fn serve(port: u32, cfg: Config) -> io::Result<()> {
+pub fn serve(port: u32, srv: Arc<Server>) -> io::Result<()> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -84,7 +84,6 @@ pub fn serve(port: u32, cfg: Config) -> io::Result<()> {
     if unsafe { libc::listen(listener.as_raw_fd(), 64) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let cfg = Arc::new(cfg);
     loop {
         let c = unsafe {
             libc::accept4(
@@ -105,7 +104,7 @@ pub fn serve(port: u32, cfg: Config) -> io::Result<()> {
             return Err(e);
         }
         let stream = VsockStream(unsafe { OwnedFd::from_raw_fd(c) });
-        let cfg = Arc::clone(&cfg);
-        thread::spawn(move || handle(stream, &cfg));
+        let srv = Arc::clone(&srv);
+        thread::spawn(move || handle(stream, &srv));
     }
 }
