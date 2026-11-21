@@ -104,7 +104,8 @@ never blocks it and never loses output that is still retained.
     `error` `idem_conflict`. This makes "send exec, lose the connection before
     `started`, send it again" safe.
 - ← `{"t":"started","job":"j_…","pid":1234,"deduped":false}`.
-- `"attach":false`: the worker closes after `started`; the job runs on.
+- `"attach":false`: the worker closes after `started`; the job runs on. `"stdin":true`
+  requires `"attach":true` (`bad_request` otherwise), since the input would be lost at once.
 - `"attach":true`: ← `{"t":"stdout","off":N}` / `{"t":"stderr","off":N}` + payload
   (≤ 64 KiB), contiguous and in order per stream, then
   ← `{"t":"exit","job":"j_…","code":0,"signal":null,"reason":"exited","stdout_len":N,"stderr_len":M}`
@@ -137,7 +138,8 @@ never blocks it and never loses output that is still retained.
 - Several connections may attach to one job at once; each gets the full stream.
 
 ### 2.5 jobs
-- → `{"t":"jobs","owner":"g_…"}` (the broker sends `"owner":"*"` only for an admin grant)
+- → `{"t":"jobs","owner":"g_…"}`. `"owner":"*"` matches every owner here and in `attach`
+  and `cancel_job`; the broker sends it only for an admin grant.
 - ← `{"t":"job_list","jobs":[{"job","label","argv","state","reason","created","ended","code","signal","stdout_len","stderr_len","stdout_earliest","stderr_earliest","output_truncated"}]}`, newest first. Then close.
 
 ### 2.6 cancel_job
