@@ -66,7 +66,7 @@ fn grant_store() -> GrantStore {
 
 /// `compute serve`: run the broker until SIGINT/SIGTERM, then stop every VM
 /// it started.
-pub async fn serve() -> Result<()> {
+pub async fn serve(allow_sleep: bool) -> Result<()> {
     let dir = compute_dir();
     create_private_dir(&dir)?;
     let Some(_lock) = FileLock::try_exclusive(&lock_path())? else {
@@ -83,14 +83,17 @@ pub async fn serve() -> Result<()> {
     let mut opts = EndpointOptions::new(key);
     opts.alpns = vec![ALPN.to_vec()];
     opts.online_timeout = Some(Duration::from_secs(30));
+    opts.quic_timeouts = Some(super::QUIC_TIMEOUTS);
     let endpoint = bind_with_options(opts).await?;
     let id = endpoint.id().to_string();
     let relay = endpoint.addr().relay_urls().next().map(|u| u.to_string()).ok_or_else(|| anyhow!("the endpoint has no home relay"))?;
     write_host_info(&HostInfo { endpoint_id: id.clone(), relay_url: relay.clone(), updated: unix_now() })?;
 
-    let backend = Arc::new(RealBackend::new(paths.clone(), helper));
+    let backend = Arc::new(RealBackend::new(paths.clone(), helper).allow_sleep(allow_sleep));
+    let guard_task = backend.spawn_sleep_guard();
     let host = gethostname::gethostname().to_string_lossy().into_owned();
     let broker = Broker::new(backend.clone(), grant_store(), host);
+    let watcher = broker.spawn_watcher();
     let router = Router::builder(endpoint).accept(ALPN, broker).spawn();
 
     print_banner(
@@ -106,8 +109,10 @@ pub async fn serve() -> Result<()> {
 
     wait_for_shutdown_signal().await;
     info!("shutting down: stopping VMs");
+    watcher.abort();
     let _ = router.shutdown().await;
     backend.shutdown().await;
+    guard_task.abort();
     Ok(())
 }
 
@@ -156,6 +161,6 @@ pub fn list_grants() -> Result<Vec<Grant>> {
     grant_store().list()
 }
 
-pub fn revoke(id: &str) -> Result<bool> {
-    grant_store().revoke(id)
+pub fn revoke(id: &str, cancel_jobs: bool) -> Result<bool> {
+    grant_store().revoke(id, cancel_jobs)
 }

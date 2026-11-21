@@ -45,3 +45,37 @@ impl Frame {
         Value::Object(self.header.clone())
     }
 }
+
+/// Send one request frame to the worker and collect the single reply frame
+/// (`job_list`, `cancel_ok`, …). An `error` frame becomes `Err("code: msg")`.
+pub async fn request_one(sock: &Path, req: Frame, timeout: Duration) -> Result<Frame, String> {
+    let fut = async {
+        let mut s = UnixStream::connect(sock).await.map_err(|e| format!("connect {}: {e}", sock.display()))?;
+        write_frame(&mut s, &req).await.map_err(|e| e.to_string())?;
+        match read_frame(&mut s).await {
+            Ok(Some(f)) if f.t() == "error" => Err(format!("{}: {}", f.str_field("code").unwrap_or("error"), f.str_field("msg").unwrap_or(""))),
+            Ok(Some(f)) => Ok(f),
+            Ok(None) => Err("worker closed the connection".to_owned()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    tokio::time::timeout(timeout, fut).await.unwrap_or_else(|_| Err("worker did not answer in time".to_owned()))
+}
+
+/// The jobs the worker lists for `owner` (`"*"` for every owner).
+pub async fn list_jobs(sock: &Path, owner: &str) -> Result<Vec<Value>, String> {
+    let req = Frame::new(serde_json::json!({"t": "jobs", "owner": owner}));
+    let reply = request_one(sock, req, Duration::from_secs(10)).await?;
+    Ok(reply.header.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default())
+}
+
+/// Ask the worker to cancel `job` on behalf of `owner`.
+pub async fn cancel_job(sock: &Path, owner: &str, job: &str) -> Result<(), String> {
+    let req = Frame::new(serde_json::json!({"t": "cancel_job", "owner": owner, "job": job}));
+    request_one(sock, req, Duration::from_secs(10)).await.map(|_| ())
+}
+
+/// How many of `jobs` (a `job_list`) are still running.
+pub fn count_running(jobs: &[Value]) -> usize {
+    jobs.iter().filter(|j| j.get("state").and_then(Value::as_str) == Some("running")).count()
+}

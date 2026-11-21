@@ -39,8 +39,32 @@ pub struct VmInfo {
     pub cpus: u32,
     pub memory_mb: u64,
     pub disk_gb: u64,
+    /// `nat` or `none`.
+    #[serde(default)]
+    pub network: String,
+    /// Jobs the worker reports running (from its `pong`).
+    #[serde(default)]
+    pub jobs_running: Option<u64>,
+    /// Free space on the guest disk in MiB (from the worker's `pong`).
+    #[serde(default)]
+    pub disk_free_mb: Option<u64>,
     /// The guest's `pong` frame header when the worker answered.
     pub worker_info: Option<Value>,
+    /// The last start failure, if the VM failed to start.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl VmInfo {
+    /// Fill `jobs_running`/`disk_free_mb` from a worker `pong`.
+    pub fn with_pong(mut self, pong: Option<Value>) -> Self {
+        if let Some(p) = &pong {
+            self.jobs_running = p.get("jobs_running").and_then(Value::as_u64);
+            self.disk_free_mb = p.get("disk_free_mb").and_then(Value::as_u64);
+        }
+        self.worker_info = pong;
+        self
+    }
 }
 
 /// A failure the broker reports to the client as `{"t":"error","code",…}`.
@@ -92,7 +116,7 @@ pub trait VmBackend: Send + Sync + 'static {
 /// names exactly one concrete VM, else `default`.
 pub fn default_vm_for(grant_vms: &[String]) -> String {
     match grant_vms {
-        [one] if one != "*" => one.clone(),
+        [one] if !one.contains('*') => one.clone(),
         _ => "default".to_owned(),
     }
 }
@@ -105,6 +129,7 @@ mod tests {
     fn vm_default_rule() {
         assert_eq!(default_vm_for(&["build".into()]), "build");
         assert_eq!(default_vm_for(&["*".into()]), "default");
+        assert_eq!(default_vm_for(&["ci-*".into()]), "default");
         assert_eq!(default_vm_for(&["a".into(), "b".into()]), "default");
         assert_eq!(default_vm_for(&[]), "default");
     }

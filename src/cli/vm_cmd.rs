@@ -33,6 +33,10 @@ enum VmAction {
         /// Disk size in GiB (sparse; grown from the image's size).
         #[arg(long, default_value_t = 32, value_name = "GIB")]
         disk_gb: u64,
+        /// `nat` gives the VM outbound networking; `none` gives it no network
+        /// device at all.
+        #[arg(long, default_value = "nat", value_name = "MODE", value_parser = ["nat", "none"])]
+        network: String,
     },
     /// Host (Apple silicon macOS): list the VMs on this host.
     List {
@@ -50,7 +54,8 @@ enum VmAction {
     /// ready. Needs a grant that allows `vm`.
     Start(RemoteVmArgs),
     /// Client: stop a VM through the broker (graceful shutdown). Needs a
-    /// grant that allows `vm`.
+    /// grant that allows `vm`. Refuses with `vm_busy` while jobs are running
+    /// unless `--force`.
     Stop(RemoteVmArgs),
     /// Client: show a VM's state and whether its worker answers.
     Status(RemoteVmArgs),
@@ -64,6 +69,9 @@ struct RemoteVmArgs {
     /// otherwise `default`.
     #[arg(value_name = "NAME")]
     name: Option<String>,
+    /// Stop even if jobs are running (they end as `interrupted`).
+    #[arg(long)]
+    force: bool,
     /// Machine-readable output: a JSON array of VM status objects.
     #[arg(long)]
     json: bool,
@@ -71,7 +79,7 @@ struct RemoteVmArgs {
 
 pub(super) async fn run(args: VmArgs) -> Result<()> {
     match args.action {
-        VmAction::Create { name, image, cpus, memory, disk_gb } => host::create(&name, &image, cpus, memory, disk_gb).await,
+        VmAction::Create { name, image, cpus, memory, disk_gb, network } => host::create(&name, &image, cpus, memory, disk_gb, &network).await,
         VmAction::List { json } => host::list(json),
         VmAction::Delete { name } => host::delete(&name),
         VmAction::Start(a) => remote("start", a).await,
@@ -86,7 +94,7 @@ async fn remote(op: &str, a: RemoteVmArgs) -> Result<()> {
         Ok(x) => x,
         Err(f) => die(f.exit_code(), &f.message()),
     };
-    let result = client::vm_op(session, op, a.name.as_deref()).await;
+    let result = client::vm_op(session, op, a.name.as_deref(), a.force).await;
     close_quietly(ep).await;
     let vms = match result {
         Ok(v) => v,
@@ -98,7 +106,7 @@ async fn remote(op: &str, a: RemoteVmArgs) -> Result<()> {
     }
     for v in &vms {
         println!(
-            "{}  {}  worker {}  ({} cpu, {} MiB, {} GiB, {})",
+            "{}  {}  worker {}  ({} cpu, {} MiB, {} GiB, {}, network {}){}{}",
             v["name"].as_str().unwrap_or("?"),
             v["state"].as_str().unwrap_or("?"),
             v["worker"].as_str().unwrap_or("?"),
@@ -106,6 +114,9 @@ async fn remote(op: &str, a: RemoteVmArgs) -> Result<()> {
             v["memory_mb"],
             v["disk_gb"],
             v["image"].as_str().unwrap_or("?"),
+            v["network"].as_str().unwrap_or("nat"),
+            v["jobs_running"].as_u64().map(|n| format!("  {n} job(s) running")).unwrap_or_default(),
+            v["error"].as_str().map(|e| format!("\n  last start failed: {}", e.lines().next().unwrap_or(""))).unwrap_or_default(),
         );
     }
     Ok(())
@@ -116,9 +127,9 @@ mod host {
     use super::*;
     use crate::compute::vmmgr::{create_vm, delete_vm, list_offline, CreateOptions, Paths};
 
-    pub(super) async fn create(name: &str, image: &str, cpus: u32, memory_mb: u64, disk_gb: u64) -> Result<()> {
+    pub(super) async fn create(name: &str, image: &str, cpus: u32, memory_mb: u64, disk_gb: u64, network: &str) -> Result<()> {
         let paths = Paths::new(crate::compute::vm_dir());
-        let dir = create_vm(&paths, name, &CreateOptions { image: image.to_owned(), cpus, memory_mb, disk_gb }).await?;
+        let dir = create_vm(&paths, name, &CreateOptions { image: image.to_owned(), cpus, memory_mb, disk_gb, network: network.to_owned() }).await?;
         println!("created VM `{name}` in {}", dir.display());
         println!("start it with `azula compute serve` plus `azula vm start {name}`, or by running a command with `azula compute exec`");
         Ok(())
@@ -150,7 +161,7 @@ mod host {
 mod host {
     use super::*;
 
-    pub(super) async fn create(_: &str, _: &str, _: u32, _: u64, _: u64) -> Result<()> {
+    pub(super) async fn create(_: &str, _: &str, _: u32, _: u64, _: u64, _: &str) -> Result<()> {
         die(2, crate::compute::HOST_ONLY_MSG)
     }
     pub(super) fn list(_: bool) -> Result<()> {

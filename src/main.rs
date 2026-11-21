@@ -23,7 +23,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| {
+                    let args: Vec<String> = std::env::args().collect();
+                    tracing_subscriber::EnvFilter::new(azula::compute::default_log_filter(&args))
+                }),
         )
         .init();
 

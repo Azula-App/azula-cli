@@ -28,6 +28,9 @@ pub const TOKEN_PREFIX: &str = "azc1.";
 pub const OP_EXEC: &str = "exec";
 /// Operation allowing `vm start|stop` (and implicit start on exec).
 pub const OP_VM: &str = "vm";
+/// Operation allowing `jobs --all`, cancelling any owner's jobs, and
+/// nothing else on its own.
+pub const OP_ADMIN: &str = "admin";
 /// Default grant lifetime.
 pub const DEFAULT_TTL: &str = "7d";
 
@@ -77,6 +80,37 @@ pub struct Grant {
     pub revoked: Option<u64>,
     pub last_used: Option<u64>,
     pub last_peer: Option<String>,
+    /// Set by `revoke --cancel-jobs`: the broker cancels this grant's running
+    /// jobs when it sees the revocation.
+    #[serde(default)]
+    pub revoke_cancel_jobs: bool,
+}
+
+/// Does `name` match `pattern`, where `*` matches any run of characters?
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == n[ni] {
+            pi += 1;
+            ni += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 impl Grant {
@@ -85,17 +119,17 @@ impl Grant {
     }
 
     pub fn allows_vm(&self, vm: &str) -> bool {
-        self.vms.iter().any(|v| v == "*" || v == vm)
+        self.vms.iter().any(|v| glob_match(v, vm))
     }
 
     pub fn is_live(&self, now: u64) -> bool {
         self.revoked.is_none() && now < self.expires
     }
 
-    /// The only VM this grant names, if it names exactly one concrete VM.
+    /// The only VM this grant names, if its scope is exactly one plain name.
     pub fn sole_vm(&self) -> Option<&str> {
         match self.vms.as_slice() {
-            [one] if one != "*" => Some(one),
+            [one] if !one.contains('*') => Some(one),
             _ => None,
         }
     }
@@ -161,6 +195,11 @@ impl GrantStore {
         }
     }
 
+    /// The grants file's modification time (`None` if it does not exist).
+    pub fn mtime(&self) -> Option<SystemTime> {
+        fs::metadata(self.path()).and_then(|m| m.modified()).ok()
+    }
+
     fn write_file(&self, file: &GrantFile) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(file)?;
         write_private_atomic(&self.path(), &bytes)
@@ -203,6 +242,7 @@ impl GrantStore {
             revoked: None,
             last_used: None,
             last_peer: None,
+            revoke_cancel_jobs: false,
         };
         let stored = grant.clone();
         self.locked(move |f| {
@@ -214,12 +254,13 @@ impl GrantStore {
 
     /// Revoke `id`. `Ok(false)` if there is no such grant; revoking twice keeps
     /// the first timestamp.
-    pub fn revoke(&self, id: &str) -> Result<bool> {
+    pub fn revoke(&self, id: &str, cancel_jobs: bool) -> Result<bool> {
         self.locked(|f| match f.grants.iter_mut().find(|g| g.id == id) {
             Some(g) => {
                 if g.revoked.is_none() {
                     g.revoked = Some(unix_now());
                 }
+                g.revoke_cancel_jobs |= cancel_jobs;
                 Ok((true, true))
             }
             None => Ok((false, false)),
@@ -486,9 +527,9 @@ mod tests {
         let t0 = g.created;
         assert!(store.authenticate(&g.id, &secret, "p", t0 + 99).unwrap().is_ok());
         assert_eq!(store.authenticate(&g.id, &secret, "p", g.expires).unwrap().unwrap_err(), Unauthorized);
-        assert!(store.revoke(&g.id).unwrap());
+        assert!(store.revoke(&g.id, false).unwrap());
         assert!(store.authenticate(&g.id, &secret, "p", t0 + 1).unwrap().is_err(), "revoked");
-        assert!(!store.revoke("g_missing").unwrap());
+        assert!(!store.revoke("g_missing", false).unwrap());
         assert!(store.list().unwrap()[0].revoked.is_some());
         let _ = fs::remove_dir_all(dir);
     }
@@ -506,6 +547,7 @@ mod tests {
             revoked: None,
             last_used: None,
             last_peer: None,
+            revoke_cancel_jobs: false,
         };
         assert!(g.allows_op("exec") && !g.allows_op("vm"));
         assert!(g.allows_vm("build") && !g.allows_vm("other"));
@@ -514,6 +556,14 @@ mod tests {
         assert!(g.allows_vm("anything"));
         assert_eq!(g.sole_vm(), None);
         assert!(g.is_live(9) && !g.is_live(10));
+    }
+
+    #[test]
+    fn vm_globs() {
+        assert!(glob_match("ci-*", "ci-1") && glob_match("ci-*", "ci-") && !glob_match("ci-*", "xci-1"));
+        assert!(glob_match("*", "anything") && glob_match("a*c", "abbbc") && !glob_match("a*c", "abbbd"));
+        assert!(glob_match("build", "build") && !glob_match("build", "builds"));
+        assert!(glob_match("*-x", "a-x") && !glob_match("*-x", "a-y"));
     }
 
     #[test]

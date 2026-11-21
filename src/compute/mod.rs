@@ -18,6 +18,8 @@ pub mod frame;
 pub mod grants;
 pub mod guest;
 pub mod seed;
+pub mod tarx;
+pub mod transfer;
 #[cfg(target_os = "macos")]
 pub mod host;
 #[cfg(target_os = "macos")]
@@ -35,6 +37,9 @@ pub const PROTO_VERSION: u32 = 1;
 pub fn agent() -> String {
     format!("azula/{}", env!("CARGO_PKG_VERSION"))
 }
+
+/// QUIC keep-alive and idle timeout on compute connections, at both ends.
+pub const QUIC_TIMEOUTS: (std::time::Duration, std::time::Duration) = (std::time::Duration::from_secs(2), std::time::Duration::from_secs(10));
 
 /// Why a host verb cannot run here.
 pub const HOST_ONLY_MSG: &str = "compute hosting requires Apple silicon macOS";
@@ -73,4 +78,35 @@ pub fn valid_vm_name(name: &str) -> bool {
 /// The first 8 hex chars of an endpoint id, for log lines.
 pub fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+/// The tracing filter a command should default to when `RUST_LOG` is unset:
+/// the broker (`compute serve`) logs requests at `info`; every other compute
+/// and vm verb is quiet (`warn`), so an agent capturing stderr sees only
+/// azula's own messages and the job's stderr.
+pub fn default_log_filter(args: &[String]) -> &'static str {
+    let mut it = args.iter().skip(1).filter(|a| !a.starts_with('-'));
+    match (it.next().map(String::as_str), it.next().map(String::as_str)) {
+        (Some("compute"), Some("serve")) => "info",
+        (Some("compute") | Some("vm"), _) => "warn",
+        _ => "info",
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::default_log_filter;
+
+    fn f(a: &[&str]) -> &'static str {
+        default_log_filter(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn client_verbs_default_to_warn_and_serve_to_info() {
+        assert_eq!(f(&["azula", "compute", "exec", "--", "ls"]), "warn");
+        assert_eq!(f(&["azula", "compute", "serve"]), "info");
+        assert_eq!(f(&["azula", "vm", "status"]), "warn");
+        assert_eq!(f(&["azula", "mcp"]), "info");
+        assert_eq!(f(&["azula"]), "info");
+    }
 }

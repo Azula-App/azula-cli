@@ -112,6 +112,13 @@ pub struct VmConfig {
     pub image: String,
     pub disk_gb: u64,
     pub created_at: u64,
+    /// `nat` (default) or `none`; the helper reads it too.
+    #[serde(default = "default_network")]
+    pub network: String,
+}
+
+fn default_network() -> String {
+    "nat".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +288,63 @@ pub struct CreateOptions {
     pub cpus: u32,
     pub memory_mb: u64,
     pub disk_gb: u64,
+    /// `nat` or `none`.
+    pub network: String,
+}
+
+/// Memory the host keeps for itself when budgeting VM memory.
+pub const HOST_RESERVE_MB: u64 = 4096;
+/// Free space `vm create` wants on top of the image size.
+pub const CREATE_HEADROOM_BYTES: u64 = 10 << 30;
+
+/// May a VM of `new_mb` start when `running_mb` is already committed on a host
+/// with `host_mb` of RAM? The running VMs plus the new one must fit in RAM
+/// minus [`HOST_RESERVE_MB`].
+pub fn check_memory_budget(running_mb: u64, new_mb: u64, host_mb: u64) -> Result<(), String> {
+    let budget = host_mb.saturating_sub(HOST_RESERVE_MB);
+    if running_mb + new_mb > budget {
+        return Err(format!(
+            "starting this VM ({new_mb} MiB) with {running_mb} MiB already running would exceed the host's VM memory budget of {budget} MiB (RAM {host_mb} MiB minus {HOST_RESERVE_MB} MiB); stop another VM first"
+        ));
+    }
+    Ok(())
+}
+
+/// May `vm create` proceed with `free` bytes available and an image of `image_len`?
+pub fn check_free_space(free: u64, image_len: u64) -> Result<(), String> {
+    let need = image_len + CREATE_HEADROOM_BYTES;
+    if free < need {
+        return Err(format!(
+            "not enough free disk space: {} MiB available, need {} MiB (image {} MiB plus 10 GiB of headroom)",
+            free >> 20,
+            need >> 20,
+            image_len >> 20
+        ));
+    }
+    Ok(())
+}
+
+/// The host's physical memory in MiB (`sysctl hw.memsize`).
+pub fn host_memory_mb() -> Option<u64> {
+    let name = std::ffi::CString::new("hw.memsize").ok()?;
+    let mut value: u64 = 0;
+    let mut len = size_of::<u64>();
+    // SAFETY: `value` and `len` describe a valid u64 out-buffer for this sysctl.
+    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), &mut value as *mut u64 as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0) };
+    (rc == 0).then_some(value >> 20)
+}
+
+/// Bytes available to unprivileged writers on the volume holding `path`.
+pub fn free_bytes(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: statvfs is plain old data; zeroed is a valid initial value.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid path and `st` a valid out-struct.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("statvfs {}", path.display()));
+    }
+    Ok(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 fn clone_file(src: &Path, dst: &Path) -> Result<()> {
@@ -316,8 +380,12 @@ pub async fn create_vm(paths: &Paths, name: &str, opts: &CreateOptions) -> Resul
     if disk_bytes < image_len {
         bail!("--disk-gb {} is smaller than the image ({} bytes)", opts.disk_gb, image_len);
     }
+    if opts.network != "nat" && opts.network != "none" {
+        bail!("--network must be `nat` or `none`");
+    }
 
     std::fs::create_dir_all(paths.vms())?;
+    check_free_space(free_bytes(&paths.vms())?, image_len).map_err(|e| anyhow!(e))?;
     let work = paths.vms().join(format!("{name}.partial"));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
@@ -364,6 +432,7 @@ pub async fn create_vm(paths: &Paths, name: &str, opts: &CreateOptions) -> Resul
             image: opts.image.clone(),
             disk_gb: opts.disk_gb,
             created_at: unix_now(),
+            network: opts.network.clone(),
         };
         write_private_atomic(&work.join("vm.json"), &serde_json::to_vec_pretty(&cfg)?)?;
         std::fs::rename(&work, &final_dir)?;
@@ -426,7 +495,11 @@ pub fn list_offline(paths: &Paths) -> Vec<VmInfo> {
                 cpus: cfg.cpus,
                 memory_mb: cfg.memory_mb,
                 disk_gb: cfg.disk_gb,
+                network: cfg.network,
+                jobs_running: None,
+                disk_free_mb: None,
                 worker_info: None,
+                error: None,
             })
         })
         .collect()
@@ -455,11 +528,80 @@ pub struct RealBackend {
     pub paths: Paths,
     helper: PathBuf,
     slots: Mutex<HashMap<String, Arc<Slot>>>,
+    /// The last start failure per VM, cleared by a successful start.
+    errors: Mutex<HashMap<String, String>>,
+    allow_sleep: bool,
+    sleep_guard: Mutex<Option<std::process::Child>>,
 }
 
 impl RealBackend {
     pub fn new(paths: Paths, helper: PathBuf) -> Self {
-        Self { paths, helper, slots: Mutex::new(HashMap::new()) }
+        Self { paths, helper, slots: Mutex::new(HashMap::new()), errors: Mutex::new(HashMap::new()), allow_sleep: false, sleep_guard: Mutex::new(None) }
+    }
+
+    /// With `true`, never hold an idle-sleep assertion (`serve --allow-sleep`).
+    pub fn allow_sleep(mut self, allow: bool) -> Self {
+        self.allow_sleep = allow;
+        self
+    }
+
+    /// VMs that are starting, running or stopping.
+    fn active_vms(&self) -> Vec<String> {
+        let names: Vec<String> = self.slots.lock().unwrap().keys().cloned().collect();
+        names.into_iter().filter(|n| self.current_state(n) != VmState::Stopped).collect()
+    }
+
+    /// Hold `caffeinate -i -w <our pid>` while at least one VM is active.
+    fn refresh_sleep_guard(&self) {
+        if self.allow_sleep {
+            return;
+        }
+        let want = !self.active_vms().is_empty();
+        let mut g = self.sleep_guard.lock().unwrap();
+        if let Some(child) = g.as_mut() {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                *g = None;
+            }
+        }
+        if want && g.is_none() {
+            match std::process::Command::new("caffeinate")
+                .args(["-i", "-w"])
+                .arg(std::process::id().to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => *g = Some(c),
+                Err(e) => warn!("could not hold an idle-sleep assertion: {e}"),
+            }
+        } else if !want {
+            if let Some(mut c) = g.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    /// Re-check the sleep assertion every few seconds (catches VMs that stopped by themselves).
+    pub fn spawn_sleep_guard(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                me.refresh_sleep_guard();
+            }
+        })
+    }
+
+    fn record_error(&self, name: &str, err: &VmError) {
+        self.errors.lock().unwrap().insert(name.to_owned(), err.msg.clone());
+    }
+
+    fn memory_check(&self, name: &str, new_mb: u64) -> Result<(), VmError> {
+        let running: u64 = self.active_vms().iter().filter(|n| n.as_str() != name).filter_map(|n| load_config(&self.paths, n).ok()).map(|c| c.memory_mb).sum();
+        let Some(host_mb) = host_memory_mb() else { return Ok(()) };
+        check_memory_budget(running, new_mb, host_mb).map_err(|m| VmError::new("host_busy", m))
     }
 
     fn slot(&self, name: &str) -> Arc<Slot> {
@@ -580,16 +722,23 @@ impl VmBackend for RealBackend {
         } else {
             ("unknown", None)
         };
+        let error = self.errors.lock().unwrap().get(name).cloned();
+        let shown = if state == VmState::Stopped && error.is_some() { "failed" } else { state.as_str() };
         Ok(VmInfo {
             name: name.to_owned(),
-            state: state.as_str().into(),
+            state: shown.into(),
             worker: worker.into(),
             image: cfg.image,
             cpus: cfg.cpus,
             memory_mb: cfg.memory_mb,
             disk_gb: cfg.disk_gb,
-            worker_info,
-        })
+            network: cfg.network,
+            jobs_running: None,
+            disk_free_mb: None,
+            worker_info: None,
+            error,
+        }
+        .with_pong(worker_info))
     }
 
     async fn start(&self, name: &str) -> Result<(), VmError> {
@@ -603,7 +752,16 @@ impl VmBackend for RealBackend {
         if socket_is_live(&sock) {
             return Err(VmError::new("vm_start_failed", format!("VM `{name}` is already running under another process (its socket is live)")));
         }
-        let run = self.spawn_helper(name)?;
+        let cfg = load_config(&self.paths, name)?;
+        self.memory_check(name, cfg.memory_mb)?;
+        let run = match self.spawn_helper(name) {
+            Ok(r) => r,
+            Err(e) => {
+                self.record_error(name, &e);
+                return Err(e);
+            }
+        };
+        self.refresh_sleep_guard();
         let mut state_rx = run.state.subscribe();
         let diag = run.diag.clone();
         let state_tx = run.state.clone();
@@ -626,11 +784,13 @@ impl VmBackend for RealBackend {
             r = &mut ready => match r {
                 Ok(_) => {
                     state_tx.send_replace(VmState::Running);
+                    self.errors.lock().unwrap().remove(name);
                     Ok(())
                 }
                 Err(e) => {
                     let diag = diag.lock().unwrap().clone();
                     let err = self.failure(name, &format!("worker did not answer within {}s ({e})", START_DEADLINE.as_secs()), &diag);
+                    self.record_error(name, &err);
                     drop(_gate);
                     let _ = self.stop(name).await;
                     Err(err)
@@ -638,7 +798,10 @@ impl VmBackend for RealBackend {
             },
             _ = exited => {
                 let diag = diag.lock().unwrap().clone();
-                Err(self.failure(name, "the helper exited before the worker came up", &diag))
+                let err = self.failure(name, "the helper exited before the worker came up", &diag);
+                self.record_error(name, &err);
+                self.refresh_sleep_guard();
+                Err(err)
             }
         }
     }
@@ -674,6 +837,7 @@ impl VmBackend for RealBackend {
         stdin.lock().await.take();
         *slot.run.lock().unwrap() = None;
         let _ = std::fs::remove_file(self.paths.vsock(name));
+        self.refresh_sleep_guard();
         Ok(())
     }
 
@@ -690,6 +854,7 @@ impl VmBackend for RealBackend {
             }
         });
         futures_join_all(stops).await;
+        self.refresh_sleep_guard();
     }
 }
 
@@ -737,6 +902,24 @@ mod tests {
         let sums = "AAA  other.tar.xz\nabcdef  debian-13-generic-arm64.tar.xz\n";
         assert_eq!(expected_sha512(sums, "debian-13-generic-arm64.tar.xz").as_deref(), Some("abcdef"));
         assert_eq!(expected_sha512(sums, "missing"), None);
+    }
+
+    #[test]
+    fn memory_budget_is_ram_minus_four_gib() {
+        // 16 GiB host: 12 GiB budget.
+        assert!(check_memory_budget(0, 12 * 1024, 16 * 1024).is_ok());
+        assert!(check_memory_budget(8 * 1024, 4 * 1024, 16 * 1024).is_ok());
+        assert!(check_memory_budget(8 * 1024, 4 * 1024 + 1, 16 * 1024).is_err());
+        assert!(check_memory_budget(0, 1, 2048).is_err(), "tiny host never underflows");
+    }
+
+    #[test]
+    fn free_space_needs_image_plus_ten_gib() {
+        let img = 3u64 << 30;
+        assert!(check_free_space(13 << 30, img).is_ok());
+        assert!(check_free_space((13 << 30) - 1, img).is_err());
+        assert!(free_bytes(&std::env::temp_dir()).unwrap() > 0);
+        assert!(host_memory_mb().unwrap() > 1024);
     }
 
     #[test]
