@@ -82,7 +82,7 @@ Client verbs (any OS). Token from `--token`, else `AZULA_COMPUTE_TOKEN`:
   `{"type":"stdout"|"stderr","data_b64"}`, `{"type":"exit","code","signal","reason"}`,
   `{"type":"error","code","msg"}`.
 - `azula compute doctor [--vm NAME] [--json]` — stages, each with its own deadline:
-  `token` (parse), `bind` (5 s), `relay` (online, 20 s), `dial` (20 s), `auth` (hello→welcome,
+  `token` (parse), `bind` + `relay` (one bind that must reach the relay within 20 s; a relay failure reports `bind` passed and `relay` failed), `dial` (20 s), `auth` (hello→welcome,
   10 s), `broker` (ping), and with `--vm` `guest` (guest_ping, 30 s). Prints ✓/✗ per stage, the
   relay URL, and for failures a hint (allowlist the relay host, check `HTTPS_PROXY`, try
   `AZULA_RELAY_ONLY=1`, is `compute serve` running?, is the grant revoked/expired?).
@@ -96,17 +96,19 @@ reach the host, or the connection dropped before `exit`). Error messages go to s
 
 ## 8. VM manager (inside `compute serve`)
 
-- Bundles per README §4 under `~/.azula/vm` (`AZULA_VM_DIR` overrides it, for tests).
+- Bundles per README §4 under `~/.azula/vm` (`AZULA_VM_DIR` overrides it, for tests; the host key,
+  grants and `host.json` live under `~/.azula/compute`, overridable with `AZULA_COMPUTE_DIR`).
 - Helper binary: `$AZULA_VM_HELPER`, else `azula-vm` next to the current executable, else on
   `PATH`. Guest binary: `$AZULA_GUEST_BIN`, else `azula-guest.linux-aarch64` next to the current
   executable. At serve start the broker copies the guest binary (atomically) into
-  `~/.azula/vm/share/azula-guest`.
+  `~/.azula/vm/share/azula-guest` (only the binary: the systemd unit comes from cloud-init).
 - Start: spawn `azula-vm run --config <vm>/vm.json` with piped stdin/stdout, track state from
   its events, and poll the worker (connect `vsock.sock` + `ping`, every 1 s) until ready. The
   helper's stdin stays open for the VM's lifetime; dropping it stops the VM.
 - Images: `debian-13` = `https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.tar.xz`,
   verified against `SHA512SUMS` from the same directory (HTTPS), extracted with `tar -xJf` to
-  `images/debian-13/disk.raw`. Downloaded on first `vm create` if absent.
+  `images/debian-13-generic-arm64/disk.raw` (the image id `debian-13` maps to the directory name its
+  archive extracts under; `--image` takes the id). Downloaded on first `vm create` if absent.
 - Create: `clonefile` (or `cp -c`) the image to `disk.img`, `set_len` to `--disk-gb`, run
   `azula-vm init --efi-vars <vm>/efi.vars` for machine id + MAC, write `seed.iso` with
   `hdiutil makehybrid -iso -joliet -default-volume-name cidata`, and write `vm.json`.
@@ -137,13 +139,24 @@ write_files:
       RestartSec=1
       [Install]
       WantedBy=multi-user.target
+  - path: /etc/systemd/resolved.conf.d/azula.conf
+    content: |
+      [Resolve]
+      LLMNR=no
+      MulticastDNS=no
 runcmd:
   - [mkdir, -p, /mnt/azula]
   - [mount, -a]
   - [systemctl, daemon-reload]
   - [systemctl, enable, --now, azula-guest.service]
-  - [systemctl, disable, --now, ssh.service]
+  - [systemctl, disable, --now, ssh.service, ssh.socket]
+  - [systemctl, mask, --now, sshd-vsock.socket, sshd-unix-local.socket]
+  - [systemctl, restart, systemd-resolved.service]
 ```
+
+The last three `runcmd` items close every other guest listener (sshd on TCP, vsock and
+the unix-local socket, LLMNR, mDNS) so the worker is the only thing the host can reach; masking
+in `/etc` overrides the generator's units in `/run`. The worker is enabled before they run.
 
 The worker runs straight from the read-only share, so every boot runs the host's current
 `azula-guest`. No copy into the guest is needed.

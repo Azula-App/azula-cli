@@ -134,8 +134,8 @@ appended to `console_log`, virtiofs shares, and one virtio socket device.
 
 ```
 ~/.azula/vm/
-  images/<image>/disk.raw        pristine downloaded image (never booted)
-  share/                         read-only virtiofs share "azula": azula-guest, azula-guest.service
+  images/<dir>/disk.raw          pristine downloaded image (never booted); <dir> for debian-13 is debian-13-generic-arm64
+  share/                         read-only virtiofs share "azula": azula-guest (the unit comes from cloud-init)
   vms/<name>/vm.json             helper config (section 3) + image, created_at
   vms/<name>/disk.img            APFS clone of the image disk, grown sparse
   vms/<name>/efi.vars
