@@ -49,35 +49,153 @@ for events.
 
 ## 2. Guest worker protocol (`azula-guest`, vsock port 1024)
 
-One request per connection. The first frame selects it.
+One request per connection; the first frame selects it. Only the broker can
+reach the worker (vsock, through the helper's 0600 Unix socket), so the worker
+trusts the `owner` field the broker puts on every job and file request: it is
+the grant id of the client the broker authenticated. A client can't set it.
 
-### ping
+### 2.1 Jobs model
+
+A job outlives the connection that started it. Its output goes to disk first
+and to whoever is attached second, so a slow, absent or reconnecting client
+never blocks it and never loses output that is still retained.
+
+- **Id** `j_` + 16 random hex. Clients name a job `<vm>/<id>` (e.g.
+  `build/j_3f9a1c2b7d4e8a60`); the worker only sees the id.
+- **Record** `/var/lib/azula/jobs/<id>/`: `job.json` (owner, label, idem key,
+  argv, cwd, env *keys* (never values), created/started times, timeout,
+  flags), `stdout/` and `stderr/` segment directories, and `exit.json` once it
+  ends. Written with fsync before `started` is sent.
+- **States**: `running`, then `exited` with a `reason` (`exited`, `timeout`,
+  `cancelled`, `stdin_lost`, `orphaned`), or `interrupted` (the worker or the VM
+  stopped while it ran: found at worker start with no `exit.json`).
+- **Output**: each stream is an append-only byte sequence with absolute
+  offsets, stored in 8 MiB segment files named by their start offset. The last
+  32 segments (256 MiB) per stream are kept; older ones are deleted and the
+  stream's `earliest` offset advances. If the guest disk is full, output that
+  can't be written is dropped, the record gets `"output_truncated":true`, and
+  the pipes keep draining so the job never stalls.
+- **Limits**: at most 64 running jobs per VM and 16 per owner; beyond that,
+  `error` `busy`.
+- **Retention**: a finished job's record and output are kept 24 h after it
+  ends, at most 200 finished jobs per VM, and at most 2 GiB of output per VM;
+  the oldest finished jobs are pruned first. Running jobs are never pruned.
+- **Worker restart**: every job without `exit.json` is marked `interrupted`
+  (its processes died with the worker's cgroup). Part files older than 24 h are
+  removed.
+
+### 2.2 ping
 - → `{"t":"ping"}`
-- ← `{"t":"pong","worker":"azula-guest/<version>","proto":1,"hostname":"…","kernel":"<uname -r>","arch":"aarch64","user":"<run-as user>"}`, then close.
+- ← `{"t":"pong","worker":"azula-guest/<version>","proto":1,"hostname":"…","kernel":"<uname -r>","arch":"aarch64","user":"<run-as user>","jobs_running":0,"disk_free_mb":12345}`, then close.
 
-### exec
-- → `{"t":"exec","argv":["cargo","test"],"cwd":"/home/azula/src","env":{"K":"V"},"stdin":false,"timeout_s":900}`
+### 2.3 exec
+- → `{"t":"exec","owner":"g_…","idem":"<client uuid>","label":"…","argv":["cargo","test"],"cwd":"/home/azula/src","env":{"K":"V"},"stdin":false,"timeout_s":900,"attach":true,"cancel_on_disconnect":false}`
   - `argv` required and non-empty, run directly (no shell). `cwd` optional, defaults
     to the run-as user's home. `env` optional, applied on top of a clean base
     environment (`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
     `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG=C.UTF-8`). `stdin` optional,
     default false (child stdin is `/dev/null`). `timeout_s` optional, default
-    900, clamped to 1..=86_400.
-- ← `{"t":"started","pid":1234}` once spawned.
-- ← `{"t":"stdout"}` / `{"t":"stderr"}` with payload chunks (≤ 64 KiB each), in order per stream.
-- → `{"t":"stdin"}` + payload (only when `"stdin":true`), → `{"t":"stdin_eof"}` closes child stdin.
-- → `{"t":"cancel"}` — SIGTERM to the job's process group, SIGKILL after 5 s.
-  The connection closing (EOF or error from the far side) is treated as cancel.
-- ← `{"t":"exit","code":0,"signal":null,"reason":"exited"}` after the child is
-  reaped **and** both output pipes are drained. `reason` is `exited`,
-  `timeout`, or `cancelled`. `code` is null when killed by a signal. Then close.
-- ← `{"t":"error","code":"<code>","msg":"…"}` then close, for failures before or
-  instead of `started`: `bad_request`, `spawn_failed` (msg = OS error; the
-  client maps it to exit 127), `cwd_missing`.
+    900, clamped to 1..=86_400 (the broker may lower it further). `label`
+    optional free text for listings.
+  - **`idem`** (required): if this owner already has a job with this key (any
+    state, still retained), no new job starts. The worker answers with that
+    job (`"deduped":true`) and continues as an attach from offset 0, or closes
+    if `attach` is false. The same key with a different argv/cwd/env/stdin is
+    `error` `idem_conflict`. This makes "send exec, lose the connection before
+    `started`, send it again" safe.
+- ← `{"t":"started","job":"j_…","pid":1234,"deduped":false}`.
+- `"attach":false`: the worker closes after `started`; the job runs on.
+- `"attach":true`: ← `{"t":"stdout","off":N}` / `{"t":"stderr","off":N}` + payload
+  (≤ 64 KiB), contiguous and in order per stream, then
+  ← `{"t":"exit","job":"j_…","code":0,"signal":null,"reason":"exited","stdout_len":N,"stderr_len":M}`
+  after the child is reaped **and** both pipes hit EOF and are on disk; then
+  close. `code` is null when killed by a signal. The `_len` fields let a client
+  confirm it holds every byte.
+- → `{"t":"stdin"}` + payload and → `{"t":"stdin_eof"}` (only with `"stdin":true`);
+  → `{"t":"cancel"}` cancels the job (SIGTERM to its process group, SIGKILL after 5 s).
+- **The connection closing does not cancel the job**, except:
+  - `"stdin":true` and `stdin_eof` not yet received: the job's input is
+    incomplete, so it is cancelled with reason `stdin_lost`;
+  - `"cancel_on_disconnect":true`: if no connection is attached to the job
+    for 60 s, it is cancelled with reason `orphaned`.
+- ← `{"t":"error","code":"<code>","msg":"…"}` then close, instead of `started`:
+  `bad_request`, `spawn_failed` (client exit 127), `cwd_missing` (126), `busy`,
+  `idem_conflict`.
+
+### 2.4 attach
+- → `{"t":"attach","owner":"g_…","job":"j_…","stdout_off":0,"stderr_off":0,"follow":true}`
+- ← `{"t":"attached","job":"j_…","state":"running","label":"…","argv":[…]}`,
+  or `error` `not_found` (unknown id **or another owner's job**, indistinguishably).
+- For a stream whose requested offset is below what's retained:
+  ← `{"t":"gap","stream":"stdout","from":N,"to":E}`, then data from `E`.
+- Replayed and live data frames are contiguous per stream: no duplicates, no holes.
+- `"follow":true`: continues live while the job runs, then ← `exit`.
+  `"follow":false`: after replaying what's on disk, ← `exit` if it has ended,
+  else ← `{"t":"end","state":"running","stdout_len":N,"stderr_len":M}`. Then close.
+- → `{"t":"cancel"}` on an attach connection cancels the job.
+- An `interrupted` job ends with an `exit` frame whose reason is `interrupted`.
+- Several connections may attach to one job at once; each gets the full stream.
+
+### 2.5 jobs
+- → `{"t":"jobs","owner":"g_…"}` (the broker sends `"owner":"*"` only for an admin grant)
+- ← `{"t":"job_list","jobs":[{"job","label","argv","state","reason","created","ended","code","signal","stdout_len","stderr_len","stdout_earliest","stderr_earliest","output_truncated"}]}`, newest first. Then close.
+
+### 2.6 cancel_job
+- → `{"t":"cancel_job","owner":"g_…","job":"j_…"}`
+- ← `{"t":"cancel_ok","job":"j_…","state":"running|exited|interrupted"}` (a job
+  that already ended is left as it is) or `error` `not_found`.
 
 Jobs run as the `--run-as` user (default `azula`) with its uid/gid/groups and
 `HOME`, in their own process group. If the worker isn't root or the user is
 missing, jobs run as the worker's own user.
+
+### 2.7 put (file into the guest, resumable)
+- → `{"t":"put","owner":"g_…","path":"out/app.tgz","upload":"<client uuid>","mode":420,"overwrite":true,"mkdirs":true}`
+  - `path` required: absolute, or relative to the run-as user's home; UTF-8
+    only. `mode` optional (default 0o644; only the 0o777 bits are applied).
+    `overwrite` default true. `mkdirs` default true (missing parents are
+    created, owned by the run-as user, mode 0o755).
+  - `upload` required: the client's id for this transfer. Resuming needs the
+    same owner, upload id and path.
+- ← `{"t":"put_ready","offset":N}`: N bytes of this upload are already on disk
+  (0 for a new one). The worker re-hashes those N bytes to continue the digest.
+- → `{"t":"data"}` + payload chunks (≤ 1 MiB each) starting at byte N, in order.
+- → `{"t":"eof","size":S,"sha256":"<hex>"}` over the whole file.
+- ← `{"t":"put_ok","path":"/home/azula/out/app.tgz","size":S,"sha256":"<hex>"}`, then close.
+- ← `{"t":"error","code":"<code>","msg":"…"}`, then close: `bad_request`,
+  `exists` (target exists and `overwrite` is false), `is_a_directory`,
+  `not_a_directory` (a parent is a file), `upload_conflict` (id in use for
+  another path or owner), `size_mismatch`, `digest_mismatch`, `io_error`
+  (message includes the OS error, e.g. ENOSPC).
+
+The bytes go to `.<name>.azula-<upload>.part` in the target's directory
+(`O_CREAT|O_NOFOLLOW`, mode 0600). Only when `eof` matches both size and
+digest does the worker `fchmod`, `fchown` to the run-as user, `fsync` and
+`rename` over the target, so the target is always either the old file or the
+complete new one. If the connection drops before `eof`, the part file stays
+for resumption (24 h); a size or digest mismatch deletes it so the client
+restarts from 0. Concurrent puts to one path each complete atomically; the
+last rename wins.
+
+### 2.8 get (file out of the guest, resumable)
+- → `{"t":"get","owner":"g_…","path":"out/app.tgz","offset":0,"etag":null}`
+- ← `{"t":"get_meta","path":"/home/azula/out/app.tgz","size":S,"mode":420,"etag":"<dev>:<ino>:<size>:<mtime_ns>"}`.
+  If the request carried an `etag` that no longer matches,
+  ← `error` `changed` instead (the client restarts from 0 without one).
+- ← `{"t":"data"}` + payload chunks (≤ 1 MiB) from `offset`.
+- ← `{"t":"get_end","size":S,"sha256":"<hex>"}`: the digest of the whole file,
+  including bytes before `offset`. Then close.
+- ← `error`: `bad_request`, `not_found`, `not_a_file` (directories, devices,
+  sockets, FIFOs; the hint suggests `-r`), `io_error`.
+
+Symlinks are followed inside the guest; the final target must be a regular
+file. The client writes to a part file next to its destination and renames it
+into place only if `get_end` matches.
+
+File operations run as the worker (root) and create files owned by the run-as
+user. Inside the VM that is not a privilege boundary (the job user has
+passwordless sudo), so put/get/attach/jobs are authorized exactly like exec.
+Nothing in this protocol can name a path on the host.
 
 ## 3. Helper protocol (`azula-vm`)
 
@@ -108,10 +226,13 @@ Config JSON (all paths absolute):
     {"path": "/…/seed.iso", "read_only": true}
   ],
   "shares": [{"tag": "azula", "path": "/…/share", "read_only": true}],
+  "network": "nat",
   "console_log": "/…/console.log",
   "vsock": {"socket": "/…/vsock.sock", "port": 1024}
 }
 ```
+
+`network` is `"nat"` (default when absent) or `"none"` (no network device at all).
 
 Linux guest via `VZEFIBootLoader`, `VZGenericPlatformConfiguration`, virtio
 block disks, NAT networking, virtio entropy + memory balloon, a virtio console

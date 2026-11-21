@@ -6,35 +6,55 @@ This file covers the Rust side in `src/compute/`. Merge into README when stable.
 ## 5. Client ↔ broker (iroh ALPN `azula/compute/1`)
 
 One iroh connection per request; the client opens one bi-stream and speaks
-§1 frames.
+§1 frames. Compute connections (both ends) use a 2 s QUIC keep-alive and a
+10 s idle timeout, so a peer that vanishes without closing (SIGKILL, a torn-down
+sandbox, a sleeping Mac) is noticed within ~10 s.
 
 1. → `{"t":"hello","v":1,"grant":"<grant id>","secret":"<base64url>","client":"azula/<version>"}`
-2. ← `{"t":"welcome","v":1,"host":"<hostname>","broker":"azula/<version>","grant":"<id>","expires":<unix>,"ops":["exec","vm"],"vms":["*"]}`
+2. ← `{"t":"welcome","v":1,"host":"<hostname>","broker":"azula/<version>","grant":"<id>","expires":<unix>,"ops":["exec","vm"],"vms":["build","ci-*"],"features":["jobs","files"]}`
    or ← `{"t":"error","code":"unauthorized|unsupported_version|bad_request","msg":"…"}` and close.
    Unknown, expired and revoked grants all get the same `unauthorized` reply.
 3. → exactly one request:
    - `{"t":"ping"}` → ← `{"t":"pong","broker":"azula/<version>","host":"<hostname>"}`.
-   - `{"t":"vm","op":"list|status|start|stop","vm":"<name>"}` → ← `{"t":"vm_status","vms":[VmInfo…]}`.
+   - `{"t":"vm","op":"list|status|start|stop","vm":"<name>","force":false}` → ← `{"t":"vm_status","vms":[VmInfo…]}`.
      `list`/`status` need any grant that covers the VM(s) (list filters to the grant's scope).
      `start`/`stop` need op `vm`. `start` replies once the worker answers a ping (deadline
-     180 s; on failure ← `error` `vm_start_failed` with the last 40 console lines in `msg`).
-     `stop` replies once the helper reports `stopped`.
-   - `{"t":"exec","vm":"<name>","start":true, …§2 exec fields}` needs op `exec` and the VM in
-     scope. If the VM isn't running: with `"start":true` and op `vm` in the grant, start it as
-     above; otherwise ← `error` `vm_not_running`. Then the broker connects to the VM's
-     `vsock.sock` (retrying ≤ 30 s while the worker comes up), forwards the exec frame with the
-     broker-only fields (`vm`, `start`) removed, and splices bytes in both directions until either
-     side closes. It never parses job output. The client's disconnect closes the guest connection,
-     which the worker treats as cancel.
+     180 s). If the helper fails or the worker never answers, the broker stops the VM and
+     replies `error` `vm_start_failed`, with the helper's error and the last 40 console lines.
+     `stop` replies once the helper reports `stopped`. If the worker reports running jobs (any
+     owner), `stop` replies `error` `vm_busy` with the count, unless `"force":true` is sent and
+     the grant has op `vm` (then the jobs end as `interrupted`).
    - `{"t":"guest_ping","vm":"<name>"}` → ← the guest's `pong` frame verbatim (for `doctor --vm`).
+   - Job and file requests, §2.3–2.8 frames plus `"vm":"<name>"` and `"start":true|false`:
+     `exec`, `attach`, `jobs`, `cancel_job`, `put`, `get`. All need op `exec` and the VM in
+     scope. If the VM isn't running: with `"start":true` and op `vm` in the grant, start it as
+     above; otherwise ← `error` `vm_not_running`. The broker then:
+     - **sets `owner`** to the authenticated grant id, overwriting anything the client sent.
+       For `jobs` and `cancel_job` from a grant with op `admin` and `"all":true`, it sets
+       `"owner":"*"`;
+     - **clamps `exec.timeout_s`** so the job ends no later than the grant expires; if the grant
+       has under 60 s left, it replies `error` `grant_expiring`;
+     - waits for the worker (ping, ≤ 30 s), connects to the VM's `vsock.sock` once, forwards the
+       frame without `vm`/`start`/`all`, and splices bytes both ways until either side closes.
+       It never parses job output or file data.
+   A client's disconnect closes its guest connection; whether that cancels a job is the
+   worker's rule (§2.3), not the broker's.
 
-`VmInfo` = `{"name","state":"stopped|starting|running|stopping","worker":"ready|unreachable|unknown","image","cpus","memory_mb","disk_gb","worker_info":<guest pong or null>}`.
+`VmInfo` = `{"name","state":"stopped|starting|running|stopping|failed","worker":"ready|unreachable|unknown","image","cpus","memory_mb","disk_gb","network","jobs_running","disk_free_mb","worker_info":<guest pong or null>,"error":<last start failure or null>}`.
 
-Error codes: `unauthorized`, `forbidden` (grant doesn't allow op or VM), `bad_request`,
-`unknown_vm`, `vm_not_running`, `vm_start_failed`, `worker_unreachable`, `internal`.
+Error codes: `unauthorized`, `forbidden` (grant doesn't allow the op or VM), `bad_request`,
+`unknown_vm`, `vm_not_running`, `vm_start_failed`, `vm_busy`, `grant_expiring`,
+`worker_unreachable`, `host_busy` (memory budget, see §8), `internal`.
+
+**Live revocation and expiry.** The broker keeps every live connection indexed by grant. It
+re-reads `grants.json` whenever its mtime changes (checked every 2 s) and at each grant's
+expiry time, and closes the live connections of a revoked or expired grant with QUIC close
+reason `revoked` / `expired`. Their jobs keep running (bounded by the clamped timeout) unless
+the revocation asked for `--cancel-jobs`, in which case the broker sends `cancel_job` for each
+of that grant's running jobs on every running VM.
 
 The broker logs one line per request to stderr: time, grant id, peer endpoint id (short),
-request type, VM, outcome. Never the secret.
+request type, VM, job id if any, outcome. Never the secret, never file contents.
 
 ## 6. Grants
 
@@ -59,40 +79,111 @@ Host identity: a persisted iroh secret key dedicated to compute (`~/.azula/compu
 learn its home relay. It must never bind the host key while serve is running, because the relay
 would drop serve's connection.
 
+Ops: `exec` (jobs and files), `vm` (start/stop, auto-start), `admin` (see and cancel every
+owner's jobs, force-stop). `vms` entries are names or `*` globs. A grant is the principal: jobs
+and uploads belong to the grant that created them, and only that grant (or an admin grant)
+can attach to, list or cancel them. Two sandboxes that share a token share a principal; mint
+one grant per session to keep them apart and to make `last_used`/`last_peer` and the broker log
+attribute work correctly.
+
 ## 7. CLI
 
 Host verbs (Apple silicon macOS only; elsewhere they exit 2 with "compute hosting requires
 Apple silicon macOS"):
 
-- `azula compute serve` — foreground broker. Banner: endpoint id, relay URL, VM dir. On
-  SIGINT/SIGTERM it stops every VM it started (helper `stop`, 30 s grace) before exiting.
-- `azula compute grant [--ttl 7d] [--vm NAME]… [--ops exec,vm] [--label TEXT] [--json]` —
-  prints the token and a one-line `export AZULA_COMPUTE_TOKEN=…` hint on stdout.
-- `azula compute grants [--json]`, `azula compute revoke <grant-id>`.
-- `azula vm create <name> [--image debian-13] [--cpus 4] [--memory 4096] [--disk-gb 32]`,
-  `azula vm list [--json]`, `azula vm delete <name>` (refuses while `vsock.sock` is live).
+- `azula compute serve [--allow-sleep]` — foreground broker. Banner: endpoint id, relay URL,
+  VM dir. A second instance fails at once ("already running, pid N"; `serve.lock`). While any
+  VM it started is running, it holds an idle-sleep assertion (`caffeinate -i -w <pid>`) unless
+  `--allow-sleep`. Closing the lid still sleeps the Mac. On SIGINT/SIGTERM it stops every VM it
+  started (helper `stop`, 30 s grace; running jobs become `interrupted`) before exiting.
+- `azula compute grant [--ttl 7d] [--vm NAME|GLOB]… [--ops exec,vm,admin] [--label TEXT] [--json]`
+  — prints the token once on stdout, plus a one-line `export AZULA_COMPUTE_TOKEN=…` hint.
+  `--vm` accepts `*` globs (`ci-*`); default `*`. Default ops `exec,vm`. One grant per cloud
+  session/agent is the recommended pattern: the grant is the principal that owns jobs.
+- `azula compute grants [--json]`, `azula compute revoke <grant-id> [--cancel-jobs]`.
+- `azula vm create <name> [--image debian-13] [--cpus 4] [--memory 4096] [--disk-gb 32]
+  [--network nat|none]`, `azula vm list [--json]`, `azula vm delete <name>` (refuses while the
+  VM is running). `create` refuses if the host volume has less free space than the image size
+  plus 10 GiB.
 
-Client verbs (any OS). Token from `--token`, else `AZULA_COMPUTE_TOKEN`:
+Client verbs (any OS). Token from `--token`, else `AZULA_COMPUTE_TOKEN`. VM: `--vm NAME`, else
+`AZULA_COMPUTE_VM`, else the grant's VM when its scope is exactly one plain name, else
+`default`. A job is named `<vm>/<job id>`; verbs that take one also accept a bare id with `--vm`.
 
 - `azula compute exec [--vm NAME] [--no-start] [--cwd DIR] [--env K=V]… [--stdin]
-  [--timeout 15m] [--json] -- ARGV…` — `--vm` defaults to the grant's only VM when it names
-  exactly one, else `default`. Streams stdout/stderr to the local stdout/stderr. `--stdin`
-  forwards local stdin then EOF. SIGINT sends `cancel` once, and a second SIGINT disconnects.
-  `--json` writes JSONL events to stdout: `{"type":"started","pid"}`,
-  `{"type":"stdout"|"stderr","data_b64"}`, `{"type":"exit","code","signal","reason"}`,
-  `{"type":"error","code","msg"}`.
-- `azula compute doctor [--vm NAME] [--json]` — stages, each with its own deadline:
-  `token` (parse), `bind` + `relay` (one bind that must reach the relay within 20 s; a relay failure reports `bind` passed and `relay` failed), `dial` (20 s), `auth` (hello→welcome,
-  10 s), `broker` (ping), and with `--vm` `guest` (guest_ping, 30 s). Prints ✓/✗ per stage, the
-  relay URL, and for failures a hint (allowlist the relay host, check `HTTPS_PROXY`, try
-  `AZULA_RELAY_ONLY=1`, is `compute serve` running?, is the grant revoked/expired?).
-- `azula vm start|stop|status [NAME] [--json]` via the broker.
+  [--timeout 15m] [--detach] [--cancel-on-disconnect] [--reconnect 5m] [--label TEXT] [--quiet]
+  [--json] -- ARGV…`
+  - Generates a fresh `idem` key, prints `azula: job build/j_… started` to stderr (unless
+    `--quiet`), streams stdout/stderr to the local stdout/stderr, and exits with the job's code.
+  - `--detach` prints the job ref on stdout and exits 0 as soon as the job has started.
+  - **Reconnect**: if the connection drops, the client retries with backoff (1 s doubling to
+    15 s) for up to `--reconnect` (default 5m, `0` disables). If it never got `started`, it
+    resends the same exec, and the `idem` key makes that safe. Otherwise it attaches with the
+    offsets it has already written, so output is neither repeated nor lost. It prints
+    `azula: connection lost, reattaching to build/j_…` once per outage. A `gap` frame prints
+    `azula: N bytes of stdout were dropped by the host's retention limit`.
+  - If reconnecting gives up: exit 255 with
+    `azula: lost the connection; build/j_… is still running on the host — reattach with: azula compute attach build/j_…`.
+  - First SIGINT sends `cancel` and waits for `exit`; a second SIGINT detaches, prints the job
+    ref, and exits 130.
+  - `--json` writes JSONL events to stdout: `{"type":"started","job","pid","deduped"}`,
+    `{"type":"stdout"|"stderr","off","data_b64"}`, `{"type":"gap","stream","from","to"}`,
+    `{"type":"reconnecting","attempt"}`, `{"type":"exit","code","signal","reason"}`,
+    `{"type":"error","code","msg"}`.
+- `azula compute attach <ref> [--json]` — replay from the start and follow to the end; exits
+  with the job's code. Same reconnect behavior as exec.
+- `azula compute logs <ref> [--follow] [--tail N] [--stdout-only|--stderr-only] [--json]`:
+  without `--follow`, print what's retained and exit 0. `--tail N` prints only the last N lines
+  (it fetches from max(0, len − 256 KiB) and trims locally).
+- `azula compute jobs [--all] [--json]` — this grant's jobs on the VM (`--all`: every owner,
+  admin grants only), newest first: ref, state/reason, exit code, age, label, argv.
+- `azula compute cancel <ref>`.
+- `azula compute push [--vm NAME] [-r] [--mode 0644] [--no-clobber] [--json] LOCAL REMOTE` and
+  `azula compute pull [--vm NAME] [-r] [--json] REMOTE LOCAL` — copy between this machine and
+  the VM's filesystem. Nothing on the Mac host itself is reachable.
+  - REMOTE is a guest path, absolute or relative to the job user's home. A REMOTE (push) or
+    LOCAL (pull) that ends in `/` or names an existing directory gets the source's basename
+    appended. LOCAL may be `-` for stdin/stdout (not resumable).
+  - Single files use §2.7/2.8: streaming SHA-256 at both ends, size and digest checked before
+    an atomic rename, mode preserved (push sends the local mode unless `--mode`).
+  - Resume: within one invocation, a dropped transfer resumes from the last acknowledged offset
+    (same reconnect window as exec). Across invocations, the client keeps
+    `~/.azula/compute/transfers.json` (host, vm, local path, size, mtime, remote path → upload id
+    / etag). Rerunning the same push or pull resumes, unless the local or remote file changed,
+    in which case it restarts from 0. pull keeps `.<name>.azula-<id>.part` next to its
+    destination until it completes.
+  - `-r` copies a directory tree by streaming tar through exec. push builds the archive locally
+    and runs `tar -x -C DIR` in the guest. pull runs `tar -c -C DIR .` in the guest and
+    extracts **defensively**: it rejects absolute paths, `..`, links that point outside LOCAL,
+    entries under a symlinked parent, and device/FIFO entries. `-r` is retried from scratch on
+    reconnect rather than resumed (extraction is idempotent). It fails if either tar fails.
+  - Progress and the result (`pushed 1.2 MiB → /home/azula/out/app.tgz sha256 3f9a…`) go to
+    stderr; `--json` prints `{"path","size","sha256","resumed_from"}` to stdout.
+- `azula compute doctor [--vm NAME] [--json]` — stages, each with its own deadline: `token`
+  (parse), `bind` + `relay` (one bind that must reach the relay within 20 s; a relay failure
+  reports `bind` passed and `relay` failed), `dial` (20 s), `auth` (hello→welcome, 10 s),
+  `broker` (ping), and with `--vm` `guest` (guest_ping, 30 s; reports jobs running and guest
+  disk free). Prints ✓/✗ per stage, the relay URL, and for failures a hint (allowlist the
+  relay host and `dns.iroh.link`, check `HTTPS_PROXY`, try `AZULA_RELAY_ONLY=1`, is
+  `compute serve` running and the Mac awake?, is the grant revoked/expired?, does the token's
+  host id match `azula compute grants` on the Mac?).
+- `azula vm start|stop|status [NAME] [--force] [--json]` via the broker.
 
-Client exit codes: the job's exit code; `128+N` when the job died of signal N; `124` timeout;
-`127` `spawn_failed`; `126` `cwd_missing`; `130` cancelled by local SIGINT; `125` any broker
-error (`unauthorized`, `forbidden`, `vm_not_running`, …); `255` transport failure (couldn't
-reach the host, or the connection dropped before `exit`). Error messages go to stderr prefixed
-`azula:`.
+Client verbs log at `warn` unless `RUST_LOG` is set, so an agent capturing stderr sees only
+azula's own messages and the job's stderr.
+
+Client exit codes:
+- exec/attach: the job's exit code; `128+N` when the job died of signal N; `124` timeout;
+  `127` `spawn_failed`; `126` `cwd_missing`; `130` cancelled (local SIGINT, or `cancel` from
+  anyone); `125` any broker error (`unauthorized`, `forbidden`, `vm_not_running`, `busy`,
+  `host_busy`, …); `255` transport failure, or a job that ended as `interrupted`,
+  `stdin_lost` or `orphaned` (the message says which).
+- push/pull: `0` on success; `1` for a file error from either end (`not_found`,
+  `not_a_file`, `exists`, `is_a_directory`, `not_a_directory`, `changed` after retries,
+  `size_mismatch`, `digest_mismatch`, `io_error`); `125` broker errors; `255` transport
+  failure after the reconnect window.
+- logs/jobs/cancel/doctor/vm: `0`, `1` (`not_found`, a doctor stage failed), `125`, `255`.
+- Error messages go to stderr prefixed `azula:`.
 
 ## 8. VM manager (inside `compute serve`)
 
@@ -102,6 +193,11 @@ reach the host, or the connection dropped before `exit`). Error messages go to s
   `PATH`. Guest binary: `$AZULA_GUEST_BIN`, else `azula-guest.linux-aarch64` next to the current
   executable. At serve start the broker copies the guest binary (atomically) into
   `~/.azula/vm/share/azula-guest` (only the binary: the systemd unit comes from cloud-init).
+- Memory budget: a start is refused with `host_busy` if the running VMs' `memory_mb` plus the
+  new VM's would exceed the host's RAM minus 4 GiB. `--network none` VMs get no network device
+  (helper config `"network":"none"`).
+- Sleep: while ≥ 1 VM it started is running, serve keeps a `caffeinate -i -w <serve pid>` child
+  (dropped when the last VM stops), unless `--allow-sleep`.
 - Start: spawn `azula-vm run --config <vm>/vm.json` with piped stdin/stdout, track state from
   its events, and poll the worker (connect `vsock.sock` + `ping`, every 1 s) until ready. The
   helper's stdin stays open for the VM's lifetime; dropping it stops the VM.
