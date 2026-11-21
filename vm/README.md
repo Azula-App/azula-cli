@@ -83,7 +83,7 @@ missing, jobs run as the worker's own user.
 
 Swift package at `vm/helper/`, product `azula-vm`, macOS 13+, Apple silicon.
 It must be signed with `vm/helper/azula-vm.entitlements`
-(`com.apple.security.virtualization`); `vm/helper/build.sh [OUT_DIR]` builds a
+(`com.apple.security.virtualization`); `vm/helper/build.sh [OUT_DIR]` (default `vm/helper/.build/dist`) builds a
 release binary and ad-hoc signs it.
 
 ### `azula-vm check`
