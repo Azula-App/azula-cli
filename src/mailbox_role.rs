@@ -57,7 +57,7 @@ use crate::certs::{DeviceCert, Revocation};
 use crate::eventlog::{AgentInBody, Kind};
 use crate::link::{RootlessLinkHandler, LINK_ALPN};
 use crate::linked_identity::{self, NODE_IDENTITY_NAME};
-use crate::proto::{read_frame, write_frame, Frame, IdentityBundle};
+use crate::proto::{read_frame, size_batches, write_frame, Frame, IdentityBundle, BATCH_BYTES_PER_FRAME};
 use crate::sync::{LogStore, PreSyncAckHook, SyncHandler, SYNC_ALPN};
 use crate::{endpoint, identity};
 
@@ -475,6 +475,25 @@ pub fn log_store_dir() -> Option<PathBuf> {
     }
 }
 
+/// The `SyncA2ui` frames replaying a syncing device's pending A2UI messages:
+/// one per conversation, split into several once a conversation's messages
+/// pass [`BATCH_BYTES_PER_FRAME`]. The phone applies each frame's messages in
+/// order as ordinary `a2ui` messages, so a split changes nothing it sees.
+/// Each surface's snapshot is capped (`relay_a2ui::MAX_SNAPSHOT_BYTES`) but a
+/// conversation's number of surfaces isn't, so without the split enough of
+/// them would add up to a line the phone refuses
+/// (`proto::MAX_FRAME_LINE_BYTES`).
+fn sync_a2ui_frames(by_conversation: std::collections::HashMap<String, Vec<serde_json::Value>>) -> Vec<Frame> {
+    let json_len = |message: &serde_json::Value| serde_json::to_vec(message).map_or(0, |bytes| bytes.len());
+    let mut frames = Vec::new();
+    for (conversation, messages) in by_conversation {
+        for batch in size_batches(messages, usize::MAX, BATCH_BYTES_PER_FRAME, json_len) {
+            frames.push(Frame::SyncA2ui { conversation: conversation.clone(), messages: batch });
+        }
+    }
+    frames
+}
+
 /// Run `azula relay`: load the identity linked via `azula link`, bind its
 /// endpoint key, and serve the chat/LLM/sync/link ALPNs until Ctrl-C. relay
 /// spec: "Relay Subsumes the Mailbox Role" — `azula mailbox` (`cli/legacy.rs`'s
@@ -550,17 +569,13 @@ pub async fn run() -> Result<()> {
     // sync session's catch-up gap but before this side's SyncAck (see
     // `sync::PreSyncAckHook`'s doc for why not after: the phone's bounded
     // catch-up mode stops listening the instant the ack arrives), replay
-    // whatever pending A2UI snapshots that device hasn't seen yet, one
-    // `SyncA2ui` frame per conversation with pending messages.
+    // whatever pending A2UI snapshots that device hasn't seen yet, as
+    // `SyncA2ui` frames (see `sync_a2ui_frames`).
     let a2ui_store_for_hook = a2ui_store.clone();
     let pre_ack_hook: PreSyncAckHook = Arc::new(move |peer_device_pk: PublicKey| {
         let a2ui_store = a2ui_store_for_hook.clone();
         Box::pin(async move {
-            let by_conversation = a2ui_store.drain_pending_messages_for_device(&peer_device_pk.to_string()).await;
-            by_conversation
-                .into_iter()
-                .map(|(conversation, messages)| Frame::SyncA2ui { conversation, messages })
-                .collect()
+            sync_a2ui_frames(a2ui_store.drain_pending_messages_for_device(&peer_device_pk.to_string()).await)
         })
     });
     let sync_handler = SyncHandler::new(cert, revocations, store).with_pre_ack_hook(pre_ack_hook);
@@ -1348,20 +1363,57 @@ mod tests {
     }
 
     /// Builds the same `PreSyncAckHook` `azula relay`'s `run` wires up:
-    /// drain `a2ui_store`'s pending messages for the syncing peer, one
-    /// `SyncA2ui` frame per conversation.
+    /// drain `a2ui_store`'s pending messages for the syncing peer into
+    /// `SyncA2ui` frames.
     fn a2ui_replay_hook(a2ui_store: crate::core::relay_a2ui::RelayA2uiStore) -> PreSyncAckHook {
         Arc::new(move |peer_device_pk: PublicKey| {
             let store = a2ui_store.clone();
             Box::pin(async move {
-                store
-                    .drain_pending_messages_for_device(&peer_device_pk.to_string())
-                    .await
-                    .into_iter()
-                    .map(|(conversation, messages)| Frame::SyncA2ui { conversation, messages })
-                    .collect()
+                sync_a2ui_frames(store.drain_pending_messages_for_device(&peer_device_pk.to_string()).await)
             })
         })
+    }
+
+    #[test]
+    fn sync_a2ui_frames_keeps_a_small_conversation_in_one_frame() {
+        let messages = vec![
+            serde_json::json!({"version":"v0.9.1","createSurface":{"surfaceId":"s1"}}),
+            serde_json::json!({"version":"v0.9.1","updateComponents":{"surfaceId":"s1","components":[]}}),
+        ];
+        let frames = sync_a2ui_frames([("conv".to_string(), messages.clone())].into());
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(&frames[0], Frame::SyncA2ui { conversation, messages: m } if conversation == "conv" && *m == messages));
+    }
+
+    #[test]
+    fn sync_a2ui_frames_splits_a_conversation_past_the_byte_budget() {
+        // 64 surfaces' worth of near-cap (256 KiB) snapshots in one
+        // conversation: ~16 MiB of messages, which as a single frame would
+        // land right at the phone's line cap.
+        let big = "x".repeat(crate::core::relay_a2ui::MAX_SNAPSHOT_BYTES - 1024);
+        let messages: Vec<serde_json::Value> = (0..64)
+            .map(|i| serde_json::json!({"version":"v0.9.1","updateDataModel":{"surfaceId":format!("s{i}"),"value":big}}))
+            .collect();
+        let frames = sync_a2ui_frames([("conv".to_string(), messages.clone())].into());
+
+        assert!(frames.len() > 1, "a ~16 MiB conversation must not go out as one frame");
+        let mut replayed = Vec::new();
+        for frame in &frames {
+            let line = serde_json::to_string(frame).unwrap();
+            assert!(
+                line.len() <= BATCH_BYTES_PER_FRAME + 1024,
+                "a SyncA2ui frame came to {} bytes, over the {BATCH_BYTES_PER_FRAME} byte budget",
+                line.len()
+            );
+            match frame {
+                Frame::SyncA2ui { conversation, messages } => {
+                    assert_eq!(conversation, "conv");
+                    replayed.extend(messages.iter().cloned());
+                }
+                other => panic!("expected SyncA2ui, got {other:?}"),
+            }
+        }
+        assert_eq!(replayed, messages, "splitting must keep every message, in order");
     }
 
     #[tokio::test]
