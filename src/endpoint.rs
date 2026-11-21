@@ -30,6 +30,12 @@ pub struct EndpointOptions {
     /// `None` waits for the relay forever (the historic behaviour); `Some(d)`
     /// fails with an actionable error if no relay is connected within `d`.
     pub online_timeout: Option<Duration>,
+    /// `Some((keep_alive, idle_timeout))` sets the QUIC keep-alive interval and
+    /// idle timeout for every connection on this endpoint (both directions),
+    /// via `iroh::endpoint::QuicTransportConfig::builder()`'s
+    /// `keep_alive_interval` / `max_idle_timeout`. `None` keeps iroh's
+    /// defaults. Compute uses 2 s / 10 s so a vanished peer is noticed fast.
+    pub quic_timeouts: Option<(Duration, Duration)>,
 }
 
 impl EndpointOptions {
@@ -39,6 +45,7 @@ impl EndpointOptions {
             alpns: Vec::new(),
             relay_only: false,
             online_timeout: None,
+            quic_timeouts: None,
         }
     }
 }
@@ -153,6 +160,15 @@ async fn bind_once(
     }
     if relay_only {
         b = b.clear_ip_transports();
+    }
+    if let Some((keep_alive, idle)) = opts.quic_timeouts {
+        let idle = iroh::endpoint::IdleTimeout::try_from(idle)?;
+        b = b.transport_config(
+            iroh::endpoint::QuicTransportConfig::builder()
+                .keep_alive_interval(keep_alive)
+                .max_idle_timeout(Some(idle))
+                .build(),
+        );
     }
     if system_roots {
         b = b.ca_tls_config(CaTlsConfig::system());

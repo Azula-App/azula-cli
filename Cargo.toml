@@ -34,6 +34,7 @@ exclude = [
     "docker-compose.yml",
     ".dockerignore",
     "docs",
+    "vm",
 ]
 
 [lints]
@@ -86,3 +87,6 @@ gethostname = "1.1.0"
 # `azula terminal kill`'s SIGTERM, local PTY sizing): already a transitive
 # dep via portable-pty, promoted to direct since we call it ourselves.
 libc = "0.2"
+# `azula compute push/pull -r`: directory trees travel as tar through exec; the
+# pull side extracts defensively (pure Rust; xattr support off).
+tar = { version = "0.4", default-features = false }
