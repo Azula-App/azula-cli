@@ -30,8 +30,8 @@ sandbox, a sleeping Mac) is noticed within ~10 s.
      scope. If the VM isn't running: with `"start":true` and op `vm` in the grant, start it as
      above; otherwise ← `error` `vm_not_running`. The broker then:
      - **sets `owner`** to the authenticated grant id, overwriting anything the client sent.
-       For `jobs` and `cancel_job` from a grant with op `admin` and `"all":true`, it sets
-       `"owner":"*"`;
+       For `jobs`, `cancel_job` and `attach` from a grant with op `admin` and `"all":true`, it sets
+       `"owner":"*"` (the CLI exposes this as `jobs --all` and `cancel --all`);
      - **clamps `exec.timeout_s`** so the job ends no later than the grant expires; if the grant
        has under 60 s left, it replies `error` `grant_expiring`;
      - waits for the worker (ping, ≤ 30 s), connects to the VM's `vsock.sock` once, forwards the
@@ -155,8 +155,9 @@ Client verbs (any OS). Token from `--token`, else `AZULA_COMPUTE_TOKEN`. VM: `--
   - `-r` copies a directory tree by streaming tar through exec. push builds the archive locally
     and runs `tar -x -C DIR` in the guest. pull runs `tar -c -C DIR .` in the guest and
     extracts **defensively**: it rejects absolute paths, `..`, links that point outside LOCAL,
-    entries under a symlinked parent, and device/FIFO entries. `-r` is retried from scratch on
-    reconnect rather than resumed (extraction is idempotent). It fails if either tar fails.
+    entries under a symlinked parent, and device/FIFO entries. `-r` rides out a dropped
+    connection through the job's reattach-with-offsets (the tar stream continues; the pull side
+    extracts only after the whole archive arrived and tar exited 0). It fails if either tar fails.
   - Progress and the result (`pushed 1.2 MiB → /home/azula/out/app.tgz sha256 3f9a…`) go to
     stderr; `--json` prints `{"path","size","sha256","resumed_from"}` to stdout.
 - `azula compute doctor [--vm NAME] [--json]` — stages, each with its own deadline: `token`
@@ -168,6 +169,11 @@ Client verbs (any OS). Token from `--token`, else `AZULA_COMPUTE_TOKEN`. VM: `--
   `compute serve` running and the Mac awake?, is the grant revoked/expired?, does the token's
   host id match `azula compute grants` on the Mac?).
 - `azula vm start|stop|status [NAME] [--force] [--json]` via the broker.
+
+**Testing.** `AZULA_COMPUTE_FAULT=drop-after:<N>` (deliberately not in `--help`) makes a client
+abruptly drop its connection once per process, after it has written N bytes of job output (or
+transferred N payload bytes for push/pull), then follow its normal reconnect path. It proves
+reconnect against a real host.
 
 Client verbs log at `warn` unless `RUST_LOG` is set, so an agent capturing stderr sees only
 azula's own messages and the job's stderr.
