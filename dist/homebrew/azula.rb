@@ -38,6 +38,10 @@ class Azula < Formula
 
   def install
     bin.install "azula"
+    # Remote-compute companions, present only in the Apple silicon archive.
+    # `azula compute serve` looks for them next to its own executable.
+    bin.install "azula-vm" if File.exist?("azula-vm")
+    bin.install "azula-guest.linux-aarch64" if File.exist?("azula-guest.linux-aarch64")
   end
 
   test do

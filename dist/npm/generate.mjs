@@ -90,6 +90,18 @@ async function buildPlatformPackage({ rustTarget, npmSuffix, os, cpu }, version,
   await copyFile(srcBinary, destBinary);
   await chmod(destBinary, 0o755);
 
+  // Remote-compute companions (only the Apple silicon archive has them):
+  // `azula compute serve` looks for them next to its own executable, which
+  // for an npm install is this package's bin/ directory.
+  for (const extra of ["azula-vm", "azula-guest.linux-aarch64"]) {
+    const src = path.join(binDir, rustTarget, extra);
+    if (existsSync(src)) {
+      const dest = path.join(binOutDir, extra);
+      await copyFile(src, dest);
+      await chmod(dest, 0o755);
+    }
+  }
+
   const packageJson = {
     name: pkgName,
     version,

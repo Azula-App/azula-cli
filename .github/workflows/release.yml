@@ -143,6 +143,24 @@ jobs:
         if: matrix.cross
         run: cross build --release --locked --target ${{ matrix.target }} -p azula
 
+      # Remote-compute hosting (`azula compute serve`) is Apple silicon only,
+      # so only this leg ships the two companions the broker looks for next
+      # to its own executable: the Virtualization.framework helper (Swift,
+      # ad-hoc signed with com.apple.security.virtualization by build.sh) and
+      # the static Linux guest worker it serves to VMs over virtiofs. See
+      # vm/README.md.
+      - name: Build remote-compute companions (Apple silicon only)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-unknown-linux-musl
+          mkdir -p stage
+          vm/helper/build.sh "$PWD/stage"
+          vm/guest/build.sh "$PWD/companions"
+          cp companions/azula-guest stage/azula-guest.linux-aarch64
+          codesign --verify --verbose stage/azula-vm
+          codesign -d --entitlements - stage/azula-vm | grep -q com.apple.security.virtualization
+
       - name: Package
         id: package
         shell: bash
@@ -155,7 +173,14 @@ jobs:
           mkdir -p stage
           cp "target/${TARGET}/release/azula" stage/azula
           chmod +x stage/azula
-          tar -C stage -czf "$ARCHIVE" azula
+          FILES=(azula)
+          for extra in azula-vm azula-guest.linux-aarch64; do
+            if [ -f "stage/${extra}" ]; then
+              chmod +x "stage/${extra}"
+              FILES+=("${extra}")
+            fi
+          done
+          tar -C stage -czf "$ARCHIVE" "${FILES[@]}"
 
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
