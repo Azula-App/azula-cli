@@ -13,6 +13,7 @@
 //! `relay` (`relay_cmd`, D6) is likewise additive to the `Command` enum
 //! below.
 
+mod compute_cmd;
 mod file;
 mod legacy;
 mod mcp_cmd;
@@ -21,6 +22,7 @@ mod terminal_cmd;
 mod message;
 mod status_cmd;
 mod ui;
+mod vm_cmd;
 mod watch_cmd;
 mod relay_cmd;
 
@@ -122,6 +124,13 @@ enum Command {
     /// directly, plus the identity log sync/bootstrap role `azula mailbox`
     /// (kept as an alias) has always served.
     Relay(relay_cmd::RelayArgs),
+
+    /// Run commands in a VM on a remote Mac over iroh: `exec` and `doctor`
+    /// anywhere; `serve`, `grant`, `grants`, `revoke` on an Apple silicon Mac.
+    Compute(compute_cmd::ComputeArgs),
+    /// Create, list, delete (Apple silicon Mac) and start/stop/status (via the
+    /// broker, anywhere) the VMs behind `azula compute`.
+    Vm(vm_cmd::VmArgs),
 
     /// Pair a new device: save its ticket to the registry.
     Pair(legacy::PairArgs),
@@ -285,6 +294,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             status_cmd::run(args)
         }
         Some(Command::Relay(args)) => relay_cmd::cmd_relay(args).await,
+        Some(Command::Compute(args)) => {
+            reject_session_label(&label, "compute")?;
+            compute_cmd::run(args).await
+        }
+        Some(Command::Vm(args)) => {
+            reject_session_label(&label, "vm")?;
+            vm_cmd::run(args).await
+        }
 
         Some(Command::Pair(args)) => {
             reject_session_label(&label, "pair")?;
