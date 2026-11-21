@@ -100,11 +100,25 @@ relay hosts iroh dials by default:
 
 Reached over HTTPS (443). Source:
 [`iroh/src/defaults.rs`](https://github.com/n0-computer/iroh/blob/main/iroh/src/defaults.rs)'s
-`prod` module — verified against `iroh 1.0.0`, the version pinned in
-`Cargo.lock` as of this writing. n0 can add or retire relay nodes between
+`prod` module — verified against `iroh 1.5.0`, the version pinned in
+`Cargo.lock` as of this writing (hosts unchanged since 1.0.0). n0 can add or retire relay nodes between
 iroh releases, so re-check that file (or `cargo tree -p iroh` for the
 locked version, then the matching tag on GitHub) if the pinned iroh version
 changes and pairing from a proxied environment stops working.
+
+Also allow `dns.iroh.link` (address lookup). iroh additionally probes the relay
+hosts with plain `GET http://<relay>/generate_204` (port 80) for latency; those
+may be refused without breaking relay connections.
+
+Environment knobs (apply to every endpoint azula binds):
+
+- `HTTPS_PROXY` / `HTTP_PROXY` (and lowercase) — relay traffic goes through this
+  HTTP CONNECT proxy; `NO_PROXY` is honored (proxy skipped only if every relay
+  host is excluded).
+- `AZULA_RELAY_ONLY=1` — disable all direct IP/UDP transports; relay path only.
+- `AZULA_TLS_ROOTS=system|embedded` — relay TLS trust. Defaults to the OS trust
+  store when a proxy is set or relay-only is on (needed behind TLS-terminating
+  proxies), otherwise iroh's built-in Mozilla roots.
 
 If the container's proxy blocks those hosts, azula cannot reach the phone at
 all in that environment — there is no user-controlled-relay fallback in this

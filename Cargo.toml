@@ -48,8 +48,10 @@ name = "azula"
 path = "src/main.rs"
 
 [dependencies]
-iroh = "1"
+iroh = { version = "1.5", features = ["platform-verifier"] }
 iroh-tickets = "1"
+# Parsing proxy URLs for `endpoint::bind_with_options` (already a transitive dep of iroh).
+url = "2"
 data-encoding = "2"
 sha2 = "0.11"
 
