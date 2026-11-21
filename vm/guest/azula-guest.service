@@ -1,0 +1,11 @@
+[Unit]
+Description=azula guest worker (remote compute)
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/azula-guest --vsock-port 1024 --run-as azula
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
