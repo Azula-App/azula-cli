@@ -54,6 +54,8 @@ iroh-tickets = "1"
 url = "2"
 data-encoding = "2"
 sha2 = "0.11"
+# CSPRNG for grant secrets (already in the tree via iroh; the OS random source).
+getrandom = "0.4"
 
 anyhow = "1"
 indexmap = { version = "2", features = ["serde"] }

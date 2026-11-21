@@ -243,6 +243,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "gethostname",
+ "getrandom 0.4.3",
  "indexmap",
  "iroh",
  "iroh-tickets",

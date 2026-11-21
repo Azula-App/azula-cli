@@ -18,6 +18,7 @@ pub mod bip39_wordlist;
 pub mod bridge;
 pub mod catalog;
 pub mod certs;
+pub mod compute;
 pub mod cli;
 pub mod core;
 pub mod endpoint;
