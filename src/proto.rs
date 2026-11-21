@@ -9,12 +9,48 @@
 //! Framing helpers ([`read_frame`] / [`write_frame`]) operate over any async
 //! reader/writer. iroh's `RecvStream`/`SendStream` implement the tokio
 //! `AsyncRead`/`AsyncWrite` traits, so they can be used directly.
+//!
+//! A frame line is capped at [`MAX_FRAME_LINE_BYTES`]; [`read_frame`] fails a
+//! longer one with [`FrameTooLong`] instead of buffering it (see
+//! `azula-docs/openspec/specs/wire-protocols/design.md`, "Frame size cap").
 
 use std::collections::BTreeMap;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+/// The longest frame line [`read_frame`] accepts, in bytes, not counting the
+/// terminating `\n`. It's the same 16 MiB per-message cap irpc uses, and
+/// comfortably above the largest legitimate frame: the frames with their own
+/// bounds top out well under 1 MiB (a 64 KiB `term` replay chunk is at most
+/// 384 KiB once JSON-escaped), and the batched ones split by
+/// [`BATCH_BYTES_PER_FRAME`]. Kotlin's `LineBuffer` enforces the same number
+/// (`MAX_FRAME_LINE_BYTES` in azula-app's `network-api`).
+pub const MAX_FRAME_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Byte budget for senders that pack a variable number of items into one
+/// frame (`sync_entries`, `sync_a2ui`): a batch is closed once its items reach
+/// this many bytes, so it stays far below [`MAX_FRAME_LINE_BYTES`] whatever
+/// the items' sizes. Only a single item bigger than the whole budget gets a
+/// frame to itself above it. See [`size_batches`].
+pub const BATCH_BYTES_PER_FRAME: usize = MAX_FRAME_LINE_BYTES / 4;
+
+/// [`read_frame`]'s error for a line longer than [`MAX_FRAME_LINE_BYTES`]. A
+/// protocol error: callers end the stream on it, exactly as on any other
+/// `read_frame` error, and never skip past it to the next line.
+#[derive(Debug)]
+pub struct FrameTooLong {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for FrameTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "frame line exceeds the {} byte cap", self.limit)
+    }
+}
+
+impl std::error::Error for FrameTooLong {}
 
 // ---------------------------------------------------------------------------
 // Identity bundle (device-linking spec: the payload `LinkGrant` delivers)
@@ -371,25 +407,79 @@ where
 /// Read a single newline-delimited [`Frame`] from a buffered reader.
 ///
 /// Returns `Ok(None)` on a clean end-of-stream (no more bytes). Blank lines are
-/// skipped. A malformed JSON line yields an `Err`.
+/// skipped. A malformed JSON line yields an `Err`, and so does a line longer
+/// than [`MAX_FRAME_LINE_BYTES`] ([`FrameTooLong`]) — detected after reading at
+/// most one byte past the cap, so a peer can't make this buffer an unbounded
+/// line.
 pub async fn read_frame<R>(reader: &mut tokio::io::BufReader<R>) -> Result<Option<Frame>>
 where
     R: AsyncRead + Unpin,
 {
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let mut line = Vec::new();
+        // One byte past the cap is enough to tell a line of exactly
+        // MAX_FRAME_LINE_BYTES plus its `\n` from one that runs longer.
+        let n = (&mut *reader).take(MAX_FRAME_LINE_BYTES as u64 + 1).read_until(b'\n', &mut line).await?;
         if n == 0 {
             // Clean EOF.
             return Ok(None);
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
+        if line.last() != Some(&b'\n') && n > MAX_FRAME_LINE_BYTES {
+            return Err(FrameTooLong { limit: MAX_FRAME_LINE_BYTES }.into());
+        }
+        let end = line.iter().rposition(|&b| b != b'\r' && b != b'\n').map_or(0, |i| i + 1);
+        if end == 0 {
             // Skip blank keepalive lines.
             continue;
         }
-        let frame: Frame = serde_json::from_str(trimmed)?;
+        let frame: Frame = serde_json::from_slice(&line[..end])?;
         return Ok(Some(frame));
+    }
+}
+
+/// Split `items` into consecutive batches of at most `max_items` items whose
+/// `size`s sum to at most `max_bytes`. An item bigger than `max_bytes` on its
+/// own still goes out, alone in its batch — the receiver is the one to judge
+/// it against [`MAX_FRAME_LINE_BYTES`]. Lazy, so a caller mapping entries to
+/// their wire form only holds one batch's worth at a time.
+pub fn size_batches<I, F>(items: I, max_items: usize, max_bytes: usize, size: F) -> SizeBatches<I::IntoIter, F>
+where
+    I: IntoIterator,
+    F: Fn(&I::Item) -> usize,
+{
+    SizeBatches { items: items.into_iter().peekable(), max_items, max_bytes, size }
+}
+
+/// Iterator returned by [`size_batches`].
+pub struct SizeBatches<I: Iterator, F> {
+    items: std::iter::Peekable<I>,
+    max_items: usize,
+    max_bytes: usize,
+    size: F,
+}
+
+impl<I, F> Iterator for SizeBatches<I, F>
+where
+    I: Iterator,
+    F: Fn(&I::Item) -> usize,
+{
+    type Item = Vec<I::Item>;
+
+    fn next(&mut self) -> Option<Vec<I::Item>> {
+        let first = self.items.next()?;
+        let mut bytes = (self.size)(&first);
+        let mut batch = vec![first];
+        while batch.len() < self.max_items {
+            let mut item_bytes = 0;
+            let fits = |item: &I::Item| {
+                item_bytes = (self.size)(item);
+                bytes + item_bytes <= self.max_bytes
+            };
+            let Some(next) = self.items.next_if(fits) else { break };
+            bytes += item_bytes;
+            batch.push(next);
+        }
+        Some(batch)
     }
 }
 
@@ -913,5 +1003,111 @@ mod tests {
         assert!(json.contains("roll"), "missing action name: {json}");
         let back: Frame = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Frame::A2uiAction { .. }));
+    }
+}
+
+#[cfg(test)]
+mod size_cap_tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    const CHAT_PREFIX: &[u8] = br#"{"type":"chat","text":""#;
+    const CHAT_SUFFIX: &[u8] = br#""}"#;
+
+    /// A `chat` frame line (no `\n`) exactly `len` bytes long.
+    fn chat_line_of_len(len: usize) -> Vec<u8> {
+        let mut line = Vec::with_capacity(len + 1);
+        line.extend_from_slice(CHAT_PREFIX);
+        line.resize(len - CHAT_SUFFIX.len(), b'x');
+        line.extend_from_slice(CHAT_SUFFIX);
+        assert_eq!(line.len(), len);
+        line
+    }
+
+    #[tokio::test]
+    async fn read_frame_accepts_a_line_exactly_at_the_cap() {
+        let mut bytes = chat_line_of_len(MAX_FRAME_LINE_BYTES);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"type\":\"thinking\",\"on\":true}\n");
+        let mut r = BufReader::new(&bytes[..]);
+
+        match read_frame(&mut r).await.unwrap() {
+            Some(Frame::Chat { text, .. }) => {
+                assert_eq!(text.len(), MAX_FRAME_LINE_BYTES - CHAT_PREFIX.len() - CHAT_SUFFIX.len());
+            }
+            other => panic!("expected the at-cap chat frame, got {other:?}"),
+        }
+        // The stream carries on normally after a line right at the cap.
+        assert!(matches!(read_frame(&mut r).await.unwrap(), Some(Frame::Thinking { on: true })));
+        assert!(read_frame(&mut r).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_a_line_one_byte_over_the_cap() {
+        let mut bytes = chat_line_of_len(MAX_FRAME_LINE_BYTES + 1);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"type\":\"thinking\",\"on\":true}\n");
+        let mut r = BufReader::new(&bytes[..]);
+
+        // An error, not a skipped line: the well-formed frame behind it is
+        // never handed out in its place.
+        let err = read_frame(&mut r).await.expect_err("an over-cap line must fail the read");
+        assert!(err.downcast_ref::<FrameTooLong>().is_some(), "wrong error: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn read_frame_gives_up_on_an_endless_line_just_past_the_cap() {
+        // A peer that never sends `\n`. Bounded at 4x the cap so a regression
+        // ends in a wrong-error assertion instead of exhausting memory.
+        const BUF_CAPACITY: usize = 8 * 1024;
+        let total = 4 * MAX_FRAME_LINE_BYTES as u64;
+        let mut r = BufReader::with_capacity(BUF_CAPACITY, tokio::io::repeat(b'x').take(total));
+
+        let err = read_frame(&mut r).await.expect_err("an endless line must fail the read");
+        assert!(err.downcast_ref::<FrameTooLong>().is_some(), "wrong error: {err:#}");
+        let consumed = (total - r.get_ref().limit()) as usize;
+        assert!(
+            consumed <= MAX_FRAME_LINE_BYTES + 1 + BUF_CAPACITY,
+            "read {consumed} bytes of an endless line; the cap is {MAX_FRAME_LINE_BYTES}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_frame_accepts_an_unterminated_final_line_under_the_cap() {
+        let bytes = br#"{"type":"thinking","on":false}"#;
+        let mut r = BufReader::new(&bytes[..]);
+        assert!(matches!(read_frame(&mut r).await.unwrap(), Some(Frame::Thinking { on: false })));
+        assert!(read_frame(&mut r).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_frame_still_skips_blank_and_crlf_lines() {
+        let bytes = b"\n\r\n{\"type\":\"thinking\",\"on\":true}\r\n";
+        let mut r = BufReader::new(&bytes[..]);
+        assert!(matches!(read_frame(&mut r).await.unwrap(), Some(Frame::Thinking { on: true })));
+        assert!(read_frame(&mut r).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn size_batches_caps_item_count() {
+        let batches: Vec<Vec<usize>> = size_batches(vec![1, 1, 1, 1, 1], 2, usize::MAX, |n| *n).collect();
+        assert_eq!(batches, vec![vec![1, 1], vec![1, 1], vec![1]]);
+    }
+
+    #[test]
+    fn size_batches_caps_bytes_inclusively() {
+        let batches: Vec<Vec<usize>> = size_batches(vec![2, 3, 1, 4, 4], 64, 5, |n| *n).collect();
+        assert_eq!(batches, vec![vec![2, 3], vec![1, 4], vec![4]]);
+    }
+
+    #[test]
+    fn size_batches_sends_an_oversize_item_alone() {
+        let batches: Vec<Vec<usize>> = size_batches(vec![2, 10, 2, 2], 64, 5, |n| *n).collect();
+        assert_eq!(batches, vec![vec![2], vec![10], vec![2, 2]]);
+    }
+
+    #[test]
+    fn size_batches_of_nothing_is_empty() {
+        assert_eq!(size_batches(Vec::<usize>::new(), 64, 5, |n| *n).count(), 0);
     }
 }

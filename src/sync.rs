@@ -45,7 +45,7 @@ use tracing::{info, warn};
 
 use crate::certs::{DeviceCert, Revocation};
 use crate::eventlog::{DeviceLogChain, Kind, LogEntry};
-use crate::proto::{read_frame, write_frame, Frame};
+use crate::proto::{read_frame, size_batches, write_frame, Frame, BATCH_BYTES_PER_FRAME};
 
 /// ALPN identifier for the account-sync protocol.
 pub const SYNC_ALPN: &[u8] = b"azula/sync/0";
@@ -617,9 +617,11 @@ where
     }
 }
 
-/// Send every entry after `from_seq` for `device_hex`, batched to
-/// [`MAX_ENTRIES_PER_FRAME`] entries per `SyncEntries` frame, in ascending
-/// `seq` order.
+/// Send every entry after `from_seq` for `device_hex`, in ascending `seq`
+/// order, batched to at most [`MAX_ENTRIES_PER_FRAME`] entries and
+/// [`BATCH_BYTES_PER_FRAME`] bytes of base64 per `SyncEntries` frame — the
+/// byte budget keeps a run of large entries from adding up to a frame line
+/// the receiver would refuse (`proto::MAX_FRAME_LINE_BYTES`).
 async fn send_gap<W>(writer: &mut W, store: &LogStore, device_hex: &str, from_seq: u64) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -627,8 +629,8 @@ where
     let device_pk = PublicKey::from_str(device_hex)
         .with_context(|| format!("sync: unparseable device key {device_hex} in our own vector"))?;
     let entries = store.read_from(&device_pk, from_seq).await?;
-    for chunk in entries.chunks(MAX_ENTRIES_PER_FRAME) {
-        let batch: Vec<String> = chunk.iter().map(LogEntry::to_base64).collect();
+    let encoded = entries.iter().map(LogEntry::to_base64);
+    for batch in size_batches(encoded, MAX_ENTRIES_PER_FRAME, BATCH_BYTES_PER_FRAME, String::len) {
         write_frame(writer, &Frame::SyncEntries { entries: batch }).await?;
     }
     Ok(())
@@ -1119,6 +1121,49 @@ mod tests {
         for (i, e) in all_entries.iter().enumerate() {
             assert_eq!(e.seq, (i + 1) as u64, "entries must arrive in ascending per-device seq order");
         }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn send_loop_splits_large_entries_by_the_frame_byte_budget() {
+        // Ten 900 KiB entries: far under the 64-entry cap, but ~12 MiB of
+        // base64 in all, which unsplit would be one frame near the receiver's
+        // line cap. Each entry is ~1.2 MB of base64, so three fit the 4 MiB
+        // budget and a fourth clearly doesn't.
+        let device = device_a_secret();
+        let store = LogStore::open(test_dir("byte_batching"), root_secret().public()).unwrap();
+        let text = "x".repeat(900 * 1024);
+        let mut prev_hash = [0u8; 32];
+        for seq in 1..=10 {
+            let mut e = make_entry(&device, seq, prev_hash);
+            e.body = serde_json::json!({ "conversation": "c", "text": text }).to_string();
+            e.sign(&device);
+            prev_hash = e.hash();
+            store.append(e).await.expect("append succeeds");
+        }
+
+        let my_vector = store.vector().await;
+        let (writer, reader) = tokio::io::duplex(1 << 20);
+        let handle = tokio::spawn(send_loop(writer, store.clone(), my_vector, BTreeMap::new(), device.public(), None));
+
+        let mut r = BufReader::new(reader);
+        let mut seqs = Vec::new();
+        let mut frame_count = 0;
+        loop {
+            match read_frame(&mut r).await.unwrap() {
+                Some(Frame::SyncEntries { entries }) => {
+                    let bytes: usize = entries.iter().map(String::len).sum();
+                    assert!(bytes <= BATCH_BYTES_PER_FRAME, "frame carried {bytes} bytes of entries");
+                    frame_count += 1;
+                    seqs.extend(entries.iter().map(|b| LogEntry::from_base64(b).unwrap().seq));
+                }
+                Some(Frame::SyncAck { .. }) => break,
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(frame_count, 4, "10 entries of ~1.2 MB base64 go 3 to a 4 MiB frame");
+        assert_eq!(seqs, (1..=10).collect::<Vec<u64>>(), "entries must still arrive in ascending seq order");
 
         handle.abort();
     }
