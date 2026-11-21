@@ -34,6 +34,8 @@ struct Config: Decodable {
     let efi_vars: String
     let disks: [DiskConfig]
     let shares: [ShareConfig]?
+    /// "nat" (default when absent) or "none" (no network device).
+    let network: String?
     let console_log: String
     let vsock: VsockConfig
 }
@@ -274,13 +276,20 @@ func buildVM(_ cfg: Config) throws -> VZVirtualMachine {
     }
     c.storageDevices = storage
 
-    guard let mac = VZMACAddress(string: cfg.mac) else {
-        throw NSError(domain: "azula-vm", code: 1, userInfo: [NSLocalizedDescriptionKey: "invalid mac"])
+    switch cfg.network ?? "nat" {
+    case "nat":
+        guard let mac = VZMACAddress(string: cfg.mac) else {
+            throw NSError(domain: "azula-vm", code: 1, userInfo: [NSLocalizedDescriptionKey: "invalid mac"])
+        }
+        let net = VZVirtioNetworkDeviceConfiguration()
+        net.attachment = VZNATNetworkDeviceAttachment()
+        net.macAddress = mac
+        c.networkDevices = [net]
+    case "none":
+        c.networkDevices = []
+    case let other:
+        throw NSError(domain: "azula-vm", code: 1, userInfo: [NSLocalizedDescriptionKey: "invalid network \"\(other)\" (expected \"nat\" or \"none\")"])
     }
-    let net = VZVirtioNetworkDeviceConfiguration()
-    net.attachment = VZNATNetworkDeviceAttachment()
-    net.macAddress = mac
-    c.networkDevices = [net]
 
     c.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
     c.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
