@@ -301,6 +301,35 @@ paired a machine with a phone that has one enrolled), the local per-device
 mailbox last. Interactive terminal traffic and file transfers are never
 relayed — those always need a direct connection.
 
+## `azula compute` — Linux VMs on your Mac for cloud agents
+
+Claude Code and Codex cloud sandboxes can run commands and move files inside a
+Linux VM on an Apple silicon Mac. The Mac runs the broker; the sandbox runs
+this same binary as a client, over iroh (relay-only works, see the allowlist
+above).
+
+```sh
+# on the Mac (Apple silicon, macOS 13+)
+azula vm create build                      # Debian 13 arm64, checksum-verified, APFS clone
+azula compute serve                        # foreground broker; Ctrl-C stops its VMs
+azula compute grant --vm build --label claude-code   # prints AZULA_COMPUTE_TOKEN once
+
+# in the sandbox, with AZULA_COMPUTE_TOKEN set
+azula compute doctor --vm build
+azula compute exec -- uname -a             # argv runs directly; exit code passes through
+azula compute push -r ./src work/src && azula compute exec --cwd work/src -- make
+azula compute pull work/src/out/app ./app  # SHA-256 verified, atomic, resumable
+azula compute exec --detach -- ./long.sh   # then: jobs, logs --follow, attach, cancel
+```
+
+Jobs outlive the connection (the client reattaches at the exact byte after a
+drop), a grant owns the jobs it starts, and nothing a client sends runs on the
+Mac itself. The VM helper (`azula-vm`, Swift, Virtualization.framework) and the
+guest worker (`azula-guest`, static Linux) ship next to `azula` in the Apple
+silicon release. Wire contract: [`vm/README.md`](vm/README.md) and
+[`vm/BROKER.md`](vm/BROKER.md); user guide: <https://azula.app/docs/compute>;
+end-to-end check from a sandbox: [`vm/e2e/cloud.sh`](vm/e2e/cloud.sh).
+
 ## Pairing & the device registry
 
 ```sh
@@ -409,6 +438,7 @@ cargo run -p azula-demos -- blackjack
 | `b"azula/chat/0"`  | identity peer chat, store-and-forward | `azula relay` only |
 | `b"azula/sync/0"`  | identity log sync/bootstrap | `azula relay` (accept-side only in this crate; the phone app dials it) |
 | `b"azula/link/0"`  | device-linking enrollment (rootless on a relay) | `azula link`, `azula relay` |
+| `b"azula/compute/1"` | remote compute: jobs, files and VM control | `azula compute serve` (dialed by `azula compute …` / `azula vm start\|stop\|status`) |
 
 ## Wire protocol
 

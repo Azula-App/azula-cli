@@ -59,8 +59,10 @@ step "resumable push + pull with forced drops (S7, H4)"
 head -c 9000000 /dev/urandom >"$work/blob"
 AZULA_COMPUTE_FAULT=drop-after:3000000 c push "$work/blob" e2e/blob.bin 2>"$work/err" || { cat "$work/err"; fail "push"; }
 cat "$work/err"
+grep -q 'resum' "$work/err" || fail "push: the fault never fired (no resume notice)"
 AZULA_COMPUTE_FAULT=drop-after:3000000 c pull e2e/blob.bin "$work/blob.back" 2>"$work/err" || { cat "$work/err"; fail "pull"; }
 cat "$work/err"
+grep -q 'resum' "$work/err" || fail "pull: the fault never fired (no resume notice)"
 [ "$(sha "$work/blob")" = "$(sha "$work/blob.back")" ] || fail "round trip differs"
 remote=$(c exec -q -- sha256sum e2e/blob.bin | cut -d' ' -f1)
 [ "$remote" = "$(sha "$work/blob")" ] || fail "guest copy differs"
@@ -78,7 +80,8 @@ echo '#define MSG "hello"' >"$work/src/lib/msg.h"
 c push -r "$work/src" e2e/src || fail "push -r"
 c exec -q --timeout 15m -- sh -c 'command -v cc >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential >/dev/null; }; cd e2e/src && cc -O2 -o hello hello.c && ./hello' || fail "build in VM"
 c pull e2e/src/hello "$work/out/hello" || fail "pull binary"
-file "$work/out/hello" | tee /dev/stderr | grep -q 'ARM aarch64' || fail "artifact isn't an aarch64 ELF"
+file "$work/out/hello" >&2
+file "$work/out/hello" | grep -q 'ARM aarch64' || fail "artifact isn't an aarch64 ELF"
 c pull -r e2e/src "$work/tree" || fail "pull -r"
 [ -f "$work/tree/lib/msg.h" ] && [ -f "$work/tree/hello" ] || fail "pulled tree incomplete"
 pass "tree in, aarch64 binary and tree out"
