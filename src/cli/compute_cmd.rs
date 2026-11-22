@@ -26,30 +26,45 @@ pub(super) struct ComputeArgs {
 
 #[derive(Debug, Subcommand)]
 enum ComputeAction {
-    /// Host (Apple silicon macOS): run the compute broker in the foreground.
-    /// It accepts authenticated requests from remote `azula compute` clients
-    /// and runs their commands inside the VMs you created with `azula vm
-    /// create`. While a VM runs it keeps the Mac from idle-sleeping. Ctrl-C
-    /// stops the broker and every VM it started (running jobs end as
-    /// `interrupted`).
+    /// Host (Apple silicon macOS, or Linux with --local): run the compute
+    /// broker in the foreground. It accepts authenticated requests from remote
+    /// `azula compute` clients and runs their commands inside the VMs you
+    /// created with `azula vm create`. While a VM runs it keeps the Mac from
+    /// idle-sleeping. Ctrl-C stops the broker and every VM it started (running
+    /// jobs end as `interrupted`). On Linux there is no VM: with --local the
+    /// jobs run on this machine itself (as --run-as), which is only
+    /// appropriate when this machine is already an isolated VM, e.g. Android's
+    /// Linux Terminal.
     Serve {
         /// Don't hold an idle-sleep assertion while VMs run.
         #[arg(long)]
         allow_sleep: bool,
+        /// Linux only: run jobs on this machine itself (required there).
+        #[cfg(target_os = "linux")]
+        #[arg(long)]
+        local: bool,
+        /// Linux only: the name of the one local "VM" (what `--vm` selects).
+        #[cfg(target_os = "linux")]
+        #[arg(long, value_name = "NAME", default_value = "default")]
+        vm_name: String,
+        /// Linux only: the user the worker runs jobs as. It must exist.
+        #[cfg(target_os = "linux")]
+        #[arg(long, value_name = "USER", default_value = "azula")]
+        run_as: String,
     },
-    /// Host (Apple silicon macOS): mint an access token for a remote client.
+    /// Host (Apple silicon macOS or Linux): mint an access token for a remote client.
     /// Prints the token once (the host keeps only a hash) and an `export
     /// AZULA_COMPUTE_TOKEN=…` line to paste into the client's environment.
     /// Mint one grant per cloud session or agent: a grant owns the jobs it
     /// starts.
     Grant(GrantArgs),
-    /// Host (Apple silicon macOS): list the grants this host has minted.
+    /// Host (Apple silicon macOS or Linux): list the grants this host has minted.
     Grants {
         /// Machine-readable output: a JSON array of grants (no secrets).
         #[arg(long)]
         json: bool,
     },
-    /// Host (Apple silicon macOS): revoke a grant. A running `serve` closes
+    /// Host (Apple silicon macOS or Linux): revoke a grant. A running `serve` closes
     /// the grant's live connections within a few seconds; its jobs keep
     /// running unless `--cancel-jobs` is given.
     Revoke {
@@ -333,6 +348,9 @@ fn parse_mode(s: &str) -> Result<u32, String> {
 
 pub(super) async fn run(args: ComputeArgs) -> Result<()> {
     match args.action {
+        #[cfg(target_os = "linux")]
+        ComputeAction::Serve { allow_sleep: _, local, vm_name, run_as } => host::serve_local(local, &vm_name, &run_as).await,
+        #[cfg(not(target_os = "linux"))]
         ComputeAction::Serve { allow_sleep } => host::serve(allow_sleep).await,
         ComputeAction::Grant(a) => host::grant(a).await,
         ComputeAction::Grants { json } => host::grants(json),
@@ -770,13 +788,22 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
 
 // --- host verbs ------------------------------------------------------------
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod host {
     use super::*;
     use crate::compute::grants::{parse_duration, MintOptions, OP_ADMIN, OP_EXEC, OP_VM};
 
+    #[cfg(target_os = "macos")]
     pub(super) async fn serve(allow_sleep: bool) -> Result<()> {
         crate::compute::host::serve(allow_sleep).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) async fn serve_local(local: bool, vm_name: &str, run_as: &str) -> Result<()> {
+        if let Err(e) = crate::compute::local::validate_serve_flags(local, vm_name, run_as) {
+            die(2, &e);
+        }
+        crate::compute::host::serve_local(vm_name, run_as).await
     }
 
     pub(super) async fn grant(a: GrantArgs) -> Result<()> {
@@ -851,7 +878,7 @@ mod host {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod host {
     use super::*;
 

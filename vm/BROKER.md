@@ -262,3 +262,24 @@ in `/etc` overrides the generator's units in `/run`. The worker is enabled befor
 
 The worker runs straight from the read-only share, so every boot runs the host's current
 `azula-guest`. No copy into the guest is needed.
+
+## 9. Local backend (Linux)
+
+- On Linux `compute serve` requires `--local`: the machine itself is the sandbox, so the broker runs
+  jobs on it directly. Use it only where the machine is already an isolated VM (e.g. Android's Linux
+  Terminal). Flags: `--local`, `--vm-name NAME` (default `default`), `--run-as USER` (default
+  `azula`). `compute grant|grants|revoke` work on Linux too; `vm create|delete|list` stay macOS-only.
+- `LocalBackend` (`src/compute/local.rs`) serves exactly one VM, named by `--vm-name`. "Start"
+  spawns `azula-guest --unix <dir>/run/worker.sock --run-as USER --state-dir <dir>/state` with
+  `<dir>` = `~/.azula/vm/local/<name>`. `run/` is created 0700, owned by the broker user, and is
+  the access control for the socket.
+- The worker must run as root to switch users. A non-root broker starts it with `sudo -n sh -c
+  'umask 0; exec "$0" "$@"' <guest> …` (umask 0 so the root-created socket is connectable; `sudo
+  -n` failing is a `vm_start_failed`); a root broker execs it directly.
+- Start is idempotent and polls `ping` every 500 ms for up to 30 s; on failure the worker's stderr
+  tail is in the error. Stop sends SIGTERM, waits 10 s, then SIGKILL (the broker's `vm_busy` check
+  applies first). `vm status` reports image `local`, network `host`, CPUs and RAM of this machine.
+- Guest binary: `$AZULA_GUEST_BIN`, else `azula-guest` or `azula-guest.linux-aarch64` next to the
+  executable, else `azula-guest` on `PATH`. The run-as user is never created automatically; start
+  fails telling the operator to run `sudo useradd -m -s /bin/bash azula`.
+- A grant with `vms:["*"]` maps to `default`, so `--vm-name default` lets `compute exec` omit `--vm`.

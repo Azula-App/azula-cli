@@ -1,5 +1,7 @@
 //! Remote compute: run commands in a disposable Linux VM on an Apple silicon
-//! Mac, from anywhere, over iroh. See `vm/README.md` (frames, guest and helper
+//! Mac (or, with `compute serve --local`, directly on a Linux machine that is
+//! already an isolated VM, such as Android's Linux Terminal), from anywhere,
+//! over iroh. See `vm/README.md` (frames, guest and helper
 //! protocols, bundles) and `vm/BROKER.md` (this module's contract) in the
 //! repository, and the `remote-compute-vm` change in azula-docs.
 //!
@@ -8,7 +10,9 @@
 //! * [`vm`] — the [`vm::VmBackend`] trait the broker drives.
 //! * [`broker`] — `compute serve`: authenticate, authorize, splice.
 //! * [`client`] — the cross-platform `exec`/`doctor`/`vm` client.
-//! * `vmmgr` / `host` — the real VM manager and host verbs (macOS only).
+//! * `vmmgr` — the real VM manager (macOS only).
+//! * `local` — the Linux backend: the worker runs on this machine (`--local`).
+//! * `host` — the host key, grants and `serve` (macOS and Linux).
 
 use std::path::PathBuf;
 
@@ -21,8 +25,10 @@ pub mod out;
 pub mod seed;
 pub mod tarx;
 pub mod transfer;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod host;
+#[cfg(any(target_os = "linux", test))]
+pub mod local;
 #[cfg(target_os = "macos")]
 pub mod vmmgr;
 pub mod vm;
