@@ -92,6 +92,24 @@ fn env_overrides_and_clean_base() {
 }
 
 #[test]
+fn job_env_applies_under_request_env() {
+    let env = start_with(|c| {
+        c.job_env = vec![
+            ("HTTPS_PROXY".into(), "http://127.0.0.1:3128".into()),
+            ("FOO".into(), "from-job-env".into()),
+        ]
+    });
+    let r = run(
+        &env,
+        merge(
+            exec_req("g_a", &["sh", "-c", "echo $HTTPS_PROXY $FOO"]),
+            json!({"env":{"FOO":"from-request"}}),
+        ),
+    );
+    assert_eq!(r.stdout, b"http://127.0.0.1:3128 from-request\n");
+}
+
+#[test]
 fn cwd_is_honored() {
     let env = start();
     let r = run(

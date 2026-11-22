@@ -12,7 +12,20 @@ enum Listen {
 }
 
 const USAGE: &str =
-    "usage: azula-guest [--vsock-port N | --tcp ADDR | --unix PATH] [--run-as USER] [--state-dir DIR] [--version]";
+    "usage: azula-guest [--vsock-port N | --tcp ADDR | --unix PATH] [--run-as USER] [--state-dir DIR] [--job-env-file PATH] [--version]";
+
+/// `KEY=VALUE` lines (blank lines and `#` comments ignored) added to every
+/// job's environment.
+fn read_job_env(path: &str) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| die(&format!("cannot read --job-env-file {path}: {e}")));
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("azula-guest: {msg}");
@@ -54,6 +67,7 @@ fn main() {
             "--unix" => listen = Some(Listen::Unix(val("--unix"))),
             "--run-as" => run_as = val("--run-as"),
             "--state-dir" => cfg.state_dir = val("--state-dir").into(),
+            "--job-env-file" => cfg.job_env = read_job_env(&val("--job-env-file")),
             // Test knobs.
             "--segment-size" => cfg.segment_size = num(&val("--segment-size")),
             "--keep-segments" => cfg.keep_segments = num(&val("--keep-segments")) as usize,

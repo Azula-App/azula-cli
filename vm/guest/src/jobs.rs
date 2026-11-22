@@ -320,7 +320,7 @@ fn killpg(pid: u32, sig: libc::c_int) {
     unsafe { libc::kill(-(pid as libc::pid_t), sig) };
 }
 
-fn build_command(req: &ExecReq, id: &Identity, cwd: &str) -> Command {
+fn build_command(req: &ExecReq, id: &Identity, cwd: &str, job_env: &[(String, String)]) -> Command {
     let mut cmd = Command::new(&req.argv[0]);
     cmd.args(&req.argv[1..]);
     cmd.env_clear();
@@ -330,6 +330,7 @@ fn build_command(req: &ExecReq, id: &Identity, cwd: &str) -> Command {
         .env("LOGNAME", &id.name)
         .env("SHELL", &id.shell)
         .env("LANG", "C.UTF-8");
+    cmd.envs(job_env.iter().map(|(k, v)| (k, v)));
     if let Some(env) = &req.env {
         cmd.envs(env);
     }
@@ -468,7 +469,7 @@ fn start_job(srv: &Arc<Server>, req: &ExecReq) -> Result<Started, (&'static str,
         return Err(("spawn_failed", format!("job record: {e}")));
     }
 
-    let mut child = match build_command(req, &id, &cwd).spawn() {
+    let mut child = match build_command(req, &id, &cwd, &srv.cfg.job_env).spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = fs::remove_dir_all(&dir);
