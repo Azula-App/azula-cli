@@ -1255,6 +1255,7 @@ async fn push_resumes_within_an_invocation_and_across_invocations() {
     let offs = h.fake.put_offsets.lock().unwrap()[before..].to_vec();
     assert_eq!(offs.len(), 2, "two connections: {offs:?}");
     assert!(offs[1] > 0, "the second connection resumed mid-file: {offs:?}");
+    assert_eq!(res.resumed_from, offs[1], "resumed_from reports where the final attempt continued");
     assert_eq!(h.fake.files.lock().unwrap()["again.bin"].0, data);
 
     // A local file that changed between invocations restarts from zero.

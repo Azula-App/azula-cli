@@ -290,11 +290,19 @@ impl Dialer {
 }
 
 /// Bind the client's own (ephemeral-identity) endpoint with a relay deadline.
-pub async fn bind_client(online_timeout: Duration) -> anyhow::Result<Endpoint> {
+/// `relay` homes it on that relay only (the token's, so both directions of a
+/// connection meet on the host's relay); `None` keeps n0's default map.
+pub async fn bind_client(online_timeout: Duration, relay: Option<iroh::RelayUrl>) -> anyhow::Result<Endpoint> {
     let mut opts = EndpointOptions::new(SecretKey::generate());
     opts.online_timeout = Some(online_timeout);
+    opts.relay_url = relay;
     opts.quic_timeouts = Some(QUIC_TIMEOUTS);
     bind_with_options(opts).await
+}
+
+/// The relay named by a token, if it parses.
+pub fn token_relay(token: &Token) -> Option<iroh::RelayUrl> {
+    token.relay.parse().ok().filter(|_| !token.relay.is_empty())
 }
 
 /// Dial `addr` on [`ALPN`] within `dial` (a stage deadline of its own).
@@ -394,6 +402,26 @@ pub async fn list_jobs(session: Session, vm: Option<&str>, all: bool) -> Result<
     let req = Frame::new(json!({"t": "jobs", "vm": vm, "start": false, "all": all}));
     let reply = request_reply(session, &req, GUEST_TIMEOUT).await?;
     Ok((vm, reply.header.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default()))
+}
+
+/// How a `job_list` entry reads in `jobs`: the state word (`running`,
+/// `exited`, or the reason when it differs: `timeout`, `cancelled`,
+/// `interrupted`, …) and the exit code the client would exit with (`-` while
+/// running or when there is none).
+pub fn job_status(j: &Value) -> (String, String) {
+    let state = j["state"].as_str().unwrap_or("?");
+    let reason = j["reason"].as_str().unwrap_or("");
+    if state == "running" {
+        return ("running".into(), "-".into());
+    }
+    let word = if reason.is_empty() || reason == "exited" || reason == state { state.to_owned() } else { reason.to_owned() };
+    let (code, signal) = (j["code"].as_i64(), j["signal"].as_i64());
+    let eff_reason = if reason.is_empty() { state } else { reason };
+    let code_text = match (code, signal, eff_reason) {
+        (None, None, "exited") => "-".to_owned(),
+        _ => Outcome::Exit { code, signal, reason: eff_reason.to_owned() }.exit_code().to_string(),
+    };
+    (word, code_text)
 }
 
 /// `cancel`: ask the worker to cancel a job. Returns the job's state afterwards.
@@ -896,7 +924,7 @@ pub async fn doctor(token_text: Option<&str>, vm: Option<&str>, mut emit: impl F
 
     // bind + relay: one bind with a relay deadline (see `bind_with_options`).
     let t = Instant::now();
-    let ep = match bind_client(RELAY_TIMEOUT).await {
+    let ep = match bind_client(RELAY_TIMEOUT, token_relay(&token)).await {
         Ok(ep) => ep,
         Err(e) => {
             let msg = redact_credentials(&format!("{e:#}"));
@@ -912,7 +940,8 @@ pub async fn doctor(token_text: Option<&str>, vm: Option<&str>, mut emit: impl F
     };
     d.pass("bind", t, "local endpoint bound");
     let home = ep.addr().relay_urls().next().map(|u| u.to_string()).unwrap_or_else(|| "?".into());
-    d.pass("relay", t, format!("online via {home} (host's relay: {})", token.relay));
+    let homed = if token_relay(&token).is_some() { "homed on the token's relay" } else { "default relay map" };
+    d.pass("relay", t, format!("online via {home} ({homed}; host's relay: {})", token.relay));
     flush!();
 
     // dial + auth + broker ping
@@ -1016,10 +1045,33 @@ mod tests {
     }
 
     #[test]
+    fn jobs_show_the_state_once_and_the_exit_code_the_client_would_use() {
+        let j = |v: Value| job_status(&v);
+        assert_eq!(j(json!({"state": "running"})), ("running".into(), "-".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "exited", "code": 0})), ("exited".into(), "0".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "exited", "code": 7})), ("exited".into(), "7".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "exited", "code": null, "signal": 9})), ("exited".into(), "137".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "timeout", "code": null})), ("timeout".into(), "124".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "cancelled", "code": null, "signal": 15})), ("cancelled".into(), "130".into()));
+        assert_eq!(j(json!({"state": "interrupted"})), ("interrupted".into(), "255".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "interrupted"})), ("interrupted".into(), "255".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "stdin_lost"})), ("stdin_lost".into(), "255".into()));
+        assert_eq!(j(json!({"state": "exited", "reason": "orphaned"})), ("orphaned".into(), "255".into()));
+    }
+
+    #[test]
     fn give_up_message_names_the_attach_command() {
         let m = Outcome::GaveUp { job: Some("build/j_3f9a1c2b7d4e8a60".into()) }.message(None).unwrap();
         assert!(m.contains("azula compute attach build/j_3f9a1c2b7d4e8a60"), "{m}");
         assert!(m.contains("still running"), "{m}");
+    }
+
+    #[test]
+    fn clients_home_on_the_tokens_relay() {
+        let mk = |relay: &str| Token { host: "h".into(), relay: relay.into(), grant: "g".into(), secret: String::new() };
+        assert_eq!(token_relay(&mk("https://usw1-1.relay.n0.iroh.link./")).unwrap().to_string(), "https://usw1-1.relay.n0.iroh.link./");
+        assert!(token_relay(&mk("")).is_none(), "no relay in the token: keep the default map");
+        assert!(token_relay(&mk("not a url")).is_none());
     }
 
     #[test]

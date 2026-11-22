@@ -183,6 +183,14 @@ impl Outage {
         Outage { since: None, attempt: 0 }
     }
 
+    /// Say once per outage that we are about to resume (stderr), like exec's
+    /// "connection lost, reattaching" line.
+    fn notice(&self, policy: &Policy, verb: &str, at: u64) {
+        if self.since.is_none() && !policy.window.is_zero() {
+            eprintln!("{}", resume_notice(verb, at));
+        }
+    }
+
     fn reset(&mut self) {
         self.since = None;
         self.attempt = 0;
@@ -207,6 +215,27 @@ impl Outage {
 
 fn policy_backoff(p: &Policy, attempt: u32) -> Duration {
     p.initial.saturating_mul(1u32 << attempt.saturating_sub(1).min(10)).min(p.max)
+}
+
+/// `azula: connection lost, resuming push at 2.9 MiB`.
+pub fn resume_notice(verb: &str, at: u64) -> String {
+    format!("azula: connection lost, resuming {verb} at {}", human_bytes(at))
+}
+
+/// Bytes as `1.5 KiB` / `512 B`.
+pub fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -323,6 +352,11 @@ pub async fn push(
     let mut outage = Outage::new();
     let mut restarts = 0u32;
     let mut first_offset: Option<u64> = None;
+    let pos = std::cell::Cell::new(0u64);
+    let mut tracked = |d: u64, t: u64| {
+        pos.set(d);
+        progress(d, t);
+    };
     let mut appended_dir = false;
 
     loop {
@@ -335,7 +369,7 @@ pub async fn push(
                 r
             }
         };
-        let step = push_once(&mut session, &vm, &remote_path, &rec.id, mode, !opts.no_clobber, local, size, &digest, dialer, progress, &mut first_offset).await;
+        let step = push_once(&mut session, &vm, &remote_path, &rec.id, mode, !opts.no_clobber, local, size, &digest, dialer, &mut tracked, &mut first_offset).await;
         session.conn.close(0u32.into(), b"done");
         match step {
             PushStep::Done(mut t) => {
@@ -371,6 +405,7 @@ pub async fn push(
                 return Err(e);
             }
             PushStep::Dropped(why) => {
+                outage.notice(&opts.policy, "push", pos.get());
                 outage.wait(&opts.policy, &why).await?;
                 loop {
                     match dialer.session().await {
@@ -427,7 +462,7 @@ async fn push_once(
         other => return PushStep::Fail(TransferError::Broker { code: "internal".into(), msg: format!("unexpected `{other}` frame") }),
     }
     let offset = ready.header.get("offset").and_then(Value::as_u64).unwrap_or(0);
-    first_offset.get_or_insert(offset);
+    *first_offset = Some(offset);
     if offset > size {
         return PushStep::NewUpload;
     }
@@ -570,6 +605,11 @@ pub async fn pull(
     let mut outage = Outage::new();
     let mut restarts = 0u32;
     let mut first_offset: Option<u64> = None;
+    let pos = std::cell::Cell::new(0u64);
+    let mut tracked = |d: u64, t: u64| {
+        pos.set(d);
+        progress(d, t);
+    };
 
     loop {
         // Resume only if we know the file's etag and the part file is there.
@@ -586,7 +626,7 @@ pub async fn pull(
             None => (uuid::Uuid::new_v4().to_string(), None, 0),
         };
         let part = part_path(&dest, &id);
-        let step = pull_once(&mut session, &vm, remote, &dest, &part, &id, etag.as_deref(), offset, store, &key, dialer, progress, &mut first_offset).await;
+        let step = pull_once(&mut session, &vm, remote, &dest, &part, &id, etag.as_deref(), offset, store, &key, dialer, &mut tracked, &mut first_offset).await;
         session.conn.close(0u32.into(), b"done");
         match step {
             PullStep::Done(mut t) => {
@@ -611,6 +651,7 @@ pub async fn pull(
                 return Err(e);
             }
             PullStep::Dropped(why) => {
+                outage.notice(&opts.policy, "pull", pos.get());
                 outage.wait(&opts.policy, &why).await?;
                 loop {
                     match dialer.session().await {
@@ -664,7 +705,7 @@ async fn pull_once(
     if offset > size {
         return PullStep::Restart(TransferError::file("changed", "the remote file is shorter than the part already downloaded"));
     }
-    first_offset.get_or_insert(offset);
+    *first_offset = Some(offset);
     // Persist the etag before any data so an interruption can resume.
     store.put(key, Record { size, mtime_ns: 0, id: id.to_owned(), etag: new_etag });
 
@@ -869,6 +910,12 @@ pub async fn pull_tree(dialer: &Dialer, remote: &str, local: &Path, vm: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_notice_names_the_position() {
+        assert_eq!(resume_notice("push", 3_040_870), "azula: connection lost, resuming push at 2.9 MiB");
+        assert_eq!(resume_notice("pull", 0), "azula: connection lost, resuming pull at 0 B");
+    }
 
     #[test]
     fn basenames() {

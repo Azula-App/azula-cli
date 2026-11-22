@@ -36,6 +36,12 @@ pub struct EndpointOptions {
     /// `keep_alive_interval` / `max_idle_timeout`. `None` keeps iroh's
     /// defaults. Compute uses 2 s / 10 s so a vanished peer is noticed fast.
     pub quic_timeouts: Option<(Duration, Duration)>,
+    /// `Some(url)` homes the endpoint on that one relay instead of n0's
+    /// default map: `Builder::relay_mode(RelayMode::Custom(RelayMap::from(url)))`
+    /// (iroh 1.5, `iroh::endpoint::RelayMode`, `iroh::RelayMap: From<RelayUrl>`).
+    /// Compute clients use the token's relay so both directions of a
+    /// connection meet on the host's relay. Address discovery is unchanged.
+    pub relay_url: Option<iroh::RelayUrl>,
 }
 
 impl EndpointOptions {
@@ -46,6 +52,7 @@ impl EndpointOptions {
             relay_only: false,
             online_timeout: None,
             quic_timeouts: None,
+            relay_url: None,
         }
     }
 }
@@ -161,6 +168,9 @@ async fn bind_once(
     if relay_only {
         b = b.clear_ip_transports();
     }
+    if let Some(url) = &opts.relay_url {
+        b = b.relay_mode(iroh::endpoint::RelayMode::Custom(iroh::RelayMap::from(url.clone())));
+    }
     if let Some((keep_alive, idle)) = opts.quic_timeouts {
         let idle = iroh::endpoint::IdleTimeout::try_from(idle)?;
         b = b.transport_config(
@@ -233,7 +243,10 @@ pub async fn bind_with_options(opts: EndpointOptions) -> Result<Endpoint> {
                     }
                 }
                 if tried.is_empty() {
-                    tried = default_relay_urls();
+                    tried = match &opts.relay_url {
+                        Some(u) => vec![u.to_string()],
+                        None => default_relay_urls(),
+                    };
                 }
                 let proxy_note = match &proxy {
                     Some(p) => format!("via proxy {}", redact_credentials(p.as_str())),

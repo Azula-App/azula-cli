@@ -368,7 +368,7 @@ pub(super) fn require_token(arg: &TokenArg) -> Token {
 /// Bind a client endpoint for `token`'s host.
 async fn make_dialer(token: &Token) -> Result<Dialer, Failure> {
     let addr = token.addr().map_err(|e| Failure::Broker { code: "bad_request".into(), msg: e.to_string() })?;
-    let ep = client::bind_client(client::RELAY_TIMEOUT).await.map_err(|e| Failure::Transport(crate::endpoint::redact_credentials(&format!("{e:#}"))))?;
+    let ep = client::bind_client(client::RELAY_TIMEOUT, client::token_relay(token)).await.map_err(|e| Failure::Transport(crate::endpoint::redact_credentials(&format!("{e:#}"))))?;
     Ok(Dialer::new(ep, addr, token.clone()).with_fault(client::Fault::from_env()))
 }
 
@@ -402,20 +402,7 @@ fn emit_json(v: &Value) {
     let _ = out.flush();
 }
 
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut v = n as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
+use crate::compute::transfer::human_bytes;
 
 /// Ctrl-C as a channel: each SIGINT is one message.
 fn interrupts() -> mpsc::Receiver<()> {
@@ -630,6 +617,10 @@ async fn jobs(args: JobsArgs) -> Result<()> {
             .map(|j| {
                 let mut j = j.clone();
                 j["ref"] = json!(JobRef::display(&vm, j["job"].as_str().unwrap_or("")));
+                j["exit_code"] = match client::job_status(&j).1.parse::<i64>() {
+                    Ok(c) => json!(c),
+                    Err(_) => Value::Null,
+                };
                 j
             })
             .collect();
@@ -643,11 +634,7 @@ async fn jobs(args: JobsArgs) -> Result<()> {
     let now = crate::compute::grants::unix_now();
     println!("{:<30} {:<18} {:>5} {:>5}  {:<14} COMMAND", "JOB", "STATE", "EXIT", "AGE", "LABEL");
     for j in &jobs {
-        let state = match (j["state"].as_str().unwrap_or("?"), j["reason"].as_str()) {
-            (s, Some(r)) if s != "running" => format!("{s}/{r}"),
-            (s, _) => s.to_owned(),
-        };
-        let code = j["code"].as_i64().map(|c| c.to_string()).unwrap_or_else(|| "-".into());
+        let (state, code) = client::job_status(j);
         let age = j["created"].as_f64().map(|c| fmt_age(now.saturating_sub(c as u64))).unwrap_or_else(|| "-".into());
         let argv = j["argv"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default();
         println!("{:<30} {:<18} {:>5} {:>5}  {:<14} {}", JobRef::display(&vm, j["job"].as_str().unwrap_or("?")), state, code, age, j["label"].as_str().unwrap_or(""), argv);
