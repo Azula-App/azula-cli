@@ -9,10 +9,12 @@ enum Listen {
     Vsock(u32),
     Tcp(String),
     Unix(String),
+    /// The listening socket systemd passes as fd 3.
+    Systemd,
 }
 
 const USAGE: &str =
-    "usage: azula-guest [--vsock-port N | --tcp ADDR | --unix PATH] [--run-as USER] [--state-dir DIR] [--job-env-file PATH] [--version]";
+    "usage: azula-guest [--vsock-port N | --tcp ADDR | --unix PATH | --systemd-socket] [--run-as USER] [--state-dir DIR] [--job-env-file PATH] [--version]";
 
 /// `KEY=VALUE` lines (blank lines and `#` comments ignored) added to every
 /// job's environment.
@@ -65,6 +67,7 @@ fn main() {
             }
             "--tcp" => listen = Some(Listen::Tcp(val("--tcp"))),
             "--unix" => listen = Some(Listen::Unix(val("--unix"))),
+            "--systemd-socket" => listen = Some(Listen::Systemd),
             "--run-as" => run_as = val("--run-as"),
             "--state-dir" => cfg.state_dir = val("--state-dir").into(),
             "--job-env-file" => cfg.job_env = read_job_env(&val("--job-env-file")),
@@ -97,6 +100,13 @@ fn main() {
                 .inspect(|_| eprintln!("azula-guest: listening on unix {path}"))
                 .and_then(|l| serve_unix(l, srv))
         }
+        Listen::Systemd => match azula_guest::activation::systemd_listener() {
+            Ok(l) => {
+                eprintln!("azula-guest: listening on the systemd-activated socket");
+                serve_unix(l, srv)
+            }
+            Err(e) => die(&e),
+        },
         #[cfg(target_os = "linux")]
         Listen::Vsock(port) => {
             eprintln!("azula-guest: listening on vsock port {port}");

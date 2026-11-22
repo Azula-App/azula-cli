@@ -92,7 +92,9 @@ pub fn resolve(run_as: &str) -> Identity {
             };
         }
         warn_once(&format!("user {run_as:?} does not exist"));
-    } else {
+    } else if by_name(run_as).is_none_or(|pw| pw.uid != euid) {
+        // Started as `run_as` itself (systemd `User=`) is the normal
+        // non-root setup and needs no warning.
         warn_once(&format!("not running as root, cannot switch to {run_as:?}"));
     }
     match by_uid(euid) {
