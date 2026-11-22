@@ -92,10 +92,20 @@ pub async fn serve(allow_sleep: bool) -> Result<()> {
 
 /// `compute serve --local` on Linux: the worker runs on this machine itself.
 #[cfg(target_os = "linux")]
-pub async fn serve_local(vm_name: &str, run_as: &str) -> Result<()> {
-    super::local::validate_serve_flags(true, vm_name, run_as).map_err(|e| anyhow!(e))?;
+pub async fn serve_local(vm_name: &str, run_as: &str, attach: Option<super::local::AttachOpts>) -> Result<()> {
     let lock = acquire_serve_lock()?;
     let key = load_or_create_host_key()?;
+    if let Some(a) = attach {
+        super::local::validate_serve_flags(true, vm_name, run_as, Some(&a.socket), Some(a.cpus), Some(a.memory_mb)).map_err(|e| anyhow!(e))?;
+        let lines = vec![
+            "  backend     : attached worker (externally managed VM)".to_owned(),
+            format!("  VM name     : {vm_name}"),
+            format!("  worker sock : {}", a.socket.display()),
+        ];
+        let backend = Arc::new(super::local::LocalBackend::attach(vm_name, a));
+        return run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker is left running).").await;
+    }
+    super::local::validate_serve_flags(true, vm_name, run_as, None, None, None).map_err(|e| anyhow!(e))?;
     let backend = Arc::new(super::local::LocalBackend::new(vm_name, run_as));
     let lines = vec![
         format!("  backend     : local (jobs run on this machine as {run_as})"),

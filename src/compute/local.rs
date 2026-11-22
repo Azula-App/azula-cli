@@ -33,8 +33,32 @@ pub const STOP_GRACE: Duration = Duration::from_secs(10);
 /// Lines of worker stderr kept for start-failure messages.
 const STDERR_KEEP: usize = 20;
 
+/// How long attach-mode `start` waits for an already-provisioned worker (the
+/// VM may still be booting).
+pub const ATTACH_DEADLINE: Duration = Duration::from_secs(180);
+/// Attach-mode `start` poll interval.
+pub const ATTACH_POLL: Duration = Duration::from_secs(1);
+
+/// Attach mode (`--worker-socket`): the worker already exists (e.g. inside an
+/// AVF VM on Android) and is reachable on this Unix socket; the broker never
+/// spawns or stops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachOpts {
+    pub socket: PathBuf,
+    pub cpus: u32,
+    pub memory_mb: u64,
+}
+
 /// Validate the Linux `compute serve` flags (pure, so it is testable anywhere).
-pub fn validate_serve_flags(local: bool, vm_name: &str, run_as: &str) -> Result<(), String> {
+/// With `worker_socket` the run-as user is ignored (not even looked up).
+pub fn validate_serve_flags(
+    local: bool,
+    vm_name: &str,
+    run_as: &str,
+    worker_socket: Option<&Path>,
+    vm_cpus: Option<u32>,
+    vm_memory_mb: Option<u64>,
+) -> Result<(), String> {
     if !local {
         return Err("on Linux `azula compute serve` runs jobs on this machine itself, with no VM in between. \
              That is only appropriate when this machine is already an isolated VM (for example Android's \
@@ -43,6 +67,15 @@ pub fn validate_serve_flags(local: bool, vm_name: &str, run_as: &str) -> Result<
     }
     if !valid_vm_name(vm_name) {
         return Err(format!("--vm-name: invalid name `{vm_name}` (lowercase letters, digits and `-`, 1..=63 chars)"));
+    }
+    if let Some(sock) = worker_socket {
+        if !sock.is_absolute() {
+            return Err(format!("--worker-socket: `{}` must be an absolute path", sock.display()));
+        }
+        return Ok(());
+    }
+    if vm_cpus.is_some() || vm_memory_mb.is_some() {
+        return Err("--vm-cpus and --vm-memory-mb only apply together with --worker-socket".to_owned());
     }
     if run_as.is_empty() || run_as.starts_with('-') || run_as.chars().any(|c| c.is_whitespace() || c == '/') {
         return Err(format!("--run-as: invalid user name `{run_as}`"));
@@ -163,8 +196,35 @@ struct Inner {
     error: Option<String>,
 }
 
+/// A blocking one-shot `ping` (cheap, for the synchronous `state`): true iff
+/// the worker answers a `pong` within `timeout`.
+fn ping_blocking(sock: &Path, timeout: Duration) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::os::unix::net::UnixStream::connect(sock) else { return false };
+    let _ = s.set_read_timeout(Some(timeout));
+    let _ = s.set_write_timeout(Some(timeout));
+    let Ok(buf) = super::frame::Frame::of_type("ping").encode() else { return false };
+    if s.write_all(&buf).is_err() {
+        return false;
+    }
+    let mut len = [0u8; 8];
+    if s.read_exact(&mut len).is_err() {
+        return false;
+    }
+    let hlen = u32::from_be_bytes([len[0], len[1], len[2], len[3]]) as usize;
+    if hlen == 0 || hlen > super::frame::MAX_HEADER {
+        return false;
+    }
+    let mut h = vec![0u8; hlen];
+    if s.read_exact(&mut h).is_err() {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(&h).ok().and_then(|v| v.get("t").and_then(|t| t.as_str()).map(|t| t == "pong")).unwrap_or(false)
+}
+
 /// One "VM": the worker running on this machine.
 pub struct LocalBackend {
+    attach: Option<AttachOpts>,
     name: String,
     run_as: String,
     paths: LocalPaths,
@@ -178,7 +238,18 @@ impl LocalBackend {
     pub fn new(name: impl Into<String>, run_as: impl Into<String>) -> Self {
         let name = name.into();
         let paths = LocalPaths::new(&name);
-        Self { name, run_as: run_as.into(), paths, inner: Mutex::new(Inner::default()), gate: tokio::sync::Mutex::new(()), stderr: Arc::default() }
+        Self { attach: None, name, run_as: run_as.into(), paths, inner: Mutex::new(Inner::default()), gate: tokio::sync::Mutex::new(()), stderr: Arc::default() }
+    }
+
+    /// Attach mode: the worker is already listening on `opts.socket`; nothing is spawned.
+    pub fn attach(name: impl Into<String>, opts: AttachOpts) -> Self {
+        let mut b = Self::new(name, "");
+        b.attach = Some(opts);
+        b
+    }
+
+    pub fn is_attach(&self) -> bool {
+        self.attach.is_some()
     }
 
     pub fn run_as(&self) -> &str {
@@ -198,6 +269,14 @@ impl LocalBackend {
     }
 
     fn current_state(&self) -> VmState {
+        if let Some(a) = &self.attach {
+            let g = self.inner.lock().unwrap();
+            if g.starting {
+                return VmState::Starting;
+            }
+            drop(g);
+            return if ping_blocking(&a.socket, Duration::from_secs(1)) { VmState::Running } else { VmState::Stopped };
+        }
         let mut g = self.inner.lock().unwrap();
         if g.stopping {
             return VmState::Stopping;
@@ -317,6 +396,33 @@ impl VmBackend for LocalBackend {
     async fn info(&self, name: &str) -> Result<VmInfo, VmError> {
         self.check(name)?;
         let state = self.current_state();
+        if let Some(a) = &self.attach {
+            let (worker, pong) = if state == VmState::Running {
+                match guest::ping(&a.socket, Duration::from_secs(5)).await {
+                    Ok(p) => ("ready", Some(p)),
+                    Err(_) => ("unreachable", None),
+                }
+            } else {
+                ("unknown", None)
+            };
+            let error = self.inner.lock().unwrap().error.clone();
+            let shown = if state == VmState::Stopped && error.is_some() { "failed" } else { state.as_str() };
+            return Ok(VmInfo {
+                name: self.name.clone(),
+                state: shown.into(),
+                worker: worker.into(),
+                image: "avf".into(),
+                cpus: a.cpus,
+                memory_mb: a.memory_mb,
+                disk_gb: 0,
+                network: "proxy".into(),
+                jobs_running: None,
+                disk_free_mb: None,
+                worker_info: None,
+                error,
+            }
+            .with_pong(pong));
+        }
         let (worker, pong) = if state == VmState::Running {
             match guest::ping(&self.paths.socket(), Duration::from_secs(5)).await {
                 Ok(p) => ("ready", Some(p)),
@@ -351,7 +457,10 @@ impl VmBackend for LocalBackend {
             return Ok(());
         }
         self.inner.lock().unwrap().starting = true;
-        let result = self.start_locked().await;
+        let result = match &self.attach {
+            Some(a) => self.attach_wait(&a.socket, ATTACH_DEADLINE).await,
+            None => self.start_locked().await,
+        };
         self.inner.lock().unwrap().starting = false;
         match result {
             Ok(()) => {
@@ -367,6 +476,9 @@ impl VmBackend for LocalBackend {
 
     async fn stop(&self, name: &str) -> Result<(), VmError> {
         self.check(name)?;
+        if self.attach.is_some() {
+            return Err(VmError::new("unsupported", "this broker is attached to an externally managed worker (--worker-socket); stop the VM from the host app instead"));
+        }
         let _gate = self.gate.lock().await;
         let child = {
             let mut g = self.inner.lock().unwrap();
@@ -382,16 +494,39 @@ impl VmBackend for LocalBackend {
     }
 
     fn vsock_path(&self, _name: &str) -> PathBuf {
-        self.paths.socket()
+        match &self.attach {
+            Some(a) => a.socket.clone(),
+            None => self.paths.socket(),
+        }
     }
 
     async fn shutdown(&self) {
+        if self.attach.is_some() {
+            return;
+        }
         info!("stopping local worker {}", self.name);
         let _ = self.stop(&self.name.clone()).await;
     }
 }
 
 impl LocalBackend {
+    /// Attach mode: poll `ping` every [`ATTACH_POLL`] until the worker answers
+    /// or `deadline` passes. Caller holds the gate.
+    async fn attach_wait(&self, sock: &Path, deadline: Duration) -> Result<(), VmError> {
+        let end = tokio::time::Instant::now() + deadline;
+        loop {
+            let err = match guest::ping(sock, Duration::from_secs(2)).await {
+                Ok(_) => return Ok(()),
+                Err(e) => e,
+            };
+            if tokio::time::Instant::now() + ATTACH_POLL >= end {
+                let msg = format!("the attached worker at {} did not answer within {}s ({err})", sock.display(), deadline.as_secs());
+                return Err(VmError::new("vm_start_failed", msg));
+            }
+            tokio::time::sleep(ATTACH_POLL).await;
+        }
+    }
+
     /// Spawn the worker and wait for its first `pong`. Caller holds the gate.
     async fn start_locked(&self) -> Result<(), VmError> {
         let child = self.spawn_worker()?;
@@ -438,18 +573,18 @@ mod tests {
 
     #[test]
     fn serve_requires_local_flag() {
-        assert!(validate_serve_flags(false, "default", "azula").unwrap_err().contains("--local"));
-        assert!(validate_serve_flags(true, "default", "azula").is_ok());
+        assert!(validate_serve_flags(false, "default", "azula", None, None, None).unwrap_err().contains("--local"));
+        assert!(validate_serve_flags(true, "default", "azula", None, None, None).is_ok());
     }
 
     #[test]
     fn serve_flag_names_are_validated() {
-        assert!(validate_serve_flags(true, "Bad Name", "azula").is_err());
-        assert!(validate_serve_flags(true, "", "azula").is_err());
-        assert!(validate_serve_flags(true, "pixel-1", "azula").is_ok());
-        assert!(validate_serve_flags(true, "default", "").is_err());
-        assert!(validate_serve_flags(true, "default", "-x").is_err());
-        assert!(validate_serve_flags(true, "default", "a b").is_err());
+        assert!(validate_serve_flags(true, "Bad Name", "azula", None, None, None).is_err());
+        assert!(validate_serve_flags(true, "", "azula", None, None, None).is_err());
+        assert!(validate_serve_flags(true, "pixel-1", "azula", None, None, None).is_ok());
+        assert!(validate_serve_flags(true, "default", "", None, None, None).is_err());
+        assert!(validate_serve_flags(true, "default", "-x", None, None, None).is_err());
+        assert!(validate_serve_flags(true, "default", "a b", None, None, None).is_err());
     }
 
     #[test]
@@ -487,5 +622,99 @@ mod tests {
         assert_eq!(b.names().unwrap(), ["default"]);
         assert_eq!(b.state("default").unwrap(), VmState::Stopped);
         assert_eq!(b.state("other").unwrap_err().code, "unknown_vm");
+    }
+
+    // --- attach mode ---------------------------------------------------------
+
+    /// A fake worker: answers every connection's first frame with a `pong`.
+    fn fake_worker(sock: &Path) -> tokio::task::JoinHandle<()> {
+        use super::super::frame::{read_frame, write_frame, Frame};
+        let l = tokio::net::UnixListener::bind(sock).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(Some(f)) = read_frame(&mut c).await {
+                        if f.t() == "ping" {
+                            let _ = write_frame(&mut c, &Frame::new(serde_json::json!({"t": "pong", "jobs_running": 2, "disk_free_mb": 99}))).await;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    fn attach_backend(sock: &Path) -> LocalBackend {
+        LocalBackend::attach("pixel", AttachOpts { socket: sock.to_path_buf(), cpus: 4, memory_mb: 2048 })
+    }
+
+    fn tmp_sock(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("azula-attach-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.join("w.sock"), dir)
+    }
+
+    #[test]
+    fn attach_flag_validation() {
+        let sock = Path::new("/data/w.sock");
+        // run-as is ignored (even invalid) in attach mode
+        assert!(validate_serve_flags(true, "default", "", Some(sock), Some(4), Some(2048)).is_ok());
+        assert!(validate_serve_flags(true, "default", "a b", Some(sock), None, None).is_ok());
+        assert!(validate_serve_flags(false, "default", "azula", Some(sock), None, None).unwrap_err().contains("--local"));
+        assert!(validate_serve_flags(true, "Bad", "azula", Some(sock), None, None).is_err());
+        assert!(validate_serve_flags(true, "default", "azula", Some(Path::new("rel.sock")), None, None).unwrap_err().contains("absolute"));
+        assert!(validate_serve_flags(true, "default", "azula", None, Some(4), None).unwrap_err().contains("--worker-socket"));
+        assert!(validate_serve_flags(true, "default", "azula", None, None, Some(1)).is_err());
+    }
+
+    // multi-thread: `state` pings with a blocking socket call
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_start_state_info_and_stop() {
+        let (sock, dir) = tmp_sock("ok");
+        let b = attach_backend(&sock);
+        assert!(b.is_attach());
+        assert_eq!(b.vsock_path("pixel"), sock);
+        assert_eq!(b.state("pixel").unwrap(), VmState::Stopped);
+        let worker = fake_worker(&sock);
+        assert_eq!(b.state("pixel").unwrap(), VmState::Running);
+        b.start("pixel").await.unwrap();
+        let info = b.info("pixel").await.unwrap();
+        assert_eq!((info.image.as_str(), info.network.as_str(), info.cpus, info.memory_mb), ("avf", "proxy", 4, 2048));
+        assert_eq!((info.state.as_str(), info.worker.as_str(), info.jobs_running, info.disk_free_mb), ("running", "ready", Some(2), Some(99)));
+        let e = b.stop("pixel").await.unwrap_err();
+        assert_eq!(e.code, "unsupported");
+        b.shutdown().await;
+        assert_eq!(b.state("pixel").unwrap(), VmState::Running, "shutdown must be a no-op");
+        assert_eq!(b.state("other").unwrap_err().code, "unknown_vm");
+        worker.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // multi-thread: `state` pings with a blocking socket call
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_start_waits_for_a_late_worker() {
+        let (sock, dir) = tmp_sock("late");
+        let b = attach_backend(&sock);
+        let s2 = sock.clone();
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _worker = fake_worker(&s2);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        b.start("pixel").await.unwrap();
+        assert_eq!(b.state("pixel").unwrap(), VmState::Running);
+        late.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_start_times_out_as_vm_start_failed() {
+        let (sock, dir) = tmp_sock("none");
+        let b = attach_backend(&sock);
+        let e = b.start("pixel").await.unwrap_err();
+        assert_eq!(e.code, "vm_start_failed");
+        assert!(e.msg.contains("180s"), "{}", e.msg);
+        assert_eq!(b.info("pixel").await.unwrap().state, "failed");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

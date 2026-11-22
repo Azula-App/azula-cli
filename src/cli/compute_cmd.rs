@@ -51,6 +51,21 @@ enum ComputeAction {
         #[cfg(target_os = "linux")]
         #[arg(long, value_name = "USER", default_value = "azula")]
         run_as: String,
+        /// Linux only, attach mode: connect to an already-running `azula-guest`
+        /// listening on this Unix socket instead of spawning one (e.g. an AVF VM
+        /// bridged by an Android app). The broker never starts or stops it;
+        /// `start` waits up to 180 s for it to answer. --run-as is ignored.
+        #[cfg(target_os = "linux")]
+        #[arg(long, value_name = "PATH")]
+        worker_socket: Option<std::path::PathBuf>,
+        /// Linux attach mode: CPU count to report in `vm status` (default 0).
+        #[cfg(target_os = "linux")]
+        #[arg(long, value_name = "N")]
+        vm_cpus: Option<u32>,
+        /// Linux attach mode: memory in MiB to report in `vm status` (default 0).
+        #[cfg(target_os = "linux")]
+        #[arg(long, value_name = "M")]
+        vm_memory_mb: Option<u64>,
     },
     /// Host (Apple silicon macOS or Linux): mint an access token for a remote client.
     /// Prints the token once (the host keeps only a hash) and an `export
@@ -349,7 +364,9 @@ fn parse_mode(s: &str) -> Result<u32, String> {
 pub(super) async fn run(args: ComputeArgs) -> Result<()> {
     match args.action {
         #[cfg(target_os = "linux")]
-        ComputeAction::Serve { allow_sleep: _, local, vm_name, run_as } => host::serve_local(local, &vm_name, &run_as).await,
+        ComputeAction::Serve { allow_sleep: _, local, vm_name, run_as, worker_socket, vm_cpus, vm_memory_mb } => {
+            host::serve_local(local, &vm_name, &run_as, worker_socket, vm_cpus, vm_memory_mb).await
+        }
         #[cfg(not(target_os = "linux"))]
         ComputeAction::Serve { allow_sleep } => host::serve(allow_sleep).await,
         ComputeAction::Grant(a) => host::grant(a).await,
@@ -799,11 +816,19 @@ mod host {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) async fn serve_local(local: bool, vm_name: &str, run_as: &str) -> Result<()> {
-        if let Err(e) = crate::compute::local::validate_serve_flags(local, vm_name, run_as) {
+    pub(super) async fn serve_local(
+        local: bool,
+        vm_name: &str,
+        run_as: &str,
+        worker_socket: Option<std::path::PathBuf>,
+        vm_cpus: Option<u32>,
+        vm_memory_mb: Option<u64>,
+    ) -> Result<()> {
+        if let Err(e) = crate::compute::local::validate_serve_flags(local, vm_name, run_as, worker_socket.as_deref(), vm_cpus, vm_memory_mb) {
             die(2, &e);
         }
-        crate::compute::host::serve_local(vm_name, run_as).await
+        let attach = worker_socket.map(|socket| crate::compute::local::AttachOpts { socket, cpus: vm_cpus.unwrap_or(0), memory_mb: vm_memory_mb.unwrap_or(0) });
+        crate::compute::host::serve_local(vm_name, run_as, attach).await
     }
 
     pub(super) async fn grant(a: GrantArgs) -> Result<()> {

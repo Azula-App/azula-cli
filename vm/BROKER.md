@@ -283,3 +283,12 @@ The worker runs straight from the read-only share, so every boot runs the host's
   executable, else `azula-guest` on `PATH`. The run-as user is never created automatically; start
   fails telling the operator to run `sudo useradd -m -s /bin/bash azula`.
 - A grant with `vms:["*"]` maps to `default`, so `--vm-name default` lets `compute exec` omit `--vm`.
+- **Attach mode** (`--worker-socket PATH`, absolute): for a broker running as a child of an Android
+  app that boots a Debian VM through AVF and bridges the guest's `azula-guest` (vsock port 1024) to
+  a Unix socket. The backend spawns nothing: `start` polls `ping` every 1 s for up to 180 s (the VM
+  may still be booting; timeout is `vm_start_failed`), `state` is `running` iff the socket answers a
+  ping, `stop` fails with code `unsupported` (the app owns the VM) and `shutdown` is a no-op.
+  `vm status` reports image `avf`, network `proxy`, and CPUs/RAM from the optional `--vm-cpus N` /
+  `--vm-memory-mb M` (default 0; only valid with `--worker-socket`). `--run-as` is ignored and the
+  run-as user is never looked up (Android has no `/etc/passwd`). Without `--worker-socket` the spawn
+  mode above is unchanged.
