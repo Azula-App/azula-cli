@@ -130,14 +130,13 @@ public class HostService extends Service {
 
             VirtualMachineManager vmm = getSystemService(VirtualMachineManager.class);
             if (vmm == null) throw new IllegalStateException("VirtualMachineManager service unavailable");
-            VirtualMachine v;
-            try {
-                v = vmm.getOrCreate(VM_NAME, config);
-            } catch (Throwable e) {
-                Log.to("host", "getOrCreate failed (" + e + "); deleting and recreating");
-                try { vmm.delete(VM_NAME); } catch (Throwable e2) { Log.to("host", "delete failed: " + e2); }
-                v = vmm.getOrCreate(VM_NAME, config);
+            // getOrCreate() returns an existing instance with its OLD config (e.g. without
+            // the seed disk), so always start from a fresh instance. Nothing in it is ours to
+            // keep: the disk images live in filesDir/vm.
+            if (vmm.get(VM_NAME) != null) {
+                try { vmm.delete(VM_NAME); } catch (Throwable e) { Log.to("host", "delete failed: " + e); }
             }
+            VirtualMachine v = vmm.getOrCreate(VM_NAME, config);
             vm = v;
             v.setCallback(Executors.newSingleThreadExecutor(), callback());
             status = "booting";
