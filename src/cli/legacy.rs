@@ -224,16 +224,16 @@ pub(super) fn cmd_pair(args: PairArgs) -> Result<()> {
     match registry::endpoint_id_of(&token) {
         Some(id) => {
             let short: String = id.to_string().chars().take(8).collect();
-            println!("Paired device '{}' (endpoint: {short}…)", added.name);
+            crate::outln!("Paired device '{}' (endpoint: {short}…)", added.name);
         }
         // No endpoint id to show — an explicit `--name` got us here, since the
         // derived path requires one. Fall back to the ticket head.
         None => {
             let short: String = token.chars().take(8).collect();
-            println!("Paired device '{}' (ticket: {short}…)", added.name);
+            crate::outln!("Paired device '{}' (ticket: {short}…)", added.name);
         }
     }
-    println!("Saved to: {}", added.path.display());
+    crate::outln!("Saved to: {}", added.path.display());
     Ok(())
 }
 
@@ -278,7 +278,7 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
     let known = registry::load();
 
     if known.is_empty() && !json {
-        println!("No devices registered. Use `azula pair <URL>` to add one.");
+        crate::outln!("No devices registered. Use `azula pair <URL>` to add one.");
         return Ok(());
     }
 
@@ -309,7 +309,7 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string(&rows)?);
+        crate::outln!("{}", serde_json::to_string(&rows)?);
         return Ok(());
     }
 
@@ -322,8 +322,8 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
         .map(|p| registry::read_file(&p).into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
 
-    println!("{:<20} {:<12} SOURCE", "NAME", "FINGERPRINT");
-    println!("{}", "-".repeat(48));
+    crate::outln!("{:<20} {:<12} SOURCE", "NAME", "FINGERPRINT");
+    crate::outln!("{}", "-".repeat(48));
     for d in &known {
         let fingerprint = fingerprint(&d.ticket);
         let source = if project_devices.contains(&d.name) {
@@ -333,7 +333,7 @@ pub(super) fn cmd_devices(json: bool) -> Result<()> {
         } else {
             "?"
         };
-        println!("{:<20} {:<12} {}", d.name, format!("{fingerprint}…"), source);
+        crate::outln!("{:<20} {:<12} {}", d.name, format!("{fingerprint}…"), source);
     }
     Ok(())
 }
@@ -396,24 +396,24 @@ pub(super) async fn cmd_invite_mint(args: InviteMintArgs) -> Result<()> {
     let url = qr::invite_url(&encoded);
 
     let endpoint_id_str = endpoint_id.to_string();
-    println!(
+    crate::outln!(
         "Minted invite {} for the {identity_label} identity (endpoint {}…)",
         record.id,
         &endpoint_id_str[..8.min(endpoint_id_str.len())]
     );
-    println!("  expires: {}", describe_expiry(record.expires_at));
+    crate::outln!("  expires: {}", describe_expiry(record.expires_at));
     if let Some(label) = &record.label {
-        println!("  label: {label}");
+        crate::outln!("  label: {label}");
     }
-    println!("  signed: {}, single-use: {}", record.is_signed(), record.is_single_use());
+    crate::outln!("  signed: {}, single-use: {}", record.is_signed(), record.is_single_use());
     if args.bridge {
-        println!("  pairs with: any azula mcp session on this machine (sessions present a cert chained to this machine identity)");
+        crate::outln!("  pairs with: any azula mcp session on this machine (sessions present a cert chained to this machine identity)");
     } else {
-        println!("  pairs with: azula serve (this same identity); NOT azula mcp — mint with --bridge for that");
+        crate::outln!("  pairs with: azula serve (this same identity); NOT azula mcp — mint with --bridge for that");
     }
-    println!();
+    crate::outln!();
     qr::print_invite_pairing("Share this invite:", &encoded);
-    println!("  {url}");
+    crate::outln!("  {url}");
     Ok(())
 }
 
@@ -428,15 +428,15 @@ fn describe_expiry(expires_at: u32) -> String {
 pub(super) fn cmd_invites() -> Result<()> {
     let issued = invite::list();
     if issued.is_empty() {
-        println!("No invites issued. Use `azula invite` to mint one.");
+        crate::outln!("No invites issued. Use `azula invite` to mint one.");
         return Ok(());
     }
 
-    println!(
+    crate::outln!(
         "{:<18} {:<12} {:<20} {:<10} {:<8} LABEL",
         "ID", "CREATED", "EXPIRES", "CONSUMED", "FLAGS"
     );
-    println!("{}", "-".repeat(90));
+    crate::outln!("{}", "-".repeat(90));
     for i in &issued {
         let expires = if i.expires_at == 0 { "never".to_string() } else { i.expires_at.to_string() };
         let mut flags = Vec::new();
@@ -447,7 +447,7 @@ pub(super) fn cmd_invites() -> Result<()> {
             flags.push("single-use");
         }
         let flags = if flags.is_empty() { "-".to_string() } else { flags.join(",") };
-        println!(
+        crate::outln!(
             "{:<18} {:<12} {:<20} {:<10} {:<8} {}",
             i.id,
             i.created_at,
@@ -466,7 +466,7 @@ pub(super) fn cmd_invite_revoke(args: InviteRevokeArgs) -> Result<()> {
         eprintln!("No invite matching {:?} found.", args.id_prefix);
         std::process::exit(1);
     }
-    println!("Revoked {removed} invite(s) matching {:?}.", args.id_prefix);
+    crate::outln!("Revoked {removed} invite(s) matching {:?}.", args.id_prefix);
     Ok(())
 }
 
@@ -490,14 +490,14 @@ pub(super) async fn cmd_link(args: LinkArgs) -> Result<()> {
     let payload = certs::LinkPayload::new(device_pk, name.clone(), ticket.encode_bytes());
     let encoded = payload.encode();
 
-    println!();
-    println!("  Scan this on the device that already holds your identity");
-    println!("  (or paste the string there):");
-    println!();
-    println!("  {encoded}");
-    println!();
-    println!("{}", qr::render_qr(&encoded));
-    println!("  Waiting for it to connect… (Ctrl-C to cancel)");
+    crate::outln!();
+    crate::outln!("  Scan this on the device that already holds your identity");
+    crate::outln!("  (or paste the string there):");
+    crate::outln!();
+    crate::outln!("  {encoded}");
+    crate::outln!();
+    crate::outln!("{}", qr::render_qr(&encoded));
+    crate::outln!("  Waiting for it to connect… (Ctrl-C to cancel)");
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handler = LinkHandler::new(device_pk, name, roles, result_tx);
@@ -507,7 +507,7 @@ pub(super) async fn cmd_link(args: LinkArgs) -> Result<()> {
         outcome = result_rx => outcome.context("link: session ended without a result")?,
         _ = tokio::signal::ctrl_c() => {
             router.shutdown().await?;
-            println!("Cancelled — nothing was saved.");
+            crate::outln!("Cancelled — nothing was saved.");
             return Ok(());
         }
     };
@@ -517,19 +517,19 @@ pub(super) async fn cmd_link(args: LinkArgs) -> Result<()> {
         LinkOutcome::Granted { cert, bundle } => match verify_granted_cert(&cert, device_pk, &bundle) {
             Ok(()) => {
                 linked_identity::save(&LinkedIdentity { cert, bundle })?;
-                println!();
-                println!("Linked! Certificate and identity bundle saved.");
-                println!("Run `azula mailbox` to serve this identity's mailbox role from this machine.");
+                crate::outln!();
+                crate::outln!("Linked! Certificate and identity bundle saved.");
+                crate::outln!("Run `azula mailbox` to serve this identity's mailbox role from this machine.");
             }
             Err(e) => {
-                println!();
-                println!("Link request was granted, but the certificate did not check out ({e}); nothing was saved.");
+                crate::outln!();
+                crate::outln!("Link request was granted, but the certificate did not check out ({e}); nothing was saved.");
             }
         },
         LinkOutcome::Rejected { reason } => {
-            println!();
-            println!("Link request was declined: {reason}");
-            println!("Nothing was saved.");
+            crate::outln!();
+            crate::outln!("Link request was declined: {reason}");
+            crate::outln!("Nothing was saved.");
         }
     }
     Ok(())

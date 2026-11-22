@@ -783,7 +783,10 @@ async fn pull_stdout(dialer: &Dialer, remote: &str, opts: &PullOptions) -> Resul
         let f = read_reply(&mut s).await.map_err(TransferError::Transport)?;
         match f.t() {
             "data" => {
-                out.write_all(&f.payload).await.map_err(|e| TransferError::file("io_error", format!("stdout: {e}")))?;
+                if let Err(e) = out.write_all(&f.payload).await {
+                    super::out::exit_on_broken_pipe(&e);
+                    return Err(TransferError::file("io_error", format!("stdout: {e}")));
+                }
                 hasher.update(&f.payload);
                 got += f.payload.len() as u64;
             }

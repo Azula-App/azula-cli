@@ -17,6 +17,7 @@ pub mod client;
 pub mod frame;
 pub mod grants;
 pub mod guest;
+pub mod out;
 pub mod seed;
 pub mod tarx;
 pub mod transfer;

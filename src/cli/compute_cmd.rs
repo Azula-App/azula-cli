@@ -397,9 +397,9 @@ pub(super) async fn close_quietly(ep: iroh::Endpoint) {
 }
 
 fn emit_json(v: &Value) {
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{v}");
-    let _ = out.flush();
+    let mut line = v.to_string();
+    line.push('\n');
+    crate::compute::out::write_bytes(line.as_bytes());
 }
 
 use crate::compute::transfer::human_bytes;
@@ -432,11 +432,7 @@ impl Printer {
             return;
         }
         match ev {
-            Event::Stdout { data, .. } if self.stdout => {
-                let mut o = std::io::stdout().lock();
-                let _ = o.write_all(data);
-                let _ = o.flush();
-            }
+            Event::Stdout { data, .. } if self.stdout => crate::compute::out::write_bytes(data),
             Event::Stderr { data, .. } if self.stderr => {
                 let mut e = std::io::stderr().lock();
                 let _ = e.write_all(data);
@@ -463,7 +459,7 @@ async fn stream_job(dialer: Dialer, start: Start, stdin: bool, policy: Policy, p
     close_quietly(dialer.ep.clone()).await;
     let json = printer.json;
     match &outcome {
-        Outcome::Detached { job, by_interrupt: false } if detach && !json => println!("{job}"),
+        Outcome::Detached { job, by_interrupt: false } if detach && !json => crate::outln!("{job}"),
         Outcome::Error { .. } if json => {}
         Outcome::Transport(_) | Outcome::GaveUp { .. } if json => {
             if let Some(m) = outcome.message(timeout_s) {
@@ -628,16 +624,16 @@ async fn jobs(args: JobsArgs) -> Result<()> {
         return Ok(());
     }
     if jobs.is_empty() {
-        println!("no jobs on {vm}");
+        crate::outln!("no jobs on {vm}");
         return Ok(());
     }
     let now = crate::compute::grants::unix_now();
-    println!("{:<30} {:<18} {:>5} {:>5}  {:<14} COMMAND", "JOB", "STATE", "EXIT", "AGE", "LABEL");
+    crate::outln!("{:<30} {:<18} {:>5} {:>5}  {:<14} COMMAND", "JOB", "STATE", "EXIT", "AGE", "LABEL");
     for j in &jobs {
         let (state, code) = client::job_status(j);
         let age = j["created"].as_f64().map(|c| fmt_age(now.saturating_sub(c as u64))).unwrap_or_else(|| "-".into());
         let argv = j["argv"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default();
-        println!("{:<30} {:<18} {:>5} {:>5}  {:<14} {}", JobRef::display(&vm, j["job"].as_str().unwrap_or("?")), state, code, age, j["label"].as_str().unwrap_or(""), argv);
+        crate::outln!("{:<30} {:<18} {:>5} {:>5}  {:<14} {}", JobRef::display(&vm, j["job"].as_str().unwrap_or("?")), state, code, age, j["label"].as_str().unwrap_or(""), argv);
     }
     Ok(())
 }
@@ -653,7 +649,7 @@ async fn cancel(args: CancelArgs) -> Result<()> {
     close_quietly(ep).await;
     match res {
         Ok(state) => {
-            println!("{}: {state}", args.job);
+            crate::outln!("{}: {state}", args.job);
             Ok(())
         }
         Err(Failure::Broker { code, msg }) if code == "not_found" => die(1, &format!("{code}: {msg}")),
@@ -755,10 +751,10 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
     let stages = client::doctor(args.token.token.as_deref().filter(|t| !t.trim().is_empty()), args.vm.as_deref(), |s| {
         if !json {
             let mark = if s.ok { "\u{2713}" } else { "\u{2717}" };
-            println!("{mark} {:<7} {:>6} ms  {}", s.stage, s.ms, s.detail);
+            crate::outln!("{mark} {:<7} {:>6} ms  {}", s.stage, s.ms, s.detail);
             if let Some(h) = &s.hint {
                 if !s.ok {
-                    println!("    hint: {h}");
+                    crate::outln!("    hint: {h}");
                 }
             }
         }
@@ -801,8 +797,8 @@ mod host {
         if a.json {
             emit_json(&json!({"grant": public_grant(&grant), "token": token}));
         } else {
-            println!("{token}");
-            println!("export AZULA_COMPUTE_TOKEN={token}");
+            crate::outln!("{token}");
+            crate::outln!("export AZULA_COMPUTE_TOKEN={token}");
             eprintln!("grant {} expires in {} (ops: {}, vms: {})", grant.id, a.ttl, grant.ops.join(","), grant.vms.join(","));
         }
         Ok(())
@@ -823,11 +819,11 @@ mod host {
             return Ok(());
         }
         if grants.is_empty() {
-            println!("no grants (mint one with `azula compute grant`)");
+            crate::outln!("no grants (mint one with `azula compute grant`)");
             return Ok(());
         }
         let now = crate::compute::grants::unix_now();
-        println!("{:<16} {:<8} {:<20} {:<14} {:<10} LABEL", "ID", "STATUS", "VMS", "OPS", "LAST USED");
+        crate::outln!("{:<16} {:<8} {:<20} {:<14} {:<10} LABEL", "ID", "STATUS", "VMS", "OPS", "LAST USED");
         for g in grants {
             let status = if g.revoked.is_some() {
                 "revoked"
@@ -837,16 +833,16 @@ mod host {
                 "active"
             };
             let last = g.last_used.map(|t| format!("{}s ago", now.saturating_sub(t))).unwrap_or_else(|| "never".into());
-            println!("{:<16} {:<8} {:<20} {:<14} {:<10} {}", g.id, status, g.vms.join(","), g.ops.join(","), last, g.label);
+            crate::outln!("{:<16} {:<8} {:<20} {:<14} {:<10} {}", g.id, status, g.vms.join(","), g.ops.join(","), last, g.label);
         }
         Ok(())
     }
 
     pub(super) fn revoke(id: &str, cancel_jobs: bool) -> Result<()> {
         if crate::compute::host::revoke(id, cancel_jobs)? {
-            println!("revoked {id}");
+            crate::outln!("revoked {id}");
             if cancel_jobs {
-                println!("a running `azula compute serve` will cancel its jobs");
+                crate::outln!("a running `azula compute serve` will cancel its jobs");
             }
             Ok(())
         } else {

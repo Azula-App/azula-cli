@@ -101,11 +101,11 @@ async fn remote(op: &str, a: RemoteVmArgs) -> Result<()> {
         Err(f) => die(f.exit_code(), &f.message()),
     };
     if a.json {
-        println!("{}", serde_json::Value::Array(vms));
+        crate::outln!("{}", serde_json::Value::Array(vms));
         return Ok(());
     }
     for v in &vms {
-        println!(
+        crate::outln!(
             "{}  {}  worker {}  ({} cpu, {} MiB, {} GiB, {}, network {}){}{}",
             v["name"].as_str().unwrap_or("?"),
             v["state"].as_str().unwrap_or("?"),
@@ -130,29 +130,29 @@ mod host {
     pub(super) async fn create(name: &str, image: &str, cpus: u32, memory_mb: u64, disk_gb: u64, network: &str) -> Result<()> {
         let paths = Paths::new(crate::compute::vm_dir());
         let dir = create_vm(&paths, name, &CreateOptions { image: image.to_owned(), cpus, memory_mb, disk_gb, network: network.to_owned() }).await?;
-        println!("created VM `{name}` in {}", dir.display());
-        println!("start it with `azula compute serve` plus `azula vm start {name}`, or by running a command with `azula compute exec`");
+        crate::outln!("created VM `{name}` in {}", dir.display());
+        crate::outln!("start it with `azula compute serve` plus `azula vm start {name}`, or by running a command with `azula compute exec`");
         Ok(())
     }
 
     pub(super) fn list(json: bool) -> Result<()> {
         let vms = list_offline(&Paths::new(crate::compute::vm_dir()));
         if json {
-            println!("{}", serde_json::to_string(&vms)?);
+            crate::outln!("{}", serde_json::to_string(&vms)?);
             return Ok(());
         }
         if vms.is_empty() {
-            println!("no VMs (create one with `azula vm create NAME`)");
+            crate::outln!("no VMs (create one with `azula vm create NAME`)");
         }
         for v in vms {
-            println!("{:<20} {:<8} {} cpu, {} MiB, {} GiB, {}", v.name, v.state, v.cpus, v.memory_mb, v.disk_gb, v.image);
+            crate::outln!("{:<20} {:<8} {} cpu, {} MiB, {} GiB, {}", v.name, v.state, v.cpus, v.memory_mb, v.disk_gb, v.image);
         }
         Ok(())
     }
 
     pub(super) fn delete(name: &str) -> Result<()> {
         delete_vm(&Paths::new(crate::compute::vm_dir()), name)?;
-        println!("deleted VM `{name}`");
+        crate::outln!("deleted VM `{name}`");
         Ok(())
     }
 }
