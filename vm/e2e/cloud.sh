@@ -89,7 +89,10 @@ pass "tree in, aarch64 binary and tree out"
 step "detach, list, attach, logs (H3)"
 ref=$(c exec --detach --label e2e-detach -- sh -c 'for i in 1 2 3; do echo tick$i; sleep 1; done; exit 5') || fail "detach"
 echo "job $ref"
-c jobs | tee "$work/jobs" | grep -q "${ref#*/}" || fail "jobs doesn't list $ref"
+# Not `c jobs | tee | grep -q`: under pipefail, grep -q exits on its first match and tee
+# then dies of SIGPIPE (141) once the listing outgrows one pipe write — a false failure.
+c jobs >"$work/jobs" || fail "jobs"
+grep -q "${ref#*/}" "$work/jobs" || fail "jobs doesn't list $ref"
 c attach "$ref" >"$work/att"
 rc=$?
 [ "$rc" = 5 ] || fail "attach exit $rc, want 5"
