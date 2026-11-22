@@ -114,7 +114,12 @@ async function buildPlatformPackage({ rustTarget, npmSuffix, os, cpu }, version,
     license: "MIT OR Apache-2.0",
     os: [os],
     cpu: [cpu],
-    bin: { azula: "bin/azula" },
+    // No "bin" here. Only the meta package declares the `azula` command; its
+    // launcher finds this binary with require.resolve. When both packages
+    // declared a bin named `azula`, npm 9 and 10 linked neither, so
+    // `npx @azula-app/cli` failed with "azula: not found" in Claude Code
+    // cloud sandboxes (npm 11 happened to pick the meta launcher). The
+    // binary keeps its exec bit from the tarball (chmod above).
     files: ["bin/"],
   };
   await writeFile(path.join(pkgDir, "package.json"), JSON.stringify(packageJson, null, 2) + "\n");
