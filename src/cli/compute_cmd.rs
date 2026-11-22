@@ -1,7 +1,7 @@
 //! `azula compute` — run commands in a VM on a remote Mac over iroh.
 //!
 //! Host verbs (`serve`, `grant`, `grants`, `revoke`) run on Apple silicon
-//! macOS only; client verbs (`exec`, `attach`, `logs`, `jobs`, `cancel`,
+//! macOS, and on Linux with `serve --local` (plus `local-setup`); client verbs (`exec`, `attach`, `logs`, `jobs`, `cancel`,
 //! `push`, `pull`, `doctor`) run anywhere. The `vm` noun lives in `vm_cmd`.
 //! Contract: `vm/BROKER.md` §5–§7.
 
@@ -31,12 +31,15 @@ enum ComputeAction {
     /// `azula compute` clients and runs their commands inside the VMs you
     /// created with `azula vm create`. While a VM runs it keeps the Mac from
     /// idle-sleeping. Ctrl-C stops the broker and every VM it started (running
-    /// jobs end as `interrupted`). On Linux there is no VM: with --local the
-    /// jobs run on this machine itself (as --run-as), which is only
-    /// appropriate when this machine is already an isolated VM, e.g. Android's
-    /// Linux Terminal.
+    /// jobs end as `interrupted`). On Linux there is no VM to boot: with
+    /// --local the jobs run on this machine itself, as an unprivileged job
+    /// user (--run-as, default `azula`) behind a systemd-activated socket
+    /// only the broker's user can open. That is only appropriate when this
+    /// machine is already an isolated VM, e.g. Android's Linux Terminal. Set
+    /// it up once with `sudo azula compute local-setup`, which also runs the
+    /// broker as a service.
     Serve {
-        /// Don't hold an idle-sleep assertion while VMs run.
+        /// macOS only: don't hold an idle-sleep assertion while VMs run.
         #[arg(long)]
         allow_sleep: bool,
         /// Linux only: run jobs on this machine itself (required there).
@@ -47,14 +50,17 @@ enum ComputeAction {
         #[cfg(target_os = "linux")]
         #[arg(long, value_name = "NAME", default_value = "default")]
         vm_name: String,
-        /// Linux only: the user the worker runs jobs as. It must exist.
+        /// Linux only: the unprivileged user the worker runs jobs as. The
+        /// broker refuses to start if it doesn't exist, is root, is the
+        /// broker's own user, or is in `sudo`/`wheel`.
         #[cfg(target_os = "linux")]
         #[arg(long, value_name = "USER", default_value = "azula")]
         run_as: String,
         /// Linux only, attach mode: connect to an already-running `azula-guest`
-        /// listening on this Unix socket instead of spawning one (e.g. an AVF VM
-        /// bridged by an Android app). The broker never starts or stops it;
-        /// `start` waits up to 180 s for it to answer. --run-as is ignored.
+        /// listening on this Unix socket (e.g. an AVF VM bridged by an Android
+        /// app) instead of the systemd-activated /run/azula/worker.sock. The
+        /// broker never starts or stops it; `start` waits up to 180 s for it
+        /// to answer. --run-as is ignored and no user checks run.
         #[cfg(target_os = "linux")]
         #[arg(long, value_name = "PATH")]
         worker_socket: Option<std::path::PathBuf>,
@@ -67,6 +73,14 @@ enum ComputeAction {
         #[arg(long, value_name = "M")]
         vm_memory_mb: Option<u64>,
     },
+    /// Linux host, once, as root (`sudo azula compute local-setup`): create the
+    /// unprivileged job user `azula`, install `azula-guest` to
+    /// /usr/local/lib/azula, and install and enable the systemd units
+    /// (azula-guest.socket, azula-guest.service, azula-compute.service) so
+    /// `azula compute serve --local` runs as a service for the invoking user.
+    /// Safe to run again: unchanged files are left alone.
+    #[cfg(target_os = "linux")]
+    LocalSetup,
     /// Host (Apple silicon macOS or Linux): mint an access token for a remote client.
     /// Prints the token once (the host keeps only a hash) and an `export
     /// AZULA_COMPUTE_TOKEN=…` line to paste into the client's environment.
@@ -364,9 +378,14 @@ fn parse_mode(s: &str) -> Result<u32, String> {
 pub(super) async fn run(args: ComputeArgs) -> Result<()> {
     match args.action {
         #[cfg(target_os = "linux")]
-        ComputeAction::Serve { allow_sleep: _, local, vm_name, run_as, worker_socket, vm_cpus, vm_memory_mb } => {
+        ComputeAction::Serve { allow_sleep, local, vm_name, run_as, worker_socket, vm_cpus, vm_memory_mb } => {
+            if allow_sleep {
+                die(2, "--allow-sleep applies to macOS only (on Linux azula holds no idle-sleep assertion; on Android's Terminal use Keep awake)");
+            }
             host::serve_local(local, &vm_name, &run_as, worker_socket, vm_cpus, vm_memory_mb).await
         }
+        #[cfg(target_os = "linux")]
+        ComputeAction::LocalSetup => crate::compute::local_setup::run(),
         #[cfg(not(target_os = "linux"))]
         ComputeAction::Serve { allow_sleep } => host::serve(allow_sleep).await,
         ComputeAction::Grant(a) => host::grant(a).await,

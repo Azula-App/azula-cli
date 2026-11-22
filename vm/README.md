@@ -172,7 +172,8 @@ missing, jobs run as the worker's own user.
 
 The bytes go to `.<name>.azula-<upload>.part` in the target's directory
 (`O_CREAT|O_NOFOLLOW`, mode 0600). Only when `eof` matches both size and
-digest does the worker `fchmod`, `fchown` to the run-as user, `fsync` and
+digest does the worker `fchmod`, `fchown` to the run-as user (a no-op when the worker already
+runs as that user), `fsync` and
 `rename` over the target, so the target is always either the old file or the
 complete new one. If the connection drops before `eof`, the part file stays
 for resumption (24 h); a size or digest mismatch deletes it so the client
@@ -194,9 +195,12 @@ Symlinks are followed inside the guest; the final target must be a regular
 file. The client writes to a part file next to its destination and renames it
 into place only if `get_end` matches.
 
-File operations run as the worker (root) and create files owned by the run-as
-user. Inside the VM that is not a privilege boundary (the job user has
-passwordless sudo), so put/get/attach/jobs are authorized exactly like exec.
+File operations run as the worker. In a Mac VM or an AVF VM the worker is root
+and creates files owned by the run-as user; there that is not a privilege
+boundary (the job user has passwordless sudo), so put/get/attach/jobs are
+authorized exactly like exec. In the Linux local backend (BROKER.md section 9)
+the worker itself runs as the unprivileged job user, so put and get are
+confined to what that user may read and write, and the `fchown` is skipped.
 Nothing in this protocol can name a path on the host.
 
 ## 3. Helper protocol (`azula-vm`)

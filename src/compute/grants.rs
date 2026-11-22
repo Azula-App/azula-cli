@@ -393,7 +393,29 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    // Without this, a crash right after the rename can lose the new directory
+    // entry: a printed token whose grant never reached disk.
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    fsync_dir(dir).with_context(|| format!("syncing {}", dir.display()))?;
     Ok(())
+}
+
+/// Flush a directory's entries (a rename or create inside it) to disk. No-op
+/// off unix, where directories can't be opened for sync.
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        match File::open(dir)?.sync_all() {
+            // Some filesystems refuse fsync on a directory; nothing more to do there.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+            r => r,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// An advisory `flock` held until dropped (no-op off unix).
@@ -449,6 +471,22 @@ impl FileLock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn write_private_atomic_syncs_the_parent_directory() {
+        let d = std::env::temp_dir().join(format!("azula-wpa-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("grants.json");
+        write_private_atomic(&p, b"one").unwrap();
+        write_private_atomic(&p, b"two").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"two");
+        assert!(fs::read_dir(&d).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("tmp")), "no temp file left");
+        // The directory sync itself works on a real dir and reports a missing one.
+        fsync_dir(&d).unwrap();
+        assert!(fsync_dir(&d.join("missing")).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {

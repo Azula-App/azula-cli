@@ -90,29 +90,39 @@ pub async fn serve(allow_sleep: bool) -> Result<()> {
     Ok(())
 }
 
-/// `compute serve --local` on Linux: the worker runs on this machine itself.
+/// `compute serve --local` on Linux: connect to a worker this machine already
+/// runs. With `attach` that is the externally managed worker's socket; without
+/// it, Terminal mode: the systemd-activated `/run/azula/worker.sock`, and the
+/// job user must pass [`super::local::check_job_user`] before anything binds.
 #[cfg(target_os = "linux")]
 pub async fn serve_local(vm_name: &str, run_as: &str, attach: Option<super::local::AttachOpts>) -> Result<()> {
-    let lock = acquire_serve_lock()?;
-    let key = load_or_create_host_key()?;
+    use super::local::{check_job_user, validate_serve_flags, AttachOpts, LocalBackend, SystemDb, DEFAULT_WORKER_SOCKET};
     if let Some(a) = attach {
-        super::local::validate_serve_flags(true, vm_name, run_as, Some(&a.socket), Some(a.cpus), Some(a.memory_mb)).map_err(|e| anyhow!(e))?;
+        validate_serve_flags(true, vm_name, run_as, Some(&a.socket), Some(a.cpus), Some(a.memory_mb)).map_err(|e| anyhow!(e))?;
+        let lock = acquire_serve_lock()?;
+        let key = load_or_create_host_key()?;
+        let AttachOpts { socket, .. } = a.clone();
         let lines = vec![
             "  backend     : attached worker (externally managed VM)".to_owned(),
             format!("  VM name     : {vm_name}"),
-            format!("  worker sock : {}", a.socket.display()),
+            format!("  worker sock : {}", socket.display()),
         ];
-        let backend = Arc::new(super::local::LocalBackend::attach(vm_name, a));
+        let backend = Arc::new(LocalBackend::attach(vm_name, a));
         return run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker is left running).").await;
     }
-    super::local::validate_serve_flags(true, vm_name, run_as, None, None, None).map_err(|e| anyhow!(e))?;
-    let backend = Arc::new(super::local::LocalBackend::new(vm_name, run_as));
+    validate_serve_flags(true, vm_name, run_as, None, None, None).map_err(|e| anyhow!(e))?;
+    // SAFETY: geteuid has no preconditions.
+    let broker_uid = unsafe { libc::geteuid() };
+    check_job_user(&SystemDb, run_as, broker_uid).map_err(|e| anyhow!(e))?;
+    let lock = acquire_serve_lock()?;
+    let key = load_or_create_host_key()?;
+    let backend = Arc::new(LocalBackend::terminal(vm_name, DEFAULT_WORKER_SOCKET));
     let lines = vec![
         format!("  backend     : local (jobs run on this machine as {run_as})"),
         format!("  VM name     : {vm_name}"),
-        format!("  worker dir  : {}", backend.paths().dir.display()),
+        format!("  worker sock : {DEFAULT_WORKER_SOCKET}"),
     ];
-    run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker and its worker.").await
+    run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker keeps running under systemd).").await
 }
 
 fn acquire_serve_lock() -> Result<FileLock> {
