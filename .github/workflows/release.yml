@@ -101,11 +101,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macos-15 (Apple silicon): GitHub retired the macos-14 image, and the
+          # v0.4.0 tag's macOS legs were refused with "The configuration
+          # 'macos-14-arm64-us-default' is not supported". x86_64-apple-darwin
+          # cross-compiles here via `rustup target add`, as it did on macos-14.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             cross: false
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             cross: false
           - target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
