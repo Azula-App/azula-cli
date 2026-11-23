@@ -162,12 +162,12 @@ mod host {
     use super::*;
 
     pub(super) async fn create(_: &str, _: &str, _: u32, _: u64, _: u64, _: &str) -> Result<()> {
-        die(2, crate::compute::HOST_ONLY_MSG)
+        die(2, crate::compute::VM_CREATE_ONLY_MSG)
     }
     pub(super) fn list(_: bool) -> Result<()> {
-        die(2, crate::compute::HOST_ONLY_MSG)
+        die(2, crate::compute::VM_CREATE_ONLY_MSG)
     }
     pub(super) fn delete(_: &str) -> Result<()> {
-        die(2, crate::compute::HOST_ONLY_MSG)
+        die(2, crate::compute::VM_CREATE_ONLY_MSG)
     }
 }

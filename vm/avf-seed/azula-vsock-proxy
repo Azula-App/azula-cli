@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Guest half of azula's userspace networking for Android AVF hosts.
+
+An AVF VM started by a third-party app has no network device (VM networking
+is reserved to Google's Terminal app), and the app can't accept vsock
+connections that the guest initiates. So the host app keeps a few idle
+host->guest vsock connections open to VSOCK_PORT, and this shim hands each
+local TCP client on 127.0.0.1:3128 one of them. The host end speaks HTTP
+proxy: CONNECT for TLS (apt over https, git, cargo, pip, npm) and absolute-form
+requests for plain http. Jobs find it through HTTP(S)_PROXY in
+/etc/azula/job-env (azula-guest --job-env-file).
+"""
+import os
+import queue
+import select
+import socket
+import threading
+
+VSOCK_PORT = int(os.environ.get("AZULA_PROXY_VSOCK_PORT", "3129"))
+LISTEN = ("127.0.0.1", int(os.environ.get("AZULA_PROXY_PORT", "3128")))
+WAIT_S = 30
+
+pool: "queue.Queue[socket.socket]" = queue.Queue()
+
+
+def accept_host() -> None:
+    srv = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    srv.bind((socket.VMADDR_CID_ANY, VSOCK_PORT))
+    srv.listen(64)
+    while True:
+        conn, _ = srv.accept()
+        pool.put(conn)
+
+
+def alive(s: socket.socket) -> bool:
+    """An idle pooled connection is usable unless the host already closed it."""
+    r, _, _ = select.select([s], [], [], 0)
+    if not r:
+        return True
+    try:
+        return s.recv(1, socket.MSG_PEEK) != b""
+    except OSError:
+        return False
+
+
+def take_host() -> "socket.socket | None":
+    while True:
+        try:
+            s = pool.get(timeout=WAIT_S)
+        except queue.Empty:
+            return None
+        if alive(s):
+            return s
+        s.close()
+
+
+def pipe(src: socket.socket, dst: socket.socket) -> None:
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def serve(client: socket.socket) -> None:
+    host = take_host()
+    if host is None:
+        client.sendall(b"HTTP/1.1 503 azula host proxy unavailable\r\nContent-Length: 0\r\n\r\n")
+        client.close()
+        return
+    back = threading.Thread(target=pipe, args=(host, client), daemon=True)
+    back.start()
+    pipe(client, host)
+    back.join()
+    client.close()
+    host.close()
+
+
+def main() -> None:
+    threading.Thread(target=accept_host, daemon=True).start()
+    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lst.bind(LISTEN)
+    lst.listen(128)
+    while True:
+        client, _ = lst.accept()
+        threading.Thread(target=serve, args=(client,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

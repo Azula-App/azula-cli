@@ -1,5 +1,8 @@
 //! Remote compute: run commands in a disposable Linux VM on an Apple silicon
-//! Mac, from anywhere, over iroh. See `vm/README.md` (frames, guest and helper
+//! Mac (or, with `compute serve --local`, on a Linux machine that is already
+//! an isolated VM, such as Android's Linux Terminal, as an unprivileged job
+//! user behind a systemd-activated socket; `compute local-setup` installs
+//! that), from anywhere, over iroh. See `vm/README.md` (frames, guest and helper
 //! protocols, bundles) and `vm/BROKER.md` (this module's contract) in the
 //! repository, and the `remote-compute-vm` change in azula-docs.
 //!
@@ -8,7 +11,12 @@
 //! * [`vm`] — the [`vm::VmBackend`] trait the broker drives.
 //! * [`broker`] — `compute serve`: authenticate, authorize, splice.
 //! * [`client`] — the cross-platform `exec`/`doctor`/`vm` client.
-//! * `vmmgr` / `host` — the real VM manager and host verbs (macOS only).
+//! * `vmmgr` — the real VM manager (macOS only).
+//! * `local` — the Linux backend (`--local`): connects to a worker already
+//!   listening on a Unix socket (systemd-activated, or attached) and checks
+//!   the job user.
+//! * `local_setup` — `compute local-setup`: job user and systemd units.
+//! * `host` — the host key, grants and `serve` (macOS and Linux).
 
 use std::path::PathBuf;
 
@@ -21,8 +29,12 @@ pub mod out;
 pub mod seed;
 pub mod tarx;
 pub mod transfer;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod host;
+#[cfg(any(target_os = "linux", test))]
+pub mod local;
+#[cfg(any(target_os = "linux", test))]
+pub mod local_setup;
 #[cfg(target_os = "macos")]
 pub mod vmmgr;
 pub mod vm;
@@ -43,7 +55,10 @@ pub fn agent() -> String {
 pub const QUIC_TIMEOUTS: (std::time::Duration, std::time::Duration) = (std::time::Duration::from_secs(2), std::time::Duration::from_secs(10));
 
 /// Why a host verb cannot run here.
-pub const HOST_ONLY_MSG: &str = "compute hosting requires Apple silicon macOS";
+pub const HOST_ONLY_MSG: &str = "compute hosting requires Apple silicon macOS (or Linux with `azula compute serve --local`)";
+
+/// Why `vm create|delete|list` cannot run here.
+pub const VM_CREATE_ONLY_MSG: &str = "creating VMs requires Apple silicon macOS";
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)

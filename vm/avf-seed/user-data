@@ -1,0 +1,96 @@
+#cloud-config
+# cloud-init NoCloud seed for an azula compute VM hosted by the Android AVF
+# prototype app (vm/android-host). Same shape as the Mac's seed (BROKER.md §8),
+# except: azula-guest and the proxy shim come from this ISO instead of a
+# virtiofs share, and the guest has no NIC, so all of its internet goes
+# through the host app's HTTP proxy over vsock (azula-vsock-proxy).
+hostname: azula-avf
+users:
+  - name: azula
+    gecos: azula job user
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+ssh_pwauth: false
+write_files:
+  - path: /etc/systemd/system/azula-guest.service
+    content: |
+      [Unit]
+      Description=azula guest worker
+      [Service]
+      ExecStart=/usr/local/bin/azula-guest --vsock-port 1024 --run-as azula --job-env-file /etc/azula/job-env
+      Restart=always
+      RestartSec=1
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/azula-vsock-proxy.service
+    content: |
+      [Unit]
+      Description=azula HTTP proxy shim (127.0.0.1:3128 -> host app over vsock 3129)
+      [Service]
+      ExecStart=/usr/bin/python3 /usr/local/bin/azula-vsock-proxy
+      Restart=always
+      RestartSec=1
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/azula-timesync.service
+    content: |
+      [Unit]
+      Description=azula clock sync over the host proxy (no RTC, no NIC)
+      After=azula-vsock-proxy.service
+      Wants=azula-vsock-proxy.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/python3 /usr/local/bin/azula-timesync
+  - path: /etc/systemd/system/azula-timesync.timer
+    content: |
+      [Unit]
+      Description=Resync the azula guest clock
+      [Timer]
+      OnBootSec=5s
+      OnUnitActiveSec=5min
+      [Install]
+      WantedBy=timers.target
+  - path: /etc/azula/job-env
+    content: |
+      HTTP_PROXY=http://127.0.0.1:3128
+      HTTPS_PROXY=http://127.0.0.1:3128
+      http_proxy=http://127.0.0.1:3128
+      https_proxy=http://127.0.0.1:3128
+      NO_PROXY=localhost,127.0.0.1,::1
+      no_proxy=localhost,127.0.0.1,::1
+  - path: /etc/profile.d/azula-proxy.sh
+    content: |
+      set -a; . /etc/azula/job-env; set +a
+  - path: /etc/apt/apt.conf.d/90azula-proxy
+    content: |
+      Acquire::http::Proxy "http://127.0.0.1:3128";
+      Acquire::https::Proxy "http://127.0.0.1:3128";
+  - path: /etc/gitconfig
+    content: |
+      [http]
+      	proxy = http://127.0.0.1:3128
+  - path: /etc/systemd/resolved.conf.d/azula.conf
+    content: |
+      [Resolve]
+      LLMNR=no
+      MulticastDNS=no
+runcmd:
+  - [mkdir, -p, /mnt/seed]
+  - [sh, -c, "mount -o ro LABEL=cidata /mnt/seed || mount -o ro /dev/vdb /mnt/seed"]
+  - [install, -m, "0755", /mnt/seed/azula-guest, /usr/local/bin/azula-guest]
+  - [install, -m, "0755", /mnt/seed/azula-vsock-proxy, /usr/local/bin/azula-vsock-proxy]
+  - [install, -m, "0755", /mnt/seed/azula-timesync, /usr/local/bin/azula-timesync]
+  - [umount, /mnt/seed]
+  # no NIC: don't stall every boot for 2 minutes waiting for one
+  - [systemctl, mask, systemd-networkd-wait-online.service]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, azula-vsock-proxy.service, azula-guest.service, azula-timesync.timer]
+  - [systemctl, start, azula-timesync.service]
+  - [systemctl, disable, --now, ssh.service, ssh.socket]
+  - [systemctl, mask, --now, sshd-vsock.socket, sshd-unix-local.socket]
+  - [systemctl, restart, systemd-resolved.service]
+  - [sh, -c, "echo \"AZULA-SEED guest=$(systemctl is-active azula-guest) proxy=$(systemctl is-active azula-vsock-proxy) uptime=$(cut -d' ' -f1 /proc/uptime)\" > /dev/console"]
+  # https mirrors, so apt needs only CONNECT from the proxy
+  - [sh, -c, "sed -i 's#http://deb.debian.org#https://deb.debian.org#g; s#http://security.debian.org#https://security.debian.org#g' /etc/apt/sources.list.d/*.sources 2>/dev/null; true"]
+  - [sh, -c, "(apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential git file) > /var/log/azula-provision.log 2>&1; rc=$?; echo \"provision rc=$rc\" >> /var/log/azula-provision.log; echo \"AZULA-SEED provision rc=$rc uptime=$(cut -d' ' -f1 /proc/uptime)\" > /dev/console"]

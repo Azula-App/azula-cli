@@ -1,6 +1,7 @@
 //! azula-guest: the job worker that runs inside the azula remote-compute VM.
 //! Protocol: vm/README.md sections 1 and 2.
 
+pub mod activation;
 pub mod files;
 pub mod frame;
 pub mod identity;

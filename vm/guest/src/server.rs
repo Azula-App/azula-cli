@@ -40,6 +40,10 @@ pub struct Config {
     pub max_bytes: u64,
     /// Test only: pretend the disk is full after this many output bytes.
     pub disk_limit: Option<u64>,
+    /// Extra environment for every job, applied after the clean base and
+    /// before the request's own `env` (`--job-env-file`). Hosts without a
+    /// NIC use it to point jobs at a proxy.
+    pub job_env: Vec<(String, String)>,
 }
 
 impl Config {
@@ -56,6 +60,7 @@ impl Config {
             max_age: Duration::from_secs(24 * 3600),
             max_bytes: 2 << 30,
             disk_limit: None,
+            job_env: Vec::new(),
         }
     }
 }

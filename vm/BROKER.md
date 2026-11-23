@@ -88,10 +88,12 @@ attribute work correctly.
 
 ## 7. CLI
 
-Host verbs (Apple silicon macOS only; elsewhere they exit 2 with "compute hosting requires
-Apple silicon macOS"):
+Host verbs (Apple silicon macOS, or Linux through `serve --local`, §9; elsewhere they exit 2 with
+"compute hosting requires Apple silicon macOS (or Linux with `azula compute serve --local`)"):
 
-- `azula compute serve [--allow-sleep]` — foreground broker. Banner: endpoint id, relay URL,
+- `azula compute local-setup` — Linux only, once, `sudo`: job user, worker and broker systemd
+  units (§9).
+- `azula compute serve [--allow-sleep]` — foreground broker (macOS; Linux: §9). Banner: endpoint id, relay URL,
   VM dir. A second instance fails at once ("already running, pid N"; `serve.lock`). While any
   VM it started is running, it holds an idle-sleep assertion (`caffeinate -i -w <pid>`) unless
   `--allow-sleep`. Closing the lid still sleeps the Mac. On SIGINT/SIGTERM it stops every VM it
@@ -262,3 +264,50 @@ in `/etc` overrides the generator's units in `/run`. The worker is enabled befor
 
 The worker runs straight from the read-only share, so every boot runs the host's current
 `azula-guest`. No copy into the guest is needed.
+
+## 9. Local backend (Linux)
+
+- On Linux `compute serve` requires `--local`: the machine itself is the sandbox, so jobs run on
+  it directly. Use it only where the machine is already an isolated VM (e.g. Android's Linux
+  Terminal). Flags: `--local`, `--vm-name NAME` (default `default`), `--run-as USER` (default
+  `azula`). `compute grant|grants|revoke` work on Linux too; `vm create|delete|list` stay
+  macOS-only ("creating VMs requires Apple silicon macOS"); `--allow-sleep` is rejected.
+- `LocalBackend` (`src/compute/local.rs`) serves exactly one VM, named by `--vm-name`, and is
+  **connect-only**: the broker never spawns, signals or stops the worker. Two modes share it and
+  differ only in the socket and the user checks.
+- **Terminal mode** (`serve --local`): the worker is reached on `/run/azula/worker.sock`, created
+  by systemd socket activation. `azula-guest.socket` has `SocketUser=<broker user>`,
+  `SocketMode=0600`, so only the broker's user can connect; `azula-guest.service` runs
+  `azula-guest --systemd-socket --run-as azula --state-dir /var/lib/azula-guest` as `User=azula`
+  (not root), with `MemoryMax=` = RAM minus 1 GiB so job page cache can't push the VM into its
+  host's low-memory killer. The worker never holds root, so jobs **and file operations (put/get,
+  README §2.7-2.8)** run with the job user's privileges: a client can't `push` over the broker's
+  host key, its grant store or a sudoers file.
+- **Job-user checks** (Terminal mode only), before the endpoint is bound: `serve --local` exits
+  nonzero, naming the violation, if the `--run-as` user does not exist, is uid 0, is the broker's
+  own user, or is in `sudo`/`wheel` (member list or primary group).
+- **`azula compute local-setup`** (Linux, `sudo`, idempotent) sets this up: creates user `azula`
+  (`useradd -m -s /bin/bash`), installs the guest binary to `/usr/local/lib/azula/azula-guest`,
+  creates `/var/lib/azula-guest` (0700, `azula`), writes `azula-guest.socket`,
+  `azula-guest.service` and `azula-compute.service` (`User=$SUDO_USER`, `Restart=always`,
+  `ExecStart=<azula> compute serve --local`) in `/etc/systemd/system`, then `systemctl
+  daemon-reload` and `enable --now azula-guest.socket azula-compute.service`. It refuses unless
+  root with `SUDO_USER` set to a non-root user, and rewrites a file only when its content differs.
+  Because systemd owns the worker, a broker restart leaves jobs running and attachable.
+- Guest binary lookup (for `local-setup`): `$AZULA_GUEST_BIN`, else `azula-guest` or
+  `azula-guest.linux-aarch64` next to the executable, else `azula-guest` on `PATH`.
+- `start` waits (polling `ping` every 1 s, up to 30 s; the first connection makes systemd start
+  the worker) and is idempotent; failure is `vm_start_failed`. `stop` fails with `unsupported`
+  (stopping the host from a client would end the machine's own session) and `shutdown` is a
+  no-op. `vm status` reports image `local`, network `host`, and this machine's online CPUs and
+  `MemTotal`.
+- A grant with `vms:["*"]` maps to `default`, so `--vm-name default` lets `compute exec` omit `--vm`.
+- **Attach mode** (`--worker-socket PATH`, absolute): for a broker running as a child of an Android
+  app that boots a Debian VM through AVF and bridges the guest's `azula-guest` (vsock port 1024) to
+  a Unix socket. The worker is in another VM, so no user checks run (Android has no `/etc/passwd`)
+  and `--run-as` is ignored. `start` polls `ping` every 1 s for up to 180 s (the VM may still be
+  booting; timeout is `vm_start_failed`), `state` is `running` iff the socket answers a ping,
+  `stop` fails with `unsupported` (the app owns the VM) and `shutdown` is a no-op. `vm status`
+  reports image `avf`, network `proxy`, and CPUs/RAM from the optional `--vm-cpus N` /
+  `--vm-memory-mb M` (default 0; only valid with `--worker-socket`). There the worker is a root
+  worker in a dedicated VM, which is a safe place for it.

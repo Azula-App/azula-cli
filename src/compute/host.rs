@@ -1,5 +1,7 @@
-//! Host-side orchestration (macOS): the dedicated host key, `host.json`, the
-//! `serve.lock`, `compute serve` itself and grant minting (`vm/BROKER.md` §6).
+//! Host-side orchestration (macOS and Linux): the dedicated host key,
+//! `host.json`, the `serve.lock`, `compute serve` itself and grant minting
+//! (`vm/BROKER.md` §6). Only `serve` differs by platform: the macOS one drives
+//! the VM manager, the Linux one (`--local`) the local backend (§9).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,8 +16,11 @@ use tracing::info;
 use super::broker::Broker;
 use super::vm::VmBackend;
 use super::grants::{create_private_dir, unix_now, write_private_atomic, FileLock, Grant, GrantStore, MintOptions, Token};
+#[cfg(target_os = "macos")]
 use super::vmmgr::{find_guest_bin, find_helper, install_guest_bin, Paths, RealBackend};
-use super::{compute_dir, vm_dir, ALPN};
+#[cfg(target_os = "macos")]
+use super::vm_dir;
+use super::{compute_dir, ALPN};
 use crate::endpoint::{bind_with_options, print_banner, EndpointOptions};
 
 /// `host.json`: where the host can be reached.
@@ -64,14 +69,11 @@ fn grant_store() -> GrantStore {
     GrantStore::new(compute_dir())
 }
 
-/// `compute serve`: run the broker until SIGINT/SIGTERM, then stop every VM
-/// it started.
+/// `compute serve` on macOS: run the broker until SIGINT/SIGTERM, then stop
+/// every VM it started.
+#[cfg(target_os = "macos")]
 pub async fn serve(allow_sleep: bool) -> Result<()> {
-    let dir = compute_dir();
-    create_private_dir(&dir)?;
-    let Some(_lock) = FileLock::try_exclusive(&lock_path())? else {
-        bail!("`azula compute serve` is already running on this host (holding {})", lock_path().display());
-    };
+    let lock = acquire_serve_lock()?;
     let key = load_or_create_host_key()?;
 
     let paths = Paths::new(vm_dir());
@@ -80,6 +82,57 @@ pub async fn serve(allow_sleep: bool) -> Result<()> {
     install_guest_bin(&paths, &guest_bin)?;
     std::fs::create_dir_all(paths.vms())?;
 
+    let backend = Arc::new(RealBackend::new(paths.clone(), helper).allow_sleep(allow_sleep));
+    let guard_task = backend.spawn_sleep_guard();
+    let vm_dir_line = format!("  VM dir      : {}", paths.root.display());
+    run_broker(backend, key, lock, vec![vm_dir_line], "  Mint a token with `azula compute grant`; Ctrl-C stops the broker and its VMs.").await?;
+    guard_task.abort();
+    Ok(())
+}
+
+/// `compute serve --local` on Linux: connect to a worker this machine already
+/// runs. With `attach` that is the externally managed worker's socket; without
+/// it, Terminal mode: the systemd-activated `/run/azula/worker.sock`, and the
+/// job user must pass [`super::local::check_job_user`] before anything binds.
+#[cfg(target_os = "linux")]
+pub async fn serve_local(vm_name: &str, run_as: &str, attach: Option<super::local::AttachOpts>) -> Result<()> {
+    use super::local::{check_job_user, validate_serve_flags, AttachOpts, LocalBackend, SystemDb, DEFAULT_WORKER_SOCKET};
+    if let Some(a) = attach {
+        validate_serve_flags(true, vm_name, run_as, Some(&a.socket), Some(a.cpus), Some(a.memory_mb)).map_err(|e| anyhow!(e))?;
+        let lock = acquire_serve_lock()?;
+        let key = load_or_create_host_key()?;
+        let AttachOpts { socket, .. } = a.clone();
+        let lines = vec![
+            "  backend     : attached worker (externally managed VM)".to_owned(),
+            format!("  VM name     : {vm_name}"),
+            format!("  worker sock : {}", socket.display()),
+        ];
+        let backend = Arc::new(LocalBackend::attach(vm_name, a));
+        return run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker is left running).").await;
+    }
+    validate_serve_flags(true, vm_name, run_as, None, None, None).map_err(|e| anyhow!(e))?;
+    // SAFETY: geteuid has no preconditions.
+    let broker_uid = unsafe { libc::geteuid() };
+    check_job_user(&SystemDb, run_as, broker_uid).map_err(|e| anyhow!(e))?;
+    let lock = acquire_serve_lock()?;
+    let key = load_or_create_host_key()?;
+    let backend = Arc::new(LocalBackend::terminal(vm_name, DEFAULT_WORKER_SOCKET));
+    let lines = vec![
+        format!("  backend     : local (jobs run on this machine as {run_as})"),
+        format!("  VM name     : {vm_name}"),
+        format!("  worker sock : {DEFAULT_WORKER_SOCKET}"),
+    ];
+    run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker keeps running under systemd).").await
+}
+
+fn acquire_serve_lock() -> Result<FileLock> {
+    create_private_dir(&compute_dir())?;
+    FileLock::try_exclusive(&lock_path())?.ok_or_else(|| anyhow!("`azula compute serve` is already running on this host (holding {})", lock_path().display()))
+}
+
+/// Bind the host key, publish `host.json`, serve the broker over `backend`
+/// until SIGINT/SIGTERM, then stop everything the backend started.
+async fn run_broker<B: VmBackend>(backend: Arc<B>, key: SecretKey, _lock: FileLock, extra_banner: Vec<String>, footer: &str) -> Result<()> {
     let mut opts = EndpointOptions::new(key);
     opts.alpns = vec![ALPN.to_vec()];
     opts.online_timeout = Some(Duration::from_secs(30));
@@ -89,30 +142,22 @@ pub async fn serve(allow_sleep: bool) -> Result<()> {
     let relay = endpoint.addr().relay_urls().next().map(|u| u.to_string()).ok_or_else(|| anyhow!("the endpoint has no home relay"))?;
     write_host_info(&HostInfo { endpoint_id: id.clone(), relay_url: relay.clone(), updated: unix_now() })?;
 
-    let backend = Arc::new(RealBackend::new(paths.clone(), helper).allow_sleep(allow_sleep));
-    let guard_task = backend.spawn_sleep_guard();
     let host = gethostname::gethostname().to_string_lossy().into_owned();
     let broker = Broker::new(backend.clone(), grant_store(), host);
     let watcher = broker.spawn_watcher();
     let router = Router::builder(endpoint).accept(ALPN, broker).spawn();
 
-    print_banner(
-        "azula compute",
-        &[
-            format!("  endpoint id : {id}"),
-            format!("  relay       : {relay}"),
-            format!("  VM dir      : {}", paths.root.display()),
-            String::new(),
-            "  Mint a token with `azula compute grant`; Ctrl-C stops the broker and its VMs.".to_owned(),
-        ],
-    );
+    let mut lines = vec![format!("  endpoint id : {id}"), format!("  relay       : {relay}")];
+    lines.extend(extra_banner);
+    lines.push(String::new());
+    lines.push(footer.to_owned());
+    print_banner("azula compute", &lines);
 
     wait_for_shutdown_signal().await;
     info!("shutting down: stopping VMs");
     watcher.abort();
     let _ = router.shutdown().await;
     backend.shutdown().await;
-    guard_task.abort();
     Ok(())
 }
 
