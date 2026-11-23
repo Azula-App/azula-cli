@@ -264,6 +264,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "azula-android-host-jni"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "azula",
+ "jni 0.21.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "azula-demos"
 version = "0.1.0"
 dependencies = [

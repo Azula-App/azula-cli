@@ -877,10 +877,7 @@ mod host {
 
     /// A grant without its secret hash, for display.
     fn public_grant(g: &crate::compute::grants::Grant) -> Value {
-        json!({
-            "id": g.id, "label": g.label, "created": g.created, "expires": g.expires, "ops": g.ops, "vms": g.vms,
-            "revoked": g.revoked, "last_used": g.last_used, "last_peer": g.last_peer,
-        })
+        g.public_json()
     }
 
     pub(super) fn grants(json: bool) -> Result<()> {

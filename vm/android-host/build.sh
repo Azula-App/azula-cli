@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds app.azula.avfhost with only the Android SDK + a JDK (no Gradle).
-# Usage: AZULA_BROKER_BIN=/path/to/static-aarch64-azula ./build.sh
+# Usage: AZULA_HOST_SO=/path/to/libazula_host.so ./build.sh   (JNI broker, preferred)
+#    or: AZULA_BROKER_BIN=/path/to/static-aarch64-azula ./build.sh  (exec'd child broker)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -12,6 +13,7 @@ JAVAC="$JDK/javac"; KEYTOOL="$JDK/keytool"; JAR="$JDK/jar"
 BYPASS_VER="${BYPASS_VER:-6.2}"
 B=.build
 BROKER="${AZULA_BROKER_BIN:-}"
+HOSTSO="${AZULA_HOST_SO:-}"
 
 rm -rf "$B/classes" "$B/stubs" "$B/apk" "$B/dex"
 mkdir -p "$B/classes" "$B/stubs" "$B/dl" "$B/apk/lib/arm64-v8a" "$B/dex"
@@ -35,24 +37,35 @@ HAB="$B/dl/hiddenapibypass-$BYPASS_VER.jar"
 "$BT/d8" --min-api 34 --lib "$AJAR" --output "$B/dex" "$B/app-classes.jar" "$HAB"
 
 # 5. link manifest, add dex + native lib
+# AZULA_APP_ID installs the prototype under another application id (code and
+# component class names stay in app.azula.avfhost).
 "$BT/aapt2" link --manifest AndroidManifest.xml -I "$AJAR" \
+  ${AZULA_APP_ID:+--rename-manifest-package "$AZULA_APP_ID"} \
   --min-sdk-version 34 --target-sdk-version 35 -o "$B/base.apk"
 cp "$B/dex/classes.dex" "$B/apk/classes.dex"
+if [ -n "$HOSTSO" ]; then
+  cp "$HOSTSO" "$B/apk/lib/arm64-v8a/libazula_host.so"
+fi
 if [ -n "$BROKER" ]; then
   cp "$BROKER" "$B/apk/lib/arm64-v8a/libazula.so"
-else
-  echo "warning: AZULA_BROKER_BIN not set; APK will have no libazula.so" >&2
+fi
+if [ -z "$HOSTSO$BROKER" ]; then
+  echo "warning: neither AZULA_HOST_SO nor AZULA_BROKER_BIN set; APK has no broker" >&2
   rmdir "$B/apk/lib/arm64-v8a" "$B/apk/lib"
 fi
 cp "$B/base.apk" "$B/unaligned.apk"
 (cd "$B/apk" && zip -q -r ../unaligned.apk .)
 
-# 6. align + sign with a debug keystore
-if [ ! -f "$B/debug.keystore" ]; then
-  "$KEYTOOL" -genkeypair -keystore "$B/debug.keystore" -storepass android -keypass android \
-    -alias debug -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=avfhost debug" >/dev/null 2>&1
+# 6. align + sign with the standard Android debug keystore, so every checkout and
+# worktree signs the same way and `install -r` keeps the installed app's data
+# (a per-worktree keystore made each rebuild incompatible with the installed app).
+KS=${AZULA_DEBUG_KEYSTORE:-$HOME/.android/debug.keystore}
+if [ ! -f "$KS" ]; then
+  mkdir -p "$(dirname "$KS")"
+  "$KEYTOOL" -genkeypair -keystore "$KS" -storepass android -keypass android \
+    -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
 fi
 "$BT/zipalign" -f -p 4 "$B/unaligned.apk" "$B/aligned.apk"
-"$BT/apksigner" sign --ks "$B/debug.keystore" --ks-pass pass:android --key-pass pass:android \
+"$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
   --out "$B/avfhost.apk" "$B/aligned.apk"
 echo "built $B/avfhost.apk"

@@ -15,7 +15,7 @@
 //!
 //! The module also compiles under `cfg(test)` on other Unixes so the pure
 //! parts (flag validation, user checks) are unit-tested everywhere.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};

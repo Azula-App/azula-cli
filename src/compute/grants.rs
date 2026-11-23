@@ -114,6 +114,15 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 impl Grant {
+    /// The grant without its secret hash, for display (`compute grant --json`,
+    /// `compute grants --json`, the Android host library).
+    pub fn public_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id, "label": self.label, "created": self.created, "expires": self.expires, "ops": self.ops, "vms": self.vms,
+            "revoked": self.revoked, "last_used": self.last_used, "last_peer": self.last_peer,
+        })
+    }
+
     pub fn allows_op(&self, op: &str) -> bool {
         self.ops.iter().any(|o| o == op)
     }
