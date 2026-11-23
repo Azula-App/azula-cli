@@ -45,6 +45,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      artifacts_only:
+        description: "Build-only run: produce the Android host and seed assets as workflow artifacts. A dispatch never publishes, whatever this is set to."
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,6 +67,7 @@ concurrency:
 jobs:
   version-guard:
     name: Verify tag matches Cargo.toml version
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
@@ -95,6 +102,7 @@ jobs:
   build-and-release:
     name: Build ${{ matrix.target }}
     needs: version-guard
+    if: ${{ github.event_name == 'push' }}
     permissions:
       contents: write
     strategy:
@@ -205,9 +213,116 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Android host library for azula-app (openspec change compute-android-app-host).
+  # Runs on a tag (after version-guard) and on a manual build-only dispatch
+  # (version-guard is skipped, so it needs the explicit if).
+  android-host:
+    name: Build libazula_host.so (aarch64-linux-android)
+    needs: version-guard
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.version-guard.result == 'success') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Rust comes from mise.toml - do not restate the version here.
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      - name: Add Android target
+        run: rustup target add aarch64-linux-android
+
+      # The runner ships the NDK (ANDROID_NDK_LATEST_HOME); build-android.sh
+      # picks it up and detects the linux-x86_64 prebuilt.
+      - name: Build libazula_host.so
+        run: android-host-jni/build-android.sh
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version-guard.outputs.version || format('0.0.0-dispatch.{0}', github.run_number) }}"
+          ARCHIVE="azula-host-android-${VERSION}-aarch64.tar.gz"
+          tar -C target/aarch64-linux-android/release -czf "$ARCHIVE" libazula_host.so
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to GitHub Release
+        if: ${{ github.event_name == 'push' }}
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: azula-host-android
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  # The cloud-init seed ISO. build-seed.sh is macOS-only (hdiutil), so it gets
+  # its own macOS job rather than a Linux ISO tool.
+  avf-seed:
+    name: Build azula-avf-seed ISO
+    needs: version-guard
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.version-guard.result == 'success') }}
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Rust comes from mise.toml - do not restate the version here.
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      # build-seed.sh builds the static azula-guest itself (vm/guest/build.sh).
+      - name: Build seed ISO
+        id: seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version-guard.outputs.version || format('0.0.0-dispatch.{0}', github.run_number) }}"
+          ISO="azula-avf-seed-${VERSION}.iso"
+          vm/avf-seed/build-seed.sh "$PWD/$ISO"
+          shasum -a 256 "$ISO" > "${ISO}.sha256"
+          echo "iso=${ISO}" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to GitHub Release
+        if: ${{ github.event_name == 'push' }}
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            ${{ steps.seed.outputs.iso }}
+            ${{ steps.seed.outputs.iso }}.sha256
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: azula-avf-seed
+          path: |
+            ${{ steps.seed.outputs.iso }}
+            ${{ steps.seed.outputs.iso }}.sha256
+          if-no-files-found: error
+
   publish-crates:
     name: Publish to crates.io
     needs: [version-guard, build-and-release]
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC) — no CARGO_REGISTRY_TOKEN secret. crates.io
     # verifies this workflow's identity against the trusted publisher
@@ -241,7 +356,7 @@ jobs:
     # Trusted Publishing needs no secret, so there is nothing to gate on
     # otherwise. Flip `PUBLISH_NPM` to `true` once all five packages exist
     # and each has a trusted publisher configured — see dist/README.md.
-    if: ${{ vars.PUBLISH_NPM == 'true' }}
+    if: ${{ github.event_name == 'push' && vars.PUBLISH_NPM == 'true' }}
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC) — no NPM_TOKEN. npm matches this workflow's
     # identity against the trusted publisher configured on EACH package
@@ -322,7 +437,7 @@ jobs:
     # whole workflow file invalid — every run fails at startup in 0s with
     # "This run likely failed because of a workflow file issue", including
     # runs for jobs that have nothing to do with this one.
-    if: ${{ vars.PUBLISH_HOMEBREW == 'true' }}
+    if: ${{ github.event_name == 'push' && vars.PUBLISH_HOMEBREW == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout azula-cli (formula template)

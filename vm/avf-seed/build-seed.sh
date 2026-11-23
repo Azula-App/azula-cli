@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the cloud-init NoCloud seed ISO (label "cidata") for the Android AVF
 # host prototype: user-data + meta-data + the static azula-guest + the vsock
-# proxy shim. macOS only (hdiutil), like the Mac broker's seed.
+# proxy shim. macOS only (hdiutil), like the Mac broker's seed; release.yml builds
+# it on a macOS runner.
 #   vm/avf-seed/build-seed.sh [OUT_ISO]   (default: vm/avf-seed/.build/seed.iso)
 set -eu
 DIR=$(cd "$(dirname "$0")" && pwd)
