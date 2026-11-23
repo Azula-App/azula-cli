@@ -1,10 +1,15 @@
 package app.azula.avfhost;
 
 import android.content.Context;
+import app.azula.vmhost.AzulaHost;
 import java.io.File;
 import java.util.Map;
 
-/** Runs libazula.so (the azula CLI) as a child process, restarting it on exit. */
+/**
+ * Runs the attach-mode broker. With libazula_host.so packaged it runs in this
+ * process through {@link AzulaHost}; otherwise (prototype fallback) it execs
+ * libazula.so (the azula CLI) as a child and restarts it on exit.
+ */
 final class Broker {
     private final Context ctx;
     private volatile boolean running;
@@ -12,6 +17,16 @@ final class Broker {
     private Thread thread;
 
     Broker(Context ctx) { this.ctx = ctx; }
+
+    static boolean jni(Context ctx) { return new File(ctx.getApplicationInfo().nativeLibraryDir, "libazula_host.so").exists(); }
+
+    static String config(Context ctx) {
+        File f = ctx.getFilesDir();
+        return "{\"computeDir\":\"" + new File(f, "compute").getAbsolutePath()
+                + "\",\"vmName\":\"default\",\"workerSocket\":\"" + new File(f, "run/worker.sock").getAbsolutePath()
+                + "\",\"vmCpus\":" + Runtime.getRuntime().availableProcessors()
+                + ",\"vmMemoryMb\":4096,\"logFile\":\"" + new File(f, "logs/broker.log").getAbsolutePath() + "\"}";
+    }
 
     static File bin(Context ctx) { return new File(ctx.getApplicationInfo().nativeLibraryDir, "libazula.so"); }
 
@@ -36,6 +51,16 @@ final class Broker {
         new File(f, "compute").mkdirs();
         new File(f, "azvm").mkdirs();
         while (running) {
+            if (jni(ctx)) {
+                String err = AzulaHost.start(config(ctx));
+                if (err.isEmpty()) {
+                    Log.to("host", "broker: running in-process (libazula_host.so)");
+                    return;
+                }
+                Log.to("host", "broker: start failed: " + err);
+                try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
+                continue;
+            }
             try {
                 File bin = bin(ctx);
                 String[] cmd = {bin.getAbsolutePath(), "compute", "serve", "--local",
@@ -63,6 +88,11 @@ final class Broker {
 
     void stop() {
         running = false;
+        if (jni(ctx)) {
+            AzulaHost.stop();
+            Log.to("host", "broker: stopped");
+            return;
+        }
         Process p = proc;
         if (p != null) p.destroy();
         if (thread != null) thread.interrupt();

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds app.azula.avfhost with only the Android SDK + a JDK (no Gradle).
-# Usage: AZULA_BROKER_BIN=/path/to/static-aarch64-azula ./build.sh
+# Usage: AZULA_HOST_SO=/path/to/libazula_host.so ./build.sh   (JNI broker, preferred)
+#    or: AZULA_BROKER_BIN=/path/to/static-aarch64-azula ./build.sh  (exec'd child broker)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -12,6 +13,7 @@ JAVAC="$JDK/javac"; KEYTOOL="$JDK/keytool"; JAR="$JDK/jar"
 BYPASS_VER="${BYPASS_VER:-6.2}"
 B=.build
 BROKER="${AZULA_BROKER_BIN:-}"
+HOSTSO="${AZULA_HOST_SO:-}"
 
 rm -rf "$B/classes" "$B/stubs" "$B/apk" "$B/dex"
 mkdir -p "$B/classes" "$B/stubs" "$B/dl" "$B/apk/lib/arm64-v8a" "$B/dex"
@@ -38,10 +40,14 @@ HAB="$B/dl/hiddenapibypass-$BYPASS_VER.jar"
 "$BT/aapt2" link --manifest AndroidManifest.xml -I "$AJAR" \
   --min-sdk-version 34 --target-sdk-version 35 -o "$B/base.apk"
 cp "$B/dex/classes.dex" "$B/apk/classes.dex"
+if [ -n "$HOSTSO" ]; then
+  cp "$HOSTSO" "$B/apk/lib/arm64-v8a/libazula_host.so"
+fi
 if [ -n "$BROKER" ]; then
   cp "$BROKER" "$B/apk/lib/arm64-v8a/libazula.so"
-else
-  echo "warning: AZULA_BROKER_BIN not set; APK will have no libazula.so" >&2
+fi
+if [ -z "$HOSTSO$BROKER" ]; then
+  echo "warning: neither AZULA_HOST_SO nor AZULA_BROKER_BIN set; APK has no broker" >&2
   rmdir "$B/apk/lib/arm64-v8a" "$B/apk/lib"
 fi
 cp "$B/base.apk" "$B/unaligned.apk"

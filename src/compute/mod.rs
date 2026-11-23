@@ -12,11 +12,12 @@
 //! * [`broker`] — `compute serve`: authenticate, authorize, splice.
 //! * [`client`] — the cross-platform `exec`/`doctor`/`vm` client.
 //! * `vmmgr` — the real VM manager (macOS only).
-//! * `local` — the Linux backend (`--local`): connects to a worker already
+//! * `local` — the Linux/Android backend (`--local`): connects to a worker already
 //!   listening on a Unix socket (systemd-activated, or attached) and checks
 //!   the job user.
 //! * `local_setup` — `compute local-setup`: job user and systemd units.
-//! * `host` — the host key, grants and `serve` (macOS and Linux).
+//! * `host` — the host key, grants and `serve` (macOS and Linux; on Android only
+//!   the attach-mode broker, `host::run_attach_broker`, for the JNI host library).
 
 use std::path::PathBuf;
 
@@ -29,9 +30,9 @@ pub mod out;
 pub mod seed;
 pub mod tarx;
 pub mod transfer;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 pub mod host;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 pub mod local;
 #[cfg(any(target_os = "linux", test))]
 pub mod local_setup;

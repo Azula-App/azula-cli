@@ -1,6 +1,7 @@
 package app.azula.avfhost;
 
 import android.app.Notification;
+import app.azula.vmhost.AzulaHost;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
@@ -28,6 +29,7 @@ public class HostService extends Service {
     /** Test hook: finish and remove the activity task even while the screen is off. */
     static final String ACTION_CLOSE_UI = "app.azula.avfhost.CLOSE_UI";
     static final String ACTION_MINT = "app.azula.avfhost.MINT";
+    static final String ACTION_REVOKE = "app.azula.avfhost.REVOKE";
     static final String VM_NAME = "azula";
     static final String U_BOOT = "/apex/com.android.virt/etc/u-boot.bin";
     static final long DISK_BYTES = 16L << 30;
@@ -62,6 +64,10 @@ public class HostService extends Service {
                 final String ttl = str(intent, "ttl", "6h");
                 final String label = str(intent, "label", "avfhost");
                 new Thread(() -> mint(ttl, label), "mint").start();
+                break;
+            case ACTION_REVOKE:
+                final String rid = str(intent, "id", "");
+                new Thread(() -> revoke(rid), "revoke").start();
                 break;
             default:
                 new Thread(this::startAll, "start").start();
@@ -259,6 +265,13 @@ public class HostService extends Service {
     private void mint(String ttl, String label) {
         try {
             File out = new File(getFilesDir(), "token.json");
+            if (Broker.jni(this)) {
+                String json = AzulaHost.mintGrant(ttl, label);
+                try (FileOutputStream f = new FileOutputStream(out)) { f.write(json.getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+                Os.chmod(out.getAbsolutePath(), 0600);
+                Log.to("host", "mint (jni) wrote " + json.length() + " bytes to " + out);
+                return;
+            }
             ProcessBuilder pb = new ProcessBuilder(Broker.bin(this).getAbsolutePath(), "compute", "grant",
                     "--ttl", ttl, "--label", label, "--json");
             Broker.env(this, pb.environment());
@@ -272,6 +285,21 @@ public class HostService extends Service {
             Log.to("host", "mint rc=" + rc + " wrote " + data.length + " bytes to " + out);
         } catch (Throwable e) {
             Log.to("host", "mint failed: " + e);
+        }
+    }
+
+    /** Revokes grant {@code id}, or the one in token.json when empty (JNI broker only). */
+    private void revoke(String id) {
+        try {
+            if (id.isEmpty()) {
+                File tf = new File(getFilesDir(), "token.json");
+                id = new org.json.JSONObject(new String(Files.readAllBytes(tf.toPath()), java.nio.charset.StandardCharsets.UTF_8))
+                        .getJSONObject("grant").getString("id");
+            }
+            boolean ok = AzulaHost.revoke(id);
+            Log.to("host", "revoke " + id + " -> " + ok + "; grants: " + AzulaHost.listGrants());
+        } catch (Throwable e) {
+            Log.to("host", "revoke failed: " + e);
         }
     }
 }

@@ -1,4 +1,5 @@
-//! Host-side orchestration (macOS and Linux): the dedicated host key,
+//! Host-side orchestration (macOS, Linux and, for the attach-mode broker only,
+//! Android): the dedicated host key,
 //! `host.json`, the `serve.lock`, `compute serve` itself and grant minting
 //! (`vm/BROKER.md` §6). Only `serve` differs by platform: the macOS one drives
 //! the VM manager, the Linux one (`--local`) the local backend (§9).
@@ -85,7 +86,7 @@ pub async fn serve(allow_sleep: bool) -> Result<()> {
     let backend = Arc::new(RealBackend::new(paths.clone(), helper).allow_sleep(allow_sleep));
     let guard_task = backend.spawn_sleep_guard();
     let vm_dir_line = format!("  VM dir      : {}", paths.root.display());
-    run_broker(backend, key, lock, vec![vm_dir_line], "  Mint a token with `azula compute grant`; Ctrl-C stops the broker and its VMs.").await?;
+    run_broker(backend, key, lock, vec![vm_dir_line], "  Mint a token with `azula compute grant`; Ctrl-C stops the broker and its VMs.", wait_for_shutdown_signal(), || {}).await?;
     guard_task.abort();
     Ok(())
 }
@@ -96,19 +97,10 @@ pub async fn serve(allow_sleep: bool) -> Result<()> {
 /// job user must pass [`super::local::check_job_user`] before anything binds.
 #[cfg(target_os = "linux")]
 pub async fn serve_local(vm_name: &str, run_as: &str, attach: Option<super::local::AttachOpts>) -> Result<()> {
-    use super::local::{check_job_user, validate_serve_flags, AttachOpts, LocalBackend, SystemDb, DEFAULT_WORKER_SOCKET};
+    use super::local::{check_job_user, validate_serve_flags, LocalBackend, SystemDb, DEFAULT_WORKER_SOCKET};
     if let Some(a) = attach {
         validate_serve_flags(true, vm_name, run_as, Some(&a.socket), Some(a.cpus), Some(a.memory_mb)).map_err(|e| anyhow!(e))?;
-        let lock = acquire_serve_lock()?;
-        let key = load_or_create_host_key()?;
-        let AttachOpts { socket, .. } = a.clone();
-        let lines = vec![
-            "  backend     : attached worker (externally managed VM)".to_owned(),
-            format!("  VM name     : {vm_name}"),
-            format!("  worker sock : {}", socket.display()),
-        ];
-        let backend = Arc::new(LocalBackend::attach(vm_name, a));
-        return run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker is left running).").await;
+        return run_attach_broker(vm_name, a, || {}, wait_for_shutdown_signal()).await;
     }
     validate_serve_flags(true, vm_name, run_as, None, None, None).map_err(|e| anyhow!(e))?;
     // SAFETY: geteuid has no preconditions.
@@ -122,7 +114,34 @@ pub async fn serve_local(vm_name: &str, run_as: &str, attach: Option<super::loca
         format!("  VM name     : {vm_name}"),
         format!("  worker sock : {DEFAULT_WORKER_SOCKET}"),
     ];
-    run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker keeps running under systemd).").await
+    run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker keeps running under systemd).", wait_for_shutdown_signal(), || {}).await
+}
+
+/// The attach-mode broker (`vm/BROKER.md` §9): connect to a worker something
+/// else manages on `opts.socket` (the AVF VM of the Android host app), serve
+/// the broker over iroh, and return once `shutdown` resolves. `on_ready` runs
+/// after the endpoint is bound and `host.json` is written, i.e. when a
+/// `compute grant` can already name this host. Does not touch the worker's
+/// lifecycle. Used by `compute serve --local --worker-socket` and by the JNI
+/// host library. Callers validate the flags
+/// ([`super::local::validate_serve_flags`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub async fn run_attach_broker(
+    vm_name: &str,
+    opts: super::local::AttachOpts,
+    on_ready: impl FnOnce(),
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    use super::local::LocalBackend;
+    let lock = acquire_serve_lock()?;
+    let key = load_or_create_host_key()?;
+    let lines = vec![
+        "  backend     : attached worker (externally managed VM)".to_owned(),
+        format!("  VM name     : {vm_name}"),
+        format!("  worker sock : {}", opts.socket.display()),
+    ];
+    let backend = Arc::new(LocalBackend::attach(vm_name, opts));
+    run_broker(backend, key, lock, lines, "  Mint a token with `azula compute grant`; Ctrl-C stops the broker (the worker is left running).", shutdown, on_ready).await
 }
 
 fn acquire_serve_lock() -> Result<FileLock> {
@@ -132,7 +151,15 @@ fn acquire_serve_lock() -> Result<FileLock> {
 
 /// Bind the host key, publish `host.json`, serve the broker over `backend`
 /// until SIGINT/SIGTERM, then stop everything the backend started.
-async fn run_broker<B: VmBackend>(backend: Arc<B>, key: SecretKey, _lock: FileLock, extra_banner: Vec<String>, footer: &str) -> Result<()> {
+async fn run_broker<B: VmBackend>(
+    backend: Arc<B>,
+    key: SecretKey,
+    _lock: FileLock,
+    extra_banner: Vec<String>,
+    footer: &str,
+    shutdown: impl std::future::Future<Output = ()>,
+    on_ready: impl FnOnce(),
+) -> Result<()> {
     let mut opts = EndpointOptions::new(key);
     opts.alpns = vec![ALPN.to_vec()];
     opts.online_timeout = Some(Duration::from_secs(30));
@@ -153,7 +180,8 @@ async fn run_broker<B: VmBackend>(backend: Arc<B>, key: SecretKey, _lock: FileLo
     lines.push(footer.to_owned());
     print_banner("azula compute", &lines);
 
-    wait_for_shutdown_signal().await;
+    on_ready();
+    shutdown.await;
     info!("shutting down: stopping VMs");
     watcher.abort();
     let _ = router.shutdown().await;
@@ -161,6 +189,7 @@ async fn run_broker<B: VmBackend>(backend: Arc<B>, key: SecretKey, _lock: FileLo
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
