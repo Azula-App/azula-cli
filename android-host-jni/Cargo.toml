@@ -2,7 +2,7 @@
 name = "azula-android-host-jni"
 version = "0.1.0"
 edition = "2021"
-description = "libazula_host.so: the attach-mode compute broker behind a small JNI surface, for the azula Android app's AVF host."
+description = "libazula_host.so: the attach-mode compute broker and an xz decoder behind a small JNI surface, for the azula Android app's AVF host."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -23,3 +23,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The xz decoder behind `NativeXz`. `static` because Android has no liblzma of its own, `parallel`
+# for the threaded decoder, and no `bindgen` (the default), so building it needs no libclang.
+# 0.4.9 bundles xz 5.8.4: before 5.8.1 the threaded decoder has CVE-2025-31115.
+[target.'cfg(unix)'.dependencies]
+liblzma = { version = "0.4.9", default-features = false, features = ["static", "parallel"] }
