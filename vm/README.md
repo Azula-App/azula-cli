@@ -114,6 +114,10 @@ never blocks it and never loses output that is still retained.
   confirm it holds every byte.
 - → `{"t":"stdin"}` + payload and → `{"t":"stdin_eof"}` (only with `"stdin":true`);
   → `{"t":"cancel"}` cancels the job (SIGTERM to its process group, SIGKILL after 5 s).
+  The worker takes stdin as fast as it arrives and never waits for the child, so a
+  `cancel` is not stuck behind unread input. What the child has not read beyond
+  4 MiB waits in an unlinked file in the job's directory; if that cannot be
+  written (a full disk), the job is cancelled with reason `stdin_lost`.
 - **The connection closing does not cancel the job**, except:
   - `"stdin":true` and `stdin_eof` not yet received: the job's input is
     incomplete, so it is cancelled with reason `stdin_lost`;

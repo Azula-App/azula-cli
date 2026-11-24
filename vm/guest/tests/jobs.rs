@@ -1,6 +1,6 @@
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 use serde_json::json;
@@ -252,6 +252,64 @@ fn stdin_lost_cancels_job() {
     let j = wait_state(&env, "g_a", &id, "exited");
     assert_eq!(j["reason"], "stdin_lost");
     assert!(j["code"].is_null());
+}
+
+/// More than the worker keeps in memory, to a child that isn't reading: all of it
+/// arrives, in order.
+#[test]
+fn a_slow_child_gets_all_of_a_large_stdin_in_order() {
+    let env = start();
+    let mut c = env.client();
+    c.send(
+        merge(
+            exec_req("g_a", &["sh", "-c", "sleep 1; cat"]),
+            json!({"stdin":true}),
+        ),
+        &[],
+    );
+    assert_eq!(c.recv().t, "started");
+    let want: Vec<u8> = (0..24usize << 20).map(|i| (i % 251) as u8).collect();
+    for chunk in want.chunks(256 * 1024) {
+        c.send(json!({"t":"stdin"}), chunk);
+    }
+    c.send(json!({"t":"stdin_eof"}), &[]);
+    let r = c.collect();
+    assert!(
+        r.stdout == want,
+        "stdout differs from stdin ({} of {} bytes)",
+        r.stdout.len(),
+        want.len()
+    );
+    assert_eq!(r.h("code"), 0);
+}
+
+/// A child that never reads its stdin must not delay a cancel behind the stdin
+/// queued in front of it, nor the disconnect that cancels a job.
+#[test]
+fn cancel_and_disconnect_are_not_stuck_behind_unread_stdin() {
+    let env = start();
+    for cancel in [true, false] {
+        let mut c = env.client();
+        c.send(
+            merge(exec_req("g_a", &["sleep", "7799"]), json!({"stdin":true})),
+            &[],
+        );
+        let id = c.recv().header["job"].as_str().unwrap().to_string();
+        for _ in 0..80 {
+            c.send(json!({"t":"stdin"}), &vec![9u8; 256 * 1024]);
+        }
+        let t = Instant::now();
+        let reason = if cancel {
+            c.send(json!({"t":"cancel"}), &[]);
+            "cancelled"
+        } else {
+            drop(c);
+            "stdin_lost"
+        };
+        let j = wait_state(&env, "g_a", &id, "exited");
+        assert_eq!(j["reason"], reason);
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    }
 }
 
 #[test]

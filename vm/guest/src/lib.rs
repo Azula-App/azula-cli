@@ -8,6 +8,7 @@ pub mod identity;
 pub mod jobs;
 pub mod server;
 pub mod sha256;
+pub mod stdin_queue;
 pub mod util;
 
 #[cfg(target_os = "linux")]

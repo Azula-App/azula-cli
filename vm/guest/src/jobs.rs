@@ -24,6 +24,7 @@ use crate::frame::{read_frame, Frame};
 use crate::identity::{resolve, Identity};
 use crate::server::{send, send_error, Conn, Server};
 use crate::sha256::Sha256;
+use crate::stdin_queue::{self, Item};
 use crate::util::{lock, now_s, random_hex, write_atomic};
 
 const CHUNK: usize = 64 * 1024;
@@ -363,7 +364,7 @@ fn build_command(req: &ExecReq, id: &Identity, cwd: &str, job_env: &[(String, St
     cmd
 }
 
-type StdinTx = Sender<Option<Vec<u8>>>;
+type StdinTx = stdin_queue::Sender;
 
 struct Started {
     job: Arc<Job>,
@@ -508,18 +509,18 @@ fn start_job(srv: &Arc<Server>, req: &ExecReq) -> Result<Started, (&'static str,
     srv.prune();
 
     let stdin = child.stdin.take().map(|mut pipe| {
-        let (stx, srx) = mpsc::channel::<Option<Vec<u8>>>();
+        let (stx, srx) = stdin_queue::channel(job.dir.clone());
         let jb = Arc::clone(&job);
         thread::spawn(move || {
             loop {
                 match srx.recv() {
-                    Ok(Some(chunk)) => {
+                    Item::Data(chunk) => {
                         if pipe.write_all(&chunk).is_err() {
                             return;
                         }
                     }
-                    Ok(None) => return, // stdin_eof: drop closes the pipe
-                    Err(_) => {
+                    Item::Eof => return, // stdin_eof: drop closes the pipe
+                    Item::HungUp => {
                         // Client vanished without stdin_eof: keep the pipe
                         // open so the stdin_lost cancel lands first.
                         while jb.is_running() {
@@ -807,13 +808,18 @@ fn spawn_reader<C: Conn>(
             match f.t.as_str() {
                 "stdin" => {
                     if let Some(s) = &stdin {
-                        let _ = s.send(Some(f.payload));
+                        // A full disk is the only way this fails, and the input
+                        // can't have a hole in it.
+                        if let Err(e) = s.data(f.payload) {
+                            eprintln!("azula-guest: queueing stdin of {}: {e}", job.id);
+                            job.cancel("stdin_lost");
+                        }
                     }
                 }
                 "stdin_eof" => {
                     got_eof = true;
                     if let Some(s) = &stdin {
-                        let _ = s.send(None);
+                        s.eof();
                     }
                 }
                 "cancel" => {
