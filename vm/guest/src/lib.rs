@@ -4,6 +4,7 @@
 pub mod activation;
 pub mod files;
 pub mod frame;
+pub mod fscreds;
 pub mod identity;
 pub mod jobs;
 pub mod server;

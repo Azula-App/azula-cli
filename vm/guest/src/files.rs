@@ -1,10 +1,10 @@
 //! Resumable file transfer: put and get (vm/README.md 2.7, 2.8).
+//!
+//! The target and its part file are touched as the job user (`AsUser`), the
+//! upload records as the worker.
 
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::frame::{read_frame, Frame};
-use crate::identity::{resolve, Identity};
+use crate::fscreds::AsUser;
+use crate::identity::resolve;
 use crate::server::{send, send_error, Server};
 use crate::sha256::Sha256;
 use crate::util::{now_s, valid_id, write_atomic};
@@ -39,37 +40,40 @@ fn resolve_path(home: &str, p: &str) -> Result<PathBuf, String> {
     })
 }
 
-fn cpath(p: &Path) -> io::Result<CString> {
-    CString::new(p.as_os_str().as_bytes()).map_err(|_| io::ErrorKind::InvalidInput.into())
-}
-
-fn chown_to(p: &Path, id: &Identity) {
-    if let Ok(c) = cpath(p) {
-        unsafe { libc::chown(c.as_ptr(), id.uid, id.gid) };
-    }
-}
-
 /// Remove part files (and their records) untouched for 24 h.
 pub fn prune_stale_parts(srv: &Server) {
     let Ok(rd) = fs::read_dir(srv.uploads_dir()) else {
         return;
     };
-    for e in rd.flatten() {
-        let rec_path = e.path();
-        let Some(up) = fs::read(&rec_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Upload>(&b).ok())
-        else {
-            continue;
+    let mut uploads: Vec<(PathBuf, Upload)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let up = serde_json::from_slice(&fs::read(e.path()).ok()?).ok()?;
+            Some((e.path(), up))
+        })
+        .collect();
+    if uploads.is_empty() {
+        return;
+    }
+    {
+        // The path may lead somewhere else by now, so not as root.
+        let _user = match AsUser::enter(&resolve(&srv.cfg.run_as)) {
+            Ok(u) => u,
+            Err(e) => return eprintln!("azula-guest: pruning part files: {e}"),
         };
-        let stale = match fs::metadata(&up.part) {
-            Ok(m) => now_s().saturating_sub(m.mtime().max(0) as u64) > PART_MAX_AGE_S,
-            Err(_) => true,
-        };
-        if stale {
-            let _ = fs::remove_file(&up.part);
-            let _ = fs::remove_file(&rec_path);
-        }
+        uploads.retain(|(_, up)| {
+            let stale = match fs::metadata(&up.part) {
+                Ok(m) => now_s().saturating_sub(m.mtime().max(0) as u64) > PART_MAX_AGE_S,
+                Err(_) => true,
+            };
+            if stale {
+                let _ = fs::remove_file(&up.part);
+            }
+            stale
+        });
+    }
+    for (rec_path, _) in uploads {
+        let _ = fs::remove_file(rec_path);
     }
 }
 
@@ -78,7 +82,7 @@ fn io_err<C: Write>(conn: &mut C, e: &io::Error) {
 }
 
 /// Ensure the parent directory exists (creating it if `mkdirs`).
-fn ensure_parent(parent: &Path, mkdirs: bool, id: &Identity) -> Result<(), (&'static str, String)> {
+fn ensure_parent(parent: &Path, mkdirs: bool) -> Result<(), (&'static str, String)> {
     let mut missing = Vec::new();
     let mut cur = parent;
     loop {
@@ -118,7 +122,6 @@ fn ensure_parent(parent: &Path, mkdirs: bool, id: &Identity) -> Result<(), (&'st
     for d in missing.into_iter().rev() {
         fs::create_dir(d).map_err(|e| ("io_error", format!("{}: {e}", d.display())))?;
         let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o755));
-        chown_to(d, id);
     }
     Ok(())
 }
@@ -174,21 +177,27 @@ pub fn put<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C, reader: &mut im
     if name == ".." || name == "." {
         return send_error(conn, "bad_request", "path has no file name");
     }
-    if fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
-        || fs::metadata(&target).is_ok_and(|m| m.is_dir())
     {
-        return send_error(conn, "is_a_directory", "target is a directory");
-    }
-    if !overwrite && fs::symlink_metadata(&target).is_ok() {
-        return send_error(conn, "exists", "target exists and overwrite is false");
-    }
-    if let Err((code, msg)) = ensure_parent(parent, mkdirs, &id) {
-        return send_error(conn, code, &msg);
+        let _user = match AsUser::enter(&id) {
+            Ok(u) => u,
+            Err(e) => return io_err(conn, &e),
+        };
+        if fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
+            || fs::metadata(&target).is_ok_and(|m| m.is_dir())
+        {
+            return send_error(conn, "is_a_directory", "target is a directory");
+        }
+        if !overwrite && fs::symlink_metadata(&target).is_ok() {
+            return send_error(conn, "exists", "target exists and overwrite is false");
+        }
+        if let Err((code, msg)) = ensure_parent(parent, mkdirs) {
+            return send_error(conn, code, &msg);
+        }
     }
     let part = parent.join(format!(".{name}.azula-{upload}.part"));
     let target_s = target.to_string_lossy().into_owned();
 
-    // Upload ownership record.
+    // Upload ownership record: the worker's own file.
     let rec_path = srv.uploads_dir().join(format!("{upload}.json"));
     match fs::read(&rec_path)
         .ok()
@@ -215,6 +224,11 @@ pub fn put<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C, reader: &mut im
         }
     }
 
+    // The job user again, until only the record is left to remove.
+    let user = match AsUser::enter(&id) {
+        Ok(u) => u,
+        Err(e) => return io_err(conn, &e),
+    };
     let mut pf = match OpenOptions::new()
         .read(true)
         .write(true)
@@ -227,7 +241,6 @@ pub fn put<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C, reader: &mut im
         Ok(f) => f,
         Err(e) => return io_err(conn, &e),
     };
-    chown_to(&part, &id);
     let offset = match pf.metadata() {
         Ok(m) if m.is_file() => m.len(),
         Ok(_) => return send_error(conn, "io_error", "part file is not a regular file"),
@@ -265,14 +278,16 @@ pub fn put<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C, reader: &mut im
                 let (Some(want_size), Some(want_sha)) = (want_size, want_sha) else {
                     return send_error(conn, "bad_request", "eof needs size and sha256");
                 };
-                let fail = |conn: &mut C, code: &str, msg: String| {
+                let fail = |conn: &mut C, user: AsUser, code: &str, msg: String| {
                     let _ = fs::remove_file(&part);
+                    drop(user);
                     let _ = fs::remove_file(&rec_path);
                     send_error(conn, code, &msg);
                 };
                 if want_size != size {
                     return fail(
                         conn,
+                        user,
                         "size_mismatch",
                         format!("received {size} bytes, client says {want_size}"),
                     );
@@ -281,15 +296,13 @@ pub fn put<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C, reader: &mut im
                 if !got.eq_ignore_ascii_case(want_sha) {
                     return fail(
                         conn,
+                        user,
                         "digest_mismatch",
                         format!("sha256 is {got}, client says {want_sha}"),
                     );
                 }
                 let finish = || -> io::Result<()> {
                     pf.set_permissions(fs::Permissions::from_mode(mode))?;
-                    if unsafe { libc::fchown(pf.as_raw_fd(), id.uid, id.gid) } != 0 && id.switch {
-                        return Err(io::Error::last_os_error());
-                    }
                     pf.sync_all()?;
                     if overwrite {
                         fs::rename(&part, &target)?;
@@ -300,7 +313,9 @@ pub fn put<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C, reader: &mut im
                     crate::util::fsync_dir(parent);
                     Ok(())
                 };
-                match finish() {
+                let finished = finish();
+                drop(user);
+                match finished {
                     Ok(()) => {
                         let _ = fs::remove_file(&rec_path);
                         let _ = send(
@@ -341,6 +356,11 @@ pub fn get<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C) {
     let target = match resolve_path(&id.home, path) {
         Ok(t) => t,
         Err(m) => return send_error(conn, "bad_request", &m),
+    };
+    // The job user reads it, to the end of the transfer.
+    let _user = match AsUser::enter(&id) {
+        Ok(u) => u,
+        Err(e) => return io_err(conn, &e),
     };
     let md = match fs::metadata(&target) {
         Ok(m) => m,

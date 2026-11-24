@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::frame::{read_frame, Frame};
+use crate::fscreds::AsUser;
 use crate::identity::{resolve, Identity};
 use crate::server::{send, send_error, Conn, Server};
 use crate::sha256::Sha256;
@@ -335,7 +336,6 @@ fn build_command(req: &ExecReq, id: &Identity, cwd: &str, job_env: &[(String, St
     if let Some(env) = &req.env {
         cmd.envs(env);
     }
-    cmd.current_dir(cwd);
     cmd.stdin(if req.stdin.unwrap_or(false) {
         Stdio::piped()
     } else {
@@ -344,22 +344,35 @@ fn build_command(req: &ExecReq, id: &Identity, cwd: &str, job_env: &[(String, St
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.process_group(0);
     if id.switch {
-        if let Ok(name) = std::ffi::CString::new(id.name.clone()) {
+        let (name, dir) = (
+            std::ffi::CString::new(id.name.clone()),
+            std::ffi::CString::new(cwd),
+        );
+        if let (Ok(name), Ok(dir)) = (name, dir) {
             let (uid, gid) = (id.uid, id.gid);
             // std applies uid/gid before pre_exec closures, so do the whole
-            // initgroups + setgid + setuid sequence here, in that order.
+            // initgroups + setgid + setuid sequence here, in that order. It also
+            // changes directory before them, as root, so that is done here too.
             unsafe {
                 cmd.pre_exec(move || {
                     if libc::initgroups(name.as_ptr(), gid as _) != 0
                         || libc::setgid(gid) != 0
                         || libc::setuid(uid) != 0
+                        || libc::chdir(dir.as_ptr()) != 0
                     {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())
                 });
             }
+        } else {
+            // Can't happen (parse_exec refuses NUL), but never run as root.
+            unsafe {
+                cmd.pre_exec(|| Err(io::Error::from_raw_os_error(libc::EINVAL)));
+            }
         }
+    } else {
+        cmd.current_dir(cwd);
     }
     cmd
 }
@@ -431,7 +444,13 @@ fn start_job(srv: &Arc<Server>, req: &ExecReq) -> Result<Started, (&'static str,
             ),
         ));
     }
-    if !Path::new(&cwd).is_dir() {
+    // As the job user, like everything else a job reaches: root could enter
+    // directories (and tell whether they exist) that the job can't.
+    let cwd_ok = match AsUser::enter(&id) {
+        Ok(_user) => Path::new(&cwd).is_dir(),
+        Err(e) => return Err(("spawn_failed", e.to_string())),
+    };
+    if !cwd_ok {
         return Err(("cwd_missing", format!("no such directory: {cwd}")));
     }
 
@@ -1043,3 +1062,4 @@ pub fn cancel_job<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C) {
         &[],
     );
 }
+

@@ -6,6 +6,7 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -79,6 +80,11 @@ impl Server {
     pub fn open(cfg: Config) -> io::Result<Arc<Server>> {
         fs::create_dir_all(cfg.state_dir.join("jobs"))?;
         fs::create_dir_all(cfg.state_dir.join("uploads"))?;
+        // Jobs' records and output, and the salt: the worker's own. (With the
+        // root worker of a VM that is not a boundary while the job user has sudo.)
+        if let Err(e) = fs::set_permissions(&cfg.state_dir, fs::Permissions::from_mode(0o700)) {
+            eprintln!("azula-guest: {}: {e}", cfg.state_dir.display());
+        }
         let salt_path = cfg.state_dir.join("salt");
         let salt = match fs::read_to_string(&salt_path) {
             Ok(s) if !s.trim().is_empty() => s.trim().to_string(),

@@ -153,7 +153,10 @@ never blocks it and never loses output that is still retained.
 
 Jobs run as the `--run-as` user (default `azula`) with its uid/gid/groups and
 `HOME`, in their own process group. If the worker isn't root or the user is
-missing, jobs run as the worker's own user.
+missing, jobs (and put and get) run as the worker's own user. `cwd` is entered as
+that user too, so a directory it can't reach is `cwd_missing`. The state dir is mode
+0700, the worker's: jobs' records and output aren't the job user's to read. Where the
+job user has sudo, as in a Mac VM or an AVF VM, none of this confines the job.
 
 ### 2.7 put (file into the guest, resumable)
 - → `{"t":"put","owner":"g_…","path":"out/app.tgz","upload":"<client uuid>","mode":420,"overwrite":true,"mkdirs":true}`
@@ -172,17 +175,18 @@ missing, jobs run as the worker's own user.
   `exists` (target exists and `overwrite` is false), `is_a_directory`,
   `not_a_directory` (a parent is a file), `upload_conflict` (id in use for
   another path or owner), `size_mismatch`, `digest_mismatch`, `io_error`
-  (message includes the OS error, e.g. ENOSPC).
+  (message includes the OS error, e.g. ENOSPC, or EACCES where the run-as user
+  may not write).
 
 The bytes go to `.<name>.azula-<upload>.part` in the target's directory
 (`O_CREAT|O_NOFOLLOW`, mode 0600). Only when `eof` matches both size and
-digest does the worker `fchmod`, `fchown` to the run-as user (a no-op when the worker already
-runs as that user), `fsync` and
-`rename` over the target, so the target is always either the old file or the
-complete new one. If the connection drops before `eof`, the part file stays
-for resumption (24 h); a size or digest mismatch deletes it so the client
-restarts from 0. Concurrent puts to one path each complete atomically; the
-last rename wins.
+digest does the worker `fchmod`, `fsync` and `rename` over the target, so the
+target is always either the old file or the complete new one. The run-as user
+creates and so owns the part file, the target and any new parents (see 2.8); the
+record of the upload is the worker's own. If the connection drops before `eof`,
+the part file stays for resumption (24 h); a size or digest mismatch deletes it
+so the client restarts from 0. Concurrent puts to one path each complete
+atomically; the last rename wins.
 
 ### 2.8 get (file out of the guest, resumable)
 - → `{"t":"get","owner":"g_…","path":"out/app.tgz","offset":0,"etag":null}`
@@ -199,13 +203,22 @@ Symlinks are followed inside the guest; the final target must be a regular
 file. The client writes to a part file next to its destination and renames it
 into place only if `get_end` matches.
 
-File operations run as the worker. In a Mac VM or an AVF VM the worker is root
-and creates files owned by the run-as user; there that is not a privilege
-boundary (the job user has passwordless sudo), so put/get/attach/jobs are
-authorized exactly like exec. In the Linux local backend (BROKER.md section 9)
-the worker itself runs as the unprivileged job user, so put and get are
-confined to what that user may read and write, and the `fchown` is skipped.
-Nothing in this protocol can name a path on the host.
+Put and get have a job's access to files: what the run-as user may read and
+write. In a Mac VM or an AVF VM the worker is root, so for everything it does to
+the target, its part file and its parents (checks, mkdirs, open, read, write,
+chmod, rename, unlink, pruning) the connection's thread takes the run-as user's
+fsuid, fsgid and supplementary groups, with no effective capabilities, and goes
+back to its own for the upload records and the rest of the state dir. The kernel
+keeps credentials per thread, so other connections don't notice. If the kernel
+doesn't confirm the switch, that is an `io_error` and the file isn't opened. A
+path the run-as user can't reach is an `io_error` with the OS's message (a client
+that needs one uses exec with `sudo`). In the Linux local backend (BROKER.md
+section 9) the worker itself runs as the unprivileged job user, so nothing is
+switched.
+
+In those VMs this does not confine the client: the job user has passwordless
+sudo, and put/get/attach/jobs are authorized exactly like exec. Nothing in this
+protocol can name a path on the host.
 
 ## 3. Helper protocol (`azula-vm`)
 
