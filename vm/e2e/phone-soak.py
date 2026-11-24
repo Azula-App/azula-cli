@@ -9,7 +9,7 @@ cost (battery, temperature, thermal status).
 
     export AZULA_COMPUTE_TOKEN_FILE=/path/to/token      # 0600; a grant that outlives the soak
     vm/e2e/phone-soak.py start   --out soak/            # start the heartbeat job
-    vm/e2e/phone-soak.py monitor --out soak/ --adb 192.168.1.176:40983 --hours 10
+    vm/e2e/phone-soak.py monitor --out soak/ --adb 192.0.2.10:40983 --hours 10
     vm/e2e/phone-soak.py report  --out soak/            # pulls the heartbeat log, prints Markdown
 
 `monitor` is safe to stop (Ctrl-C) and restart: it appends to `samples.csv`.
