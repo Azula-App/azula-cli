@@ -24,6 +24,7 @@ use super::broker::Broker;
 use super::client::{self, AttachRequest, Dialer, Event, ExecRequest, Failure, Fault, JobRef, Outcome, Policy, Start};
 use super::frame::{read_frame, write_frame, Frame};
 use super::grants::{GrantStore, MintOptions, Token, OP_ADMIN, OP_EXEC, OP_VM};
+use super::local::{AttachOpts, LocalBackend};
 use super::transfer::{self, PullOptions, PushOptions, TransferError, TransferStore};
 use super::vm::{VmBackend, VmError, VmInfo, VmState};
 use super::ALPN;
@@ -91,6 +92,8 @@ struct Fake {
     changed_replies: AtomicUsize,
     tar_payload: Mutex<Vec<u8>>,
     last_stdin: Mutex<Vec<u8>>,
+    /// Connections the fake worker accepted.
+    conns: AtomicUsize,
 }
 
 fn sha_hex(b: &[u8]) -> String {
@@ -116,6 +119,7 @@ impl Fake {
         let me = self.clone();
         tokio::spawn(async move {
             while let Ok((s, _)) = listener.accept().await {
+                me.conns.fetch_add(1, SeqCst);
                 tokio::spawn(guest_conn(me.clone(), s));
             }
         });
@@ -546,11 +550,17 @@ fn no_reconnect() -> Policy {
 impl Harness {
     async fn new(tag: &str) -> Self {
         let fake = Fake::new(tag);
+        let backend = Arc::new(FakeBackend(fake.clone()));
+        Self::with_backend(tag, fake, backend).await
+    }
+
+    /// A broker over any backend; `fake` still serves the worker's socket.
+    async fn with_backend<B: VmBackend>(tag: &str, fake: Arc<Fake>, backend: Arc<B>) -> Self {
         let dir = std::env::temp_dir().join(format!("azg{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = GrantStore::new(&dir);
         let broker_ep = Endpoint::bind(presets::Minimal).await.unwrap();
-        let broker = Broker::with_watch_interval(Arc::new(FakeBackend(fake.clone())), store.clone(), "testhost".into(), Duration::from_millis(150));
+        let broker = Broker::with_watch_interval(backend, store.clone(), "testhost".into(), Duration::from_millis(150));
         let watcher = broker.spawn_watcher();
         let router = Router::builder(broker_ep.clone()).accept(ALPN, broker).spawn();
         let client_ep = Endpoint::bind(presets::Minimal).await.unwrap();
@@ -1164,6 +1174,72 @@ async fn vm_verbs_list_status_start_stop_and_guest_ping() {
 
     let ping = client::request_reply(h.session(&all).await.unwrap(), &Frame::of_type("ping"), Duration::from_secs(10)).await.unwrap();
     assert_eq!(ping.str_field("host"), Some("testhost"));
+    h.shutdown().await;
+}
+
+/// One warm request to a local worker opens two connections to it: the state
+/// probe, whose pong is then reused, and the request itself. `guest_ping` needs
+/// only the probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_warm_request_to_a_local_worker_opens_two_connections() {
+    let fake = Fake::new("warmconns");
+    fake.set_running("a");
+    let backend = LocalBackend::attach("a", AttachOpts { socket: fake.dir.join("a.sock"), cpus: 4, memory_mb: 2048 });
+    let h = Harness::with_backend("warmconns", fake, Arc::new(backend)).await;
+    let t = h.mint(&[OP_EXEC], &["a"]);
+
+    let (out, _) = h.exec(&t, req(&["echo", "hi"])).await;
+    assert!(matches!(out, Outcome::Exit { code: Some(0), .. }), "{out:?}");
+    assert_eq!(h.fake.conns.swap(0, SeqCst), 2, "a warm exec must not ping the worker twice");
+
+    let pong = client::request_reply(h.session(&t).await.unwrap(), &Frame::new(json!({"t":"guest_ping","vm":"a"})), Duration::from_secs(10)).await.unwrap();
+    assert_eq!(pong.str_field("hostname"), Some("fake-vm"));
+    assert_eq!(h.fake.conns.swap(0, SeqCst), 1);
+    h.shutdown().await;
+}
+
+/// Reports a worker as running, with a pong, however dead its socket is.
+struct StaleProbe(Arc<Fake>);
+
+impl VmBackend for StaleProbe {
+    fn names(&self) -> Result<Vec<String>, VmError> {
+        Ok(vec!["a".into()])
+    }
+    fn state(&self, _name: &str) -> Result<VmState, VmError> {
+        Ok(VmState::Running)
+    }
+    async fn probe(&self, _name: &str) -> Result<(VmState, Option<Value>), VmError> {
+        Ok((VmState::Running, Some(json!({"t": "pong"}))))
+    }
+    async fn info(&self, name: &str) -> Result<VmInfo, VmError> {
+        FakeBackend(self.0.clone()).info(name).await
+    }
+    async fn start(&self, _name: &str) -> Result<(), VmError> {
+        Ok(())
+    }
+    async fn stop(&self, _name: &str) -> Result<(), VmError> {
+        Ok(())
+    }
+    fn vsock_path(&self, name: &str) -> PathBuf {
+        self.0.dir.join(format!("{name}.sock"))
+    }
+    async fn shutdown(&self) {}
+}
+
+/// A worker can die between the probe and the request. Nothing has been sent by
+/// then, so the request waits for it to come back rather than failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_lost_after_the_probe_is_waited_for() {
+    let fake = Fake::new("staleprobe");
+    let h = Harness::with_backend("staleprobe", fake.clone(), Arc::new(StaleProbe(fake.clone()))).await;
+    let t = h.mint(&[OP_EXEC], &["a"]);
+    let late = fake.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        late.set_running("a");
+    });
+    let (out, _) = h.exec(&t, req(&["echo", "hi"])).await;
+    assert!(matches!(out, Outcome::Exit { code: Some(0), .. }), "{out:?}");
     h.shutdown().await;
 }
 

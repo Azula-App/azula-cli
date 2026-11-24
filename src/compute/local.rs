@@ -311,6 +311,17 @@ impl LocalBackend {
         }
     }
 
+    /// `current_state` without blocking the runtime, keeping the pong.
+    async fn current_state_and_pong(&self) -> (VmState, Option<serde_json::Value>) {
+        if self.inner.lock().unwrap().starting {
+            return (VmState::Starting, None);
+        }
+        match guest::ping(&self.socket, Duration::from_secs(1)).await {
+            Ok(pong) => (VmState::Running, Some(pong)),
+            Err(_) => (VmState::Stopped, None),
+        }
+    }
+
     /// Poll `ping` every [`START_POLL`] until the worker answers or `deadline`
     /// passes. (In Terminal mode the first connection makes systemd start it.)
     async fn wait_for_worker(&self, deadline: Duration) -> Result<(), VmError> {
@@ -344,17 +355,15 @@ impl VmBackend for LocalBackend {
         Ok(self.current_state())
     }
 
+    async fn probe(&self, name: &str) -> Result<(VmState, Option<serde_json::Value>), VmError> {
+        self.check(name)?;
+        Ok(self.current_state_and_pong().await)
+    }
+
     async fn info(&self, name: &str) -> Result<VmInfo, VmError> {
         self.check(name)?;
-        let state = self.current_state();
-        let (worker, pong) = if state == VmState::Running {
-            match guest::ping(&self.socket, Duration::from_secs(5)).await {
-                Ok(p) => ("ready", Some(p)),
-                Err(_) => ("unreachable", None),
-            }
-        } else {
-            ("unknown", None)
-        };
+        let (state, pong) = self.current_state_and_pong().await;
+        let worker = if state == VmState::Running { "ready" } else { "unknown" };
         let error = self.inner.lock().unwrap().error.clone();
         let shown = if state == VmState::Stopped && error.is_some() { "failed" } else { state.as_str() };
         let (image, network, cpus, memory_mb, disk_gb) = match &self.attach {
@@ -387,7 +396,7 @@ impl VmBackend for LocalBackend {
     async fn start(&self, name: &str) -> Result<(), VmError> {
         self.check(name)?;
         let _gate = self.gate.lock().await;
-        if self.current_state() == VmState::Running {
+        if self.current_state_and_pong().await.0 == VmState::Running {
             return Ok(());
         }
         self.inner.lock().unwrap().starting = true;

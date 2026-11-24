@@ -99,6 +99,13 @@ pub trait VmBackend: Send + Sync + 'static {
     fn names(&self) -> Result<Vec<String>, VmError>;
     /// Current state; `unknown_vm` if there is no such VM.
     fn state(&self, name: &str) -> Result<VmState, VmError>;
+    /// The state, plus the worker's `pong` when finding the state out took a
+    /// successful ping. A backend whose `state` pings overrides this, so one
+    /// request does not ping the worker twice. Unlike `state`, this must not
+    /// block the runtime.
+    fn probe(&self, name: &str) -> impl Future<Output = Result<(VmState, Option<Value>), VmError>> + Send {
+        async move { Ok((self.state(name)?, None)) }
+    }
     /// Full status, including a worker ping when running.
     fn info(&self, name: &str) -> impl Future<Output = Result<VmInfo, VmError>> + Send;
     /// Start the VM and return once its worker answers a ping. Idempotent:

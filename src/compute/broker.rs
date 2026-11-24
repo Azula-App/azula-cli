@@ -18,7 +18,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::frame::{read_frame, write_frame, Frame};
 use super::grants::{unix_now, Grant, GrantStore, OP_ADMIN, OP_EXEC, OP_VM};
@@ -194,7 +194,7 @@ impl<B: VmBackend> Broker<B> {
         let backend = &*self.inner.backend;
         let Ok(names) = backend.names() else { return };
         for name in names {
-            if backend.state(&name) != Ok(VmState::Running) {
+            if !matches!(backend.probe(&name).await, Ok((VmState::Running, _))) {
                 continue;
             }
             let sock = backend.vsock_path(&name);
@@ -315,7 +315,7 @@ impl<B: VmBackend> Broker<B> {
                     if op != "status" && !grant.allows_op(OP_VM) {
                         return Err(VmError::new("forbidden", format!("this grant does not allow `vm {op}`")));
                     }
-                    let state = backend.state(name)?;
+                    let (state, _) = backend.probe(name).await?;
                     match op {
                         "start" => backend.start(name).await?,
                         "stop" => {
@@ -354,10 +354,12 @@ impl<B: VmBackend> Broker<B> {
             return reply_err(send, "forbidden", format!("this grant does not cover VM `{name}`")).await;
         }
         let backend = &*self.inner.backend;
-        match backend.state(name) {
+        match backend.probe(name).await {
             Err(e) => return reply_err(send, e.code, e.msg).await,
-            Ok(VmState::Running) => {}
-            Ok(s) => return reply_err(send, "vm_not_running", format!("VM `{name}` is {}", s.as_str())).await,
+            // The probe just pinged the worker, so its answer is the answer.
+            Ok((VmState::Running, Some(pong))) => return reply(send, Frame::with_payload(pong, Vec::new()), "ok").await,
+            Ok((VmState::Running, None)) => {}
+            Ok((s, _)) => return reply_err(send, "vm_not_running", format!("VM `{name}` is {}", s.as_str())).await,
         }
         match guest::ping(&backend.vsock_path(name), Duration::from_secs(10)).await {
             Ok(pong) => reply(send, Frame::with_payload(pong, Vec::new()), "ok").await,
@@ -415,8 +417,8 @@ impl<B: VmBackend> Broker<B> {
         fwd.header.insert("owner".into(), json!(owner));
 
         let backend = &*self.inner.backend;
-        let state = match backend.state(&name) {
-            Ok(s) => s,
+        let (state, pong) = match backend.probe(&name).await {
+            Ok(p) => p,
             Err(e) => return reply_err(send, e.code, e.msg).await,
         };
         if state != VmState::Running {
@@ -431,13 +433,30 @@ impl<B: VmBackend> Broker<B> {
         // The helper closes the socket at once while the worker is not up, so
         // wait for a ping rather than retrying the request itself (which could
         // otherwise run a job twice).
+        // A warm worker already answered the state probe, so its request
+        // connection is the only other one this needs.
         let sock = backend.vsock_path(&name);
-        if let Err(e) = guest::wait_ready(&sock, WORKER_WAIT).await {
-            return reply_err(send, "worker_unreachable", format!("worker in `{name}` not answering: {e}")).await;
+        let warm = state == VmState::Running && pong.is_some();
+        let mut connected = None;
+        if warm {
+            // It can still die between the probe and here. Nothing has been sent
+            // yet, so fall through to waiting for it, as before.
+            match UnixStream::connect(&sock).await {
+                Ok(s) => connected = Some(s),
+                Err(e) => debug!(target: "azula::compute", "vm={name} warm connect failed ({e}); waiting for the worker"),
+            }
         }
-        let mut unix = match UnixStream::connect(&sock).await {
-            Ok(s) => s,
-            Err(e) => return reply_err(send, "worker_unreachable", format!("connect {}: {e}", sock.display())).await,
+        let mut unix = match connected {
+            Some(s) => s,
+            None => {
+                if let Err(e) = guest::wait_ready(&sock, WORKER_WAIT).await {
+                    return reply_err(send, "worker_unreachable", format!("worker in `{name}` not answering: {e}")).await;
+                }
+                match UnixStream::connect(&sock).await {
+                    Ok(s) => s,
+                    Err(e) => return reply_err(send, "worker_unreachable", format!("connect {}: {e}", sock.display())).await,
+                }
+            }
         };
         if write_frame(&mut unix, &fwd).await.is_err() {
             return reply_err(send, "worker_unreachable", "worker closed the connection").await;
