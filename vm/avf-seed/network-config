@@ -1,0 +1,14 @@
+# NoCloud network config for the AVF guest, which has no NIC at all.
+#
+# With no link it can bring online, systemd-networkd-wait-online runs to its
+# 2-minute timeout on the first boot, and cloud-init's network stage waits
+# behind it. user-data can't help, because its earliest hook runs after that
+# wait. cloud-init renders this file in its init-local stage, before networkd
+# starts. A dummy link with a TEST-NET-1 /32 comes up at once and satisfies the
+# wait. Nothing is routed through it: all guest traffic goes through the
+# host's proxy over vsock (azula-vsock-proxy).
+network:
+  version: 2
+  dummy-devices:
+    azula0:
+      addresses: [192.0.2.1/32]

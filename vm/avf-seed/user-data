@@ -82,7 +82,8 @@ runcmd:
   - [install, -m, "0755", /mnt/seed/azula-vsock-proxy, /usr/local/bin/azula-vsock-proxy]
   - [install, -m, "0755", /mnt/seed/azula-timesync, /usr/local/bin/azula-timesync]
   - [umount, /mnt/seed]
-  # no NIC: don't stall every boot for 2 minutes waiting for one
+  # No NIC. network-config's dummy link already satisfies wait-online, including on the
+  # first boot. Masking it as well skips the unit on later boots.
   - [systemctl, mask, systemd-networkd-wait-online.service]
   - [systemctl, daemon-reload]
   - [systemctl, enable, --now, azula-vsock-proxy.service, azula-guest.service, azula-timesync.timer]
