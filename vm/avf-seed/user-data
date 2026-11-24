@@ -51,6 +51,20 @@ write_files:
       OnUnitActiveSec=5min
       [Install]
       WantedBy=timers.target
+  - path: /etc/systemd/system/azula-provision.service
+    content: |
+      [Unit]
+      Description=azula first-boot tools (retries until they are in; the host app waits for it)
+      After=azula-vsock-proxy.service
+      Wants=azula-vsock-proxy.service
+      [Service]
+      ExecStart=/usr/local/bin/azula-provision
+      Restart=on-failure
+      RestartSec=5
+      StandardOutput=null
+      StandardError=journal
+      [Install]
+      WantedBy=multi-user.target
   - path: /etc/azula/job-env
     content: |
       HTTP_PROXY=http://127.0.0.1:3128
@@ -93,6 +107,7 @@ runcmd:
   - [install, -m, "0755", /mnt/seed/azula-guest, /usr/local/bin/azula-guest]
   - [install, -m, "0755", /mnt/seed/azula-vsock-proxy, /usr/local/bin/azula-vsock-proxy]
   - [install, -m, "0755", /mnt/seed/azula-timesync, /usr/local/bin/azula-timesync]
+  - [install, -m, "0755", /mnt/seed/azula-provision, /usr/local/bin/azula-provision]
   - [umount, /mnt/seed]
   # No NIC. network-config's dummy link already satisfies wait-online, including on the
   # first boot. Masking it as well skips the unit on later boots.
@@ -108,9 +123,10 @@ runcmd:
   # guest never uses but `apt-get update` would fetch
   - [sh, -c, "sed -i 's/^Types: deb deb-src$/Types: deb/' /etc/apt/sources.list.d/*.sources 2>/dev/null; true"]
   - [sh, -c, "sed -i 's#http://deb.debian.org#https://deb.debian.org#g; s#http://security.debian.org#https://security.debian.org#g' /etc/apt/sources.list.d/*.sources 2>/dev/null; true"]
-  # The first boot's tools. No recommends (they add 9 of 64 packages and nothing a build
-  # needs), no fsync per file (the VM is disposable until it's Ready), and no man-db index
-  # rebuild: together about 6 s of dpkg on the Pixel 10a. The man-db switch stays off, since
-  # jobs' own installs would pay for it too.
+  # The first boot's tools (azula-provision). It retries until git, gcc, make and file are
+  # there, reports each attempt on the console, and runs again at every boot, so a failed
+  # install (no network) fixes itself. Its apt call skips recommends (9 of 64 packages,
+  # nothing a build needs) and per-file fsync (the guest is disposable until it's Ready).
+  # The man-db index rebuild stays off, since jobs' own installs would pay for it too.
   - [rm, -f, /var/lib/man-db/auto-update]
-  - [sh, -c, "(apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends -o Dpkg::Options::=--force-unsafe-io build-essential git file) > /var/log/azula-provision.log 2>&1; rc=$?; echo \"provision rc=$rc\" >> /var/log/azula-provision.log; echo \"AZULA-SEED provision rc=$rc uptime=$(cut -d' ' -f1 /proc/uptime)\" > /dev/console"]
+  - [systemctl, enable, --now, --no-block, azula-provision.service]

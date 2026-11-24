@@ -1,0 +1,57 @@
+#!/bin/sh
+# Installs the guest's tools, and keeps trying until they are in.
+#
+# The host app waits for the line this prints on the console, once per attempt:
+#
+#   AZULA-SEED provision rc=<n> uptime=<s>
+#
+# rc=0 means the tools are really there (they run, whatever apt said), and only then
+# is the host Ready. Any other rc is a failed attempt, usually no network, and the next
+# one follows by itself. Runs on every boot: with the tools in place it reports at once,
+# offline, so a guest that has them is never held up.
+#
+# AZULA_PROVISION_RETRY_S (15) is for tests.
+set -u
+MARK=/var/lib/azula/provisioned
+LOG=/var/log/azula-provision.log
+RETRY_S=${AZULA_PROVISION_RETRY_S:-15}
+
+# build-essential brings gcc and make; git and file are named directly.
+have_tools() {
+  for t in git gcc make file; do command -v "$t" >/dev/null 2>&1 || return 1; done
+}
+
+report() {
+  echo "AZULA-SEED provision rc=$1 uptime=$(cut -d' ' -f1 /proc/uptime)" > /dev/console 2>/dev/null || true
+}
+
+# TLS needs a clock, and a guest without an RTC starts in the past. Bounded: without a
+# network there is nothing to sync with, and that mustn't hold up the attempt.
+sync_clock() {
+  timeout 25 systemctl start azula-timesync.service >/dev/null 2>&1 || true
+}
+
+install_tools() {
+  apt-get update -q &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      -o Dpkg::Options::=--force-unsafe-io build-essential git file
+}
+
+while :; do
+  if have_tools; then
+    mkdir -p "$(dirname "$MARK")" && : > "$MARK"
+    report 0
+    exit 0
+  fi
+  rm -f "$MARK"
+  sync_clock
+  # Finish anything an interrupted dpkg left half done.
+  dpkg --configure -a --force-unsafe-io >> "$LOG" 2>&1 || true
+  install_tools >> "$LOG" 2>&1
+  rc=$?
+  have_tools && continue
+  [ "$rc" -eq 0 ] && rc=1 # apt was happy, but the tools aren't there
+  echo "provision rc=$rc" >> "$LOG"
+  report "$rc"
+  sleep "$RETRY_S"
+done
