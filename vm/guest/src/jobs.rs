@@ -938,11 +938,13 @@ fn stream_to<C: Write>(
                 if let Some(s) = decide(job, &g, &mut offs, follow, closed) {
                     break s;
                 }
-                g = job
-                    .cv
-                    .wait_timeout(g, Duration::from_secs(1))
-                    .unwrap_or_else(|p| p.into_inner())
-                    .0;
+                // No timeout: everything `decide` looks at is followed by a
+                // notify under this lock (output and retention in
+                // `StreamWriter`, the end of the job in `supervise`, a closed
+                // connection in `Job::wake`; a cancel ends the job).
+                g = job.cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                #[cfg(test)]
+                tests::FOLLOWER_WAKES.fetch_add(1, Ordering::Relaxed);
             }
         };
         match step {
@@ -1063,3 +1065,68 @@ pub fn cancel_job<C: Write>(srv: &Arc<Server>, f: &Frame, conn: &mut C) {
     );
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicU64;
+
+    /// Times any follower in this test binary came back from its wait.
+    pub static FOLLOWER_WAKES: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn a_follower_sleeps_until_there_is_news() {
+        let dir = std::env::temp_dir().join(format!("azula-guest-follow-{}", random_hex(4)));
+        let srv = Server::open(crate::server::Config::new("azula", &dir)).unwrap();
+        let req = ExecReq {
+            owner: "g_a".into(),
+            idem: "i".into(),
+            label: None,
+            argv: ["sh", "-c", "read x; echo \"$x\"; exec sleep 60"]
+                .map(String::from)
+                .to_vec(),
+            cwd: Some("/".into()),
+            env: None,
+            stdin: Some(true),
+            timeout_s: None,
+            attach: None,
+            cancel_on_disconnect: None,
+        };
+        let st = start_job(&srv, &req).unwrap();
+        let (job, stdin) = (st.job, st.stdin.unwrap());
+
+        let soon = Duration::from_secs(10);
+        let follow = || {
+            let closed = Arc::new(AtomicBool::new(false));
+            let (mut conn, client) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(soon)).unwrap();
+            let (j, c) = (Arc::clone(&job), Arc::clone(&closed));
+            thread::spawn(move || stream_to(&mut conn, &j, [0, 0], true, &c).unwrap());
+            (closed, client)
+        };
+        let (leaver_closed, mut leaver) = follow();
+        let (_, mut stayer) = follow();
+
+        // Nothing to say, nothing to do (a condvar may wake on its own, though
+        // hardly once a second).
+        thread::sleep(Duration::from_millis(2500));
+        let wakes = FOLLOWER_WAKES.load(Ordering::Relaxed);
+        assert!(wakes <= 1, "{wakes} wakes of a silent job");
+
+        // A closed connection ends the wait (what `spawn_reader` does).
+        leaver_closed.store(true, Ordering::Relaxed);
+        job.wake();
+        assert!(read_frame(&mut leaver).unwrap().is_none());
+
+        // So do output, and a cancel (through the job's end).
+        stdin.data(b"hi\n".to_vec()).unwrap();
+        let f = read_frame(&mut stayer).unwrap().unwrap();
+        assert_eq!((f.t.as_str(), &f.payload[..]), ("stdout", &b"hi\n"[..]));
+        assert!(job.cancel("cancelled"));
+        let f = read_frame(&mut stayer).unwrap().unwrap();
+        assert_eq!(f.t, "exit");
+        assert_eq!(f.header["reason"], "cancelled");
+        assert!(read_frame(&mut stayer).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
