@@ -66,6 +66,18 @@ write_files:
     content: |
       Acquire::http::Proxy "http://127.0.0.1:3128";
       Acquire::https::Proxy "http://127.0.0.1:3128";
+  - path: /etc/apt/apt.conf.d/90azula-fast
+    content: |
+      // Debian's CDN stops answering HTTP requests that are pipelined: the default depth of
+      // 10 made apt wait out its 30 s read timeout about half the time (it happens from any
+      // machine, not just here). Without pipelining, `apt-get update` is 5 to 9 s and the
+      // tool set downloads in 7 to 22 s, with no stall.
+      Acquire::http::Pipeline-Depth "0";
+      Acquire::https::Pipeline-Depth "0";
+      // No description translations and no pdiffs: `apt-get update` fetches less.
+      Acquire::Languages "none";
+      Acquire::PDiffs "false";
+      Acquire::Retries "3";
   - path: /etc/gitconfig
     content: |
       [http]
@@ -92,6 +104,13 @@ runcmd:
   - [systemctl, mask, --now, sshd-vsock.socket, sshd-unix-local.socket]
   - [systemctl, restart, systemd-resolved.service]
   - [sh, -c, "echo \"AZULA-SEED guest=$(systemctl is-active azula-guest) proxy=$(systemctl is-active azula-vsock-proxy) uptime=$(cut -d' ' -f1 /proc/uptime)\" > /dev/console"]
-  # https mirrors, so apt needs only CONNECT from the proxy
+  # https mirrors, so apt needs only CONNECT from the proxy; and no source lists, which a
+  # guest never uses but `apt-get update` would fetch
+  - [sh, -c, "sed -i 's/^Types: deb deb-src$/Types: deb/' /etc/apt/sources.list.d/*.sources 2>/dev/null; true"]
   - [sh, -c, "sed -i 's#http://deb.debian.org#https://deb.debian.org#g; s#http://security.debian.org#https://security.debian.org#g' /etc/apt/sources.list.d/*.sources 2>/dev/null; true"]
-  - [sh, -c, "(apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential git file) > /var/log/azula-provision.log 2>&1; rc=$?; echo \"provision rc=$rc\" >> /var/log/azula-provision.log; echo \"AZULA-SEED provision rc=$rc uptime=$(cut -d' ' -f1 /proc/uptime)\" > /dev/console"]
+  # The first boot's tools. No recommends (they add 9 of 64 packages and nothing a build
+  # needs), no fsync per file (the VM is disposable until it's Ready), and no man-db index
+  # rebuild: together about 6 s of dpkg on the Pixel 10a. The man-db switch stays off, since
+  # jobs' own installs would pay for it too.
+  - [rm, -f, /var/lib/man-db/auto-update]
+  - [sh, -c, "(apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends -o Dpkg::Options::=--force-unsafe-io build-essential git file) > /var/log/azula-provision.log 2>&1; rc=$?; echo \"provision rc=$rc\" >> /var/log/azula-provision.log; echo \"AZULA-SEED provision rc=$rc uptime=$(cut -d' ' -f1 /proc/uptime)\" > /dev/console"]
