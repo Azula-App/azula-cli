@@ -29,7 +29,12 @@ pub struct EndpointOptions {
     pub relay_only: bool,
     /// `None` waits for the relay forever (the historic behaviour); `Some(d)`
     /// fails with an actionable error if no relay is connected within `d`.
+    /// Not used with `wait_online: false`.
     pub online_timeout: Option<Duration>,
+    /// `false` returns as soon as the endpoint is bound, without waiting for a
+    /// relay. The caller then finds out whether one is reachable, e.g. with
+    /// [`relay_unreachable`].
+    pub wait_online: bool,
     /// `Some((keep_alive, idle_timeout))` sets the QUIC keep-alive interval and
     /// idle timeout for every connection on this endpoint (both directions),
     /// via `iroh::endpoint::QuicTransportConfig::builder()`'s
@@ -51,6 +56,7 @@ impl EndpointOptions {
             alpns: Vec::new(),
             relay_only: false,
             online_timeout: None,
+            wait_online: true,
             quic_timeouts: None,
             relay_url: None,
         }
@@ -226,47 +232,56 @@ pub async fn bind_with_options(opts: EndpointOptions) -> Result<Endpoint> {
         Err(err) => return Err(err),
     };
 
+    if !opts.wait_online {
+        return Ok(endpoint);
+    }
     info!("bringing endpoint online…");
     match opts.online_timeout {
         None => endpoint.online().await,
         Some(d) => {
             if tokio::time::timeout(d, endpoint.online()).await.is_err() {
-                let mut status = endpoint.home_relay_status();
-                let mut tried: Vec<String> = Vec::new();
-                let mut last_err = None;
-                for s in status.get() {
-                    tried.push(s.url().to_string());
-                    if last_err.is_none() {
-                        last_err = s
-                            .last_error()
-                            .map(|e| redact_credentials(&format!("{e:#}")));
-                    }
-                }
-                if tried.is_empty() {
-                    tried = match &opts.relay_url {
-                        Some(u) => vec![u.to_string()],
-                        None => default_relay_urls(),
-                    };
-                }
-                let proxy_note = match &proxy {
-                    Some(p) => format!("via proxy {}", redact_credentials(p.as_str())),
-                    None => "with no HTTPS_PROXY/HTTP_PROXY set".to_owned(),
-                };
-                let detail = last_err
-                    .map(|e| format!(" Last error: {e}."))
-                    .unwrap_or_default();
+                let msg = relay_unreachable(&endpoint, &opts, d);
                 endpoint.close().await;
-                bail!(
-                    "could not reach an iroh relay within {}s (tried {}; {proxy_note}).{detail} \
-                     Check that the HTTPS proxy is configured (HTTPS_PROXY) and its allowlist permits these relay hosts on port 443, \
-                     and that the proxy's CA is in the system trust store.",
-                    d.as_secs_f32(),
-                    tried.join(", "),
-                );
+                bail!(msg);
             }
         }
     }
     Ok(endpoint)
+}
+
+/// What to tell someone whose endpoint hasn't reached a relay within `waited`:
+/// the relays tried, whether a proxy was used, and the last error.
+pub fn relay_unreachable(endpoint: &Endpoint, opts: &EndpointOptions, waited: Duration) -> String {
+    let mut status = endpoint.home_relay_status();
+    let mut tried: Vec<String> = Vec::new();
+    let mut last_err = None;
+    for s in status.get() {
+        tried.push(s.url().to_string());
+        if last_err.is_none() {
+            last_err = s.last_error().map(|e| redact_credentials(&format!("{e:#}")));
+        }
+    }
+    if tried.is_empty() {
+        tried = match &opts.relay_url {
+            Some(u) => vec![u.to_string()],
+            None => default_relay_urls(),
+        };
+    }
+    let proxy = proxy_from_env(
+        &default_relay_urls().iter().filter_map(|u| Url::parse(u).ok()).filter_map(|u| u.host_str().map(str::to_owned)).collect::<Vec<_>>(),
+    );
+    let proxy_note = match &proxy {
+        Some(p) => format!("via proxy {}", redact_credentials(p.as_str())),
+        None => "with no HTTPS_PROXY/HTTP_PROXY set".to_owned(),
+    };
+    let detail = last_err.map(|e| format!(" Last error: {e}.")).unwrap_or_default();
+    format!(
+        "could not reach an iroh relay within {}s (tried {}; {proxy_note}).{detail} \
+                     Check that the HTTPS proxy is configured (HTTPS_PROXY) and its allowlist permits these relay hosts on port 443, \
+                     and that the proxy's CA is in the system trust store.",
+        waited.as_secs_f32(),
+                    tried.join(", "),
+    )
 }
 
 /// Bind an iroh endpoint with an explicit secret key, wait for it to come

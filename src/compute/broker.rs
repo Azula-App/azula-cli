@@ -9,6 +9,7 @@
 //! expired grants.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,6 +30,9 @@ use super::{agent, guest, short_id, PROTO_VERSION};
 pub(super) const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the broker waits for a freshly started VM's worker before forwarding.
 const WORKER_WAIT: Duration = Duration::from_secs(30);
+/// How long the client may take in nothing before the broker closes the
+/// connection on a finished response.
+const DELIVERY_STALL: Duration = Duration::from_secs(30);
 /// A job whose grant has less than this left is refused.
 const MIN_GRANT_LEFT_S: u64 = 60;
 /// Default job timeout when the client names none (matches the worker's).
@@ -473,8 +477,10 @@ impl<B: VmBackend> Broker<B> {
         let g2c = async {
             let _ = tokio::io::copy(&mut ur, &mut send).await;
             let _ = send.finish();
-            // Let the client read everything; do not wait forever for a stuck peer.
-            let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
+            // Everything is in our send buffer, not with the client: over a slow
+            // path (n0's relay throttles to some tens of KB/s) it takes a while,
+            // and closing the connection now would discard what is left.
+            delivered(conn, &mut send, DELIVERY_STALL).await;
         };
         let outcome = tokio::select! {
             _ = g2c => "done",
@@ -491,6 +497,33 @@ async fn read_timed<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>, St
         Ok(Ok(f)) => Ok(f),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("timed out waiting for a frame".to_owned()),
+    }
+}
+
+/// Wait until the client has everything written to `send`, which is finished.
+async fn delivered(conn: &Connection, send: &mut SendStream, stall: Duration) {
+    let sent = || conn.stats().udp_tx.bytes;
+    delivered_by(send.stopped(), sent, stall).await;
+}
+
+/// [`delivered`], given what ends the wait and how many bytes the connection has
+/// sent so far. Gives up only when nothing moves for `stall`: a client that
+/// stopped reading must not hold the connection forever, and one that died is
+/// caught by the QUIC idle timeout (`conn.closed()`).
+pub(super) async fn delivered_by<F: Future>(done: F, sent: impl Fn() -> u64, stall: Duration) {
+    // A stuck connection still sends keep-alives: tens of bytes every 2 s.
+    const MIN_PROGRESS: u64 = 2048;
+    tokio::pin!(done);
+    loop {
+        let before = sent();
+        tokio::select! {
+            _ = &mut done => return,
+            _ = tokio::time::sleep(stall) => {
+                if sent().saturating_sub(before) < MIN_PROGRESS {
+                    return;
+                }
+            }
+        }
     }
 }
 

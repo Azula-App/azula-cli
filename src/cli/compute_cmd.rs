@@ -422,8 +422,18 @@ pub(super) fn require_token(arg: &TokenArg) -> Token {
 /// Bind a client endpoint for `token`'s host.
 async fn make_dialer(token: &Token) -> Result<Dialer, Failure> {
     let addr = token.addr().map_err(|e| Failure::Broker { code: "bad_request".into(), msg: e.to_string() })?;
-    let ep = client::bind_client(client::RELAY_TIMEOUT, client::token_relay(token)).await.map_err(|e| Failure::Transport(crate::endpoint::redact_credentials(&format!("{e:#}"))))?;
-    Ok(Dialer::new(ep, addr, token.clone()).with_fault(client::Fault::from_env()))
+    let relay = client::token_relay(token);
+    // The token says which relay the host is on, so dial while we register there.
+    let bound = match &relay {
+        Some(url) => client::bind_client_unwaited(url.clone()).await,
+        None => client::bind_client(client::RELAY_TIMEOUT, None).await,
+    };
+    let ep = bound.map_err(|e| Failure::Transport(crate::endpoint::redact_credentials(&format!("{e:#}"))))?;
+    let dialer = Dialer::new(ep, addr, token.clone()).with_fault(client::Fault::from_env());
+    Ok(match relay {
+        Some(url) => dialer.with_unwaited_relay(url),
+        None => dialer,
+    })
 }
 
 async fn dialer_or_die(arg: &TokenArg) -> Dialer {

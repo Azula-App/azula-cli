@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use super::frame::{read_frame, write_frame, Frame};
 use super::grants::{parse_duration, Token};
 use super::{agent, ALPN, PROTO_VERSION, QUIC_TIMEOUTS};
-use crate::endpoint::{bind_with_options, redact_credentials, EndpointOptions};
+use crate::endpoint::{bind_with_options, redact_credentials, relay_unreachable, EndpointOptions};
 
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -272,11 +272,20 @@ pub struct Dialer {
     pub addr: EndpointAddr,
     pub token: Token,
     pub fault: Option<Arc<Fault>>,
+    /// Set by [`Dialer::with_unwaited_relay`]: the relay, until a session has been opened.
+    unwaited: Option<(iroh::RelayUrl, Arc<AtomicBool>)>,
 }
 
 impl Dialer {
     pub fn new(ep: Endpoint, addr: EndpointAddr, token: Token) -> Self {
-        Dialer { ep, addr, token, fault: None }
+        Dialer { ep, addr, token, fault: None, unwaited: None }
+    }
+
+    /// For an endpoint from [`bind_client_unwaited`]: sessions dial while it
+    /// registers with `relay`, and say so if it can't.
+    pub fn with_unwaited_relay(mut self, relay: iroh::RelayUrl) -> Self {
+        self.unwaited = Some((relay, Arc::new(AtomicBool::new(true))));
+        self
     }
 
     pub fn with_fault(mut self, fault: Option<Arc<Fault>>) -> Self {
@@ -285,7 +294,12 @@ impl Dialer {
     }
 
     pub async fn session(&self) -> Result<Session, Failure> {
-        connect(&self.ep, self.addr.clone(), &self.token).await
+        let Some((relay, waiting)) = self.unwaited.as_ref().filter(|(_, w)| w.load(Ordering::Relaxed)) else {
+            return connect(&self.ep, self.addr.clone(), &self.token).await;
+        };
+        let conn = dial_unwaited(&self.ep, self.addr.clone(), relay, RELAY_TIMEOUT, DIAL_TIMEOUT).await?;
+        waiting.store(false, Ordering::Relaxed);
+        authenticate(conn, &self.token, AUTH_TIMEOUT).await
     }
 }
 
@@ -296,6 +310,17 @@ pub async fn bind_client(online_timeout: Duration, relay: Option<iroh::RelayUrl>
     let mut opts = EndpointOptions::new(SecretKey::generate());
     opts.online_timeout = Some(online_timeout);
     opts.relay_url = relay;
+    opts.quic_timeouts = Some(QUIC_TIMEOUTS);
+    bind_with_options(opts).await
+}
+
+/// [`bind_client`] homed on `relay` without waiting for it: the first dial can
+/// use the time the registration takes (about a second over n0's relays).
+/// Use the endpoint with [`Dialer::with_unwaited_relay`].
+pub async fn bind_client_unwaited(relay: iroh::RelayUrl) -> anyhow::Result<Endpoint> {
+    let mut opts = EndpointOptions::new(SecretKey::generate());
+    opts.wait_online = false;
+    opts.relay_url = Some(relay);
     opts.quic_timeouts = Some(QUIC_TIMEOUTS);
     bind_with_options(opts).await
 }
@@ -313,6 +338,47 @@ pub async fn dial(ep: &Endpoint, addr: EndpointAddr, dial: Duration) -> Result<C
         Err(_) => Err(transport(format!("timed out after {}s connecting to the host", dial.as_secs()))),
     }
 }
+
+/// Dial `addr` while the endpoint is still reaching `relay`. Whoever is first
+/// decides: a direct path needs no relay at all, and once the relay is there the
+/// dial gets `dial_wait` of its own. No relay within `relay_wait` is the error a
+/// waiting bind gives, and so is a dial that failed without one.
+pub(super) async fn dial_unwaited(ep: &Endpoint, addr: EndpointAddr, relay: &iroh::RelayUrl, relay_wait: Duration, dial_wait: Duration) -> Result<Connection, Failure> {
+    let opts = || {
+        let mut o = EndpointOptions::new(SecretKey::generate());
+        o.relay_url = Some(relay.clone());
+        o
+    };
+    let failed = |e: String| transport(format!("could not connect to the host: {e}"));
+    let dialing = ep.connect(addr, ALPN);
+    tokio::pin!(dialing);
+    tokio::select! {
+        biased;
+        r = &mut dialing => match r {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                // Too soon to blame the host unless the relay is there.
+                return match tokio::time::timeout(RELAY_GRACE, ep.online()).await {
+                    Ok(()) => Err(failed(format!("{e:#}"))),
+                    Err(_) => Err(transport(format!("{} (dial: {e:#})", relay_unreachable(ep, &opts(), relay_wait)))),
+                };
+            }
+        },
+        online = tokio::time::timeout(relay_wait, ep.online()) => {
+            if online.is_err() {
+                return Err(transport(relay_unreachable(ep, &opts(), relay_wait)));
+            }
+        }
+    }
+    match tokio::time::timeout(dial_wait, dialing).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) => Err(failed(format!("{e:#}"))),
+        Err(_) => Err(transport(format!("timed out after {}s connecting to the host", dial_wait.as_secs()))),
+    }
+}
+
+/// How long a failed dial waits to learn whether the relay was the problem.
+const RELAY_GRACE: Duration = Duration::from_millis(500);
 
 /// Send `hello` on a fresh bi-stream of `conn` and wait for `welcome`.
 pub async fn authenticate(conn: Connection, token: &Token, auth: Duration) -> Result<Session, Failure> {

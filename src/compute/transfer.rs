@@ -26,7 +26,8 @@ use super::frame::{read_frame, write_frame, write_frame_parts, Frame, MAX_PAYLOA
 use super::grants::{fsync_dir, write_private_atomic};
 
 /// Largest data frame we send (the contract allows 1 MiB).
-const CHUNK: usize = 512 * 1024;
+/// The worker saves whole frames only, so this is what a dropped push loses.
+const CHUNK: usize = 128 * 1024;
 
 /// How long a push keeps a ready session while it is still hashing. The broker
 /// hangs up on one that sends no request within [`FRAME_TIMEOUT`] of `welcome`,

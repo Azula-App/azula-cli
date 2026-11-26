@@ -20,7 +20,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Notify};
 
-use super::broker::{Broker, FRAME_TIMEOUT};
+use super::broker::{delivered_by, Broker, FRAME_TIMEOUT};
 use super::client::{self, AttachRequest, Dialer, Event, ExecRequest, Failure, Fault, JobRef, Outcome, Policy, Start};
 use super::frame::{read_frame, write_frame, Frame};
 use super::grants::{GrantStore, MintOptions, Token, OP_ADMIN, OP_EXEC, OP_VM};
@@ -1802,7 +1802,143 @@ async fn directory_trees_travel_as_tar_and_pull_extracts_defensively() {
     h.shutdown().await;
 }
 
+// --- delivering a response over a slow path --------------------------------------------------
+
+/// A response the client takes 24 s to receive: 1 MiB over n0's throttled relay.
+/// Nothing is stuck, so it must not be cut off at the old 10 s.
+#[tokio::test(start_paused = true)]
+async fn a_slow_client_gets_all_of_a_response() {
+    let begin = tokio::time::Instant::now();
+    let elapsed = || begin.elapsed().as_secs_f64();
+    // 43 KB/s, until the end at 24 s.
+    let sent = || (elapsed().min(24.0) * 43_000.0) as u64;
+    delivered_by(tokio::time::sleep(Duration::from_secs(24)), sent, Duration::from_secs(10)).await;
+    assert_eq!(begin.elapsed().as_secs(), 24);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_that_stopped_taking_anything_is_given_up_on() {
+    let begin = tokio::time::Instant::now();
+    // Only keep-alives: 25 bytes a second.
+    let sent = || begin.elapsed().as_secs() * 25;
+    delivered_by(std::future::pending::<()>(), sent, Duration::from_secs(10)).await;
+    assert_eq!(begin.elapsed().as_secs(), 10);
+
+    // Stuck after a while of progress: the stall starts at the end of that.
+    let begin = tokio::time::Instant::now();
+    let sent = || begin.elapsed().as_secs_f64().min(23.0) as u64 * 50_000;
+    delivered_by(std::future::pending::<()>(), sent, Duration::from_secs(10)).await;
+    assert!((30..=40).contains(&begin.elapsed().as_secs()), "{:?}", begin.elapsed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delivered_response_ends_the_wait_at_once() {
+    let begin = tokio::time::Instant::now();
+    delivered_by(std::future::ready(()), || 0, Duration::from_secs(10)).await;
+    assert_eq!(begin.elapsed().as_secs(), 0);
+}
+
+// --- dialing before the relay is there -------------------------------------------------------
+
+fn relay_nowhere() -> iroh::RelayUrl {
+    "https://relay.invalid./".parse().unwrap()
+}
+
+/// The test endpoints have no relay, so `online()` never ends: a direct path must
+/// not wait for it.
+#[tokio::test]
+async fn a_dial_does_not_wait_for_a_relay() {
+    let h = Harness::new("unwaited").await;
+    assert!(tokio::time::timeout(Duration::from_millis(300), h.client_ep.online()).await.is_err(), "this test needs an endpoint without a relay");
+    let t = Instant::now();
+    client::dial_unwaited(&h.client_ep, h.broker_ep.addr(), &relay_nowhere(), Duration::from_secs(30), Duration::from_secs(30)).await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+
+    // A dialer does that once; then it dials like any other.
+    let token = h.mint(&[OP_EXEC], &["a"]);
+    let d = h.dialer(&token).with_unwaited_relay(relay_nowhere());
+    for _ in 0..2 {
+        let s = d.session().await.unwrap();
+        s.conn.close(0u32.into(), b"done");
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dial_that_gets_nowhere_without_a_relay_names_the_relay() {
+    let ep = Endpoint::bind(presets::Minimal).await.unwrap();
+    let nobody = iroh::SecretKey::generate().public();
+    let unreachable = [
+        // Nothing known about it but its name.
+        iroh::EndpointAddr::new(nobody),
+        // An address nothing answers on (TEST-NET-1): the dial would go on.
+        iroh::EndpointAddr::new(nobody).with_ip_addr("192.0.2.1:9".parse().unwrap()),
+    ];
+    for addr in unreachable {
+        let t = Instant::now();
+        let e = client::dial_unwaited(&ep, addr, &relay_nowhere(), Duration::from_millis(400), Duration::from_secs(60)).await.map(|_| ()).unwrap_err();
+        let msg = e.message();
+        assert!(matches!(e, Failure::Transport(_)), "{msg}");
+        assert!(msg.contains("could not reach an iroh relay") && msg.contains("relay.invalid") && msg.contains("allowlist"), "{msg}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    }
+    ep.close().await;
+}
+
 // --- measurements ----------------------------------------------------------------------------
+
+/// A push and a pull of each size over n0's relay, to see whether transfers make
+/// progress when it throttles. Both ends are in this process, with a real worker:
+///
+/// `AZULA_GUEST_BIN=vm/guest/target/release/azula-guest AZULA_RELAY_ONLY=1 \
+///  PROBE_KIB=64,256,1024 cargo test --release --lib relay_transfer_probe -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "sends data through n0's relays"]
+async fn relay_transfer_probe() {
+    let guest_bin = std::env::var("AZULA_GUEST_BIN").expect("AZULA_GUEST_BIN");
+    let sizes: Vec<usize> = std::env::var("PROBE_KIB").unwrap_or("64,256,1024".into()).split(',').map(|k| k.parse::<usize>().unwrap() << 10).collect();
+    let dir = tmpdir("probe");
+    let sock = dir.join("w.sock");
+    let mut worker = std::process::Command::new(guest_bin)
+        .args(["--unix", sock.to_str().unwrap(), "--state-dir", dir.join("state").to_str().unwrap()])
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    while !sock.exists() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let store = GrantStore::new(dir.join("grants"));
+    let backend = LocalBackend::attach("a", AttachOpts { socket: sock, cpus: 1, memory_mb: 1 });
+    let broker = Broker::new(Arc::new(backend), store.clone(), "probe".into());
+    let broker_ep = client::bind_client(client::RELAY_TIMEOUT, None).await.unwrap();
+    let router = Router::builder(broker_ep.clone()).accept(ALPN, broker).spawn();
+    let (g, secret) = store.mint(&MintOptions { label: "t".into(), ttl: Duration::from_secs(7200), ops: vec![OP_EXEC.into()], vms: vec!["a".into()] }).unwrap();
+    let relay = broker_ep.addr().relay_urls().next().unwrap().to_string();
+    let token = Token { host: broker_ep.id().to_string(), relay: relay.clone(), grant: g.id, secret };
+    let ep = client::bind_client_unwaited(relay.parse().unwrap()).await.unwrap();
+    let dialer = Dialer::new(ep.clone(), token.addr().unwrap(), token.clone()).with_unwaited_relay(relay.parse().unwrap());
+    println!("relay {relay}, relay only: {}", std::env::var_os("AZULA_RELAY_ONLY").is_some());
+    for size in sizes {
+        let src = dir.join(format!("src-{size}"));
+        std::fs::write(&src, pattern(size)).unwrap();
+        let file = format!("azula-probe-{size}");
+        let target = format!("{}/{file}", dir.display());
+        let policy = || Policy { window: Duration::from_secs(150), initial: Duration::from_millis(200), max: Duration::from_secs(2) };
+        let tstore = TransferStore::new(dir.join("transfers.json"));
+        let t = Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(180), transfer::push(&dialer, &tstore, src.to_str().unwrap(), &target, &PushOptions { policy: policy(), ..Default::default() }, &mut |_, _| {})).await;
+        println!("push {:>5} KiB: {:6.1} s {}", size >> 10, t.elapsed().as_secs_f64(), match &r { Err(_) => "TIMED OUT".into(), Ok(Err(e)) => format!("FAILED {e:?}"), Ok(Ok(_)) => "ok".into() });
+        let t = Instant::now();
+        let out = dir.join(format!("back-{size}"));
+        let r = tokio::time::timeout(Duration::from_secs(180), transfer::pull(&dialer, &tstore, &target, out.to_str().unwrap(), &PullOptions { policy: policy(), ..Default::default() }, &mut |_, _| {})).await;
+        println!("pull {:>5} KiB: {:6.1} s {}", size >> 10, t.elapsed().as_secs_f64(), match &r { Err(_) => "TIMED OUT".into(), Ok(Err(e)) => format!("FAILED {e:?}"), Ok(Ok(_)) => format!("ok, same bytes: {}", std::fs::read(&out).unwrap() == pattern(size)) });
+    }
+    ep.close().await;
+    let _ = router.shutdown().await;
+    let _ = worker.kill();
+    let _ = worker.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 /// What a client that kept its endpoint between requests would save: each round
 /// times a `ping` as every `azula compute` invocation makes it (bind, reach the
@@ -1814,7 +1950,7 @@ async fn directory_trees_travel_as_tar_and_pull_extracts_defensively() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measures over the internet, through n0's relays"]
 async fn bench_retained_endpoint() {
-    const ROUNDS: usize = 25;
+    const ROUNDS: usize = 12;
     let fake = Fake::new("bench");
     let dir = tmpdir("bench");
     let store = GrantStore::new(&dir);
@@ -1842,7 +1978,7 @@ async fn bench_retained_endpoint() {
 
     let kept = client::bind_client(client::RELAY_TIMEOUT, client::token_relay(&token)).await.unwrap();
     ask(&kept, &addr, &token).await;
-    let (mut fresh, mut again) = (Vec::new(), Vec::new());
+    let (mut fresh, mut eager, mut again) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..ROUNDS {
         let t = Instant::now();
         let ep = client::bind_client(client::RELAY_TIMEOUT, client::token_relay(&token)).await.unwrap();
@@ -1853,6 +1989,24 @@ async fn bench_retained_endpoint() {
         let close = t.elapsed().as_secs_f64() * 1e3;
         fresh.push(vec![bind, dial, auth, ping, close, bind + dial + auth + ping + close]);
         tokio::time::sleep(Duration::from_secs(1)).await;
+        // As a command dials now: the relay registration runs under the dial.
+        let t = Instant::now();
+        let ep = client::bind_client_unwaited(relay.parse().unwrap()).await.unwrap();
+        let bind = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let conn = client::dial_unwaited(&ep, addr.clone(), &relay.parse().unwrap(), client::RELAY_TIMEOUT, client::DIAL_TIMEOUT).await.unwrap();
+        let dial = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let s = client::authenticate(conn, &token, client::AUTH_TIMEOUT).await.unwrap();
+        let auth = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        client::request_reply(s, &Frame::of_type("ping"), client::AUTH_TIMEOUT).await.unwrap();
+        let ping = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let _ = tokio::time::timeout(Duration::from_secs(3), ep.close()).await;
+        let close = t.elapsed().as_secs_f64() * 1e3;
+        eager.push(vec![bind, dial, auth, ping, close, bind + dial + auth + ping + close]);
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let [dial, auth, ping] = ask(&kept, &addr, &token).await;
         again.push(vec![dial, auth, ping, dial + auth + ping]);
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1860,6 +2014,7 @@ async fn bench_retained_endpoint() {
     println!("relay {relay}, relay only: {}, {ROUNDS} rounds, milliseconds", std::env::var_os("AZULA_RELAY_ONLY").is_some());
     for (what, names, rows) in [
         ("fresh endpoint", &["bind+relay", "dial", "hello", "ping", "close", "total"][..], fresh),
+        ("dial at once", &["bind", "dial", "hello", "ping", "close", "total"][..], eager),
         ("kept endpoint", &["dial", "hello", "ping", "total"][..], again),
     ] {
         for (i, name) in names.iter().enumerate() {

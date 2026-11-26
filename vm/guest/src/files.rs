@@ -19,7 +19,9 @@ use crate::server::{send, send_error, Server};
 use crate::sha256::Sha256;
 use crate::util::{now_s, valid_id, write_atomic};
 
-const CHUNK: usize = 1 << 20;
+/// Read buffer, and the size of a get's data frames. A client saves whole frames
+/// only, so a frame should cross even a slow link well inside its patience.
+const CHUNK: usize = 128 * 1024;
 const PART_MAX_AGE_S: u64 = 24 * 3600;
 
 #[derive(Serialize, Deserialize)]
