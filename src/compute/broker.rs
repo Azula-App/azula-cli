@@ -26,7 +26,7 @@ use super::vm::{VmBackend, VmError, VmInfo, VmState};
 use super::{agent, guest, short_id, PROTO_VERSION};
 
 /// How long a client gets to send `hello` and then its request.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the broker waits for a freshly started VM's worker before forwarding.
 const WORKER_WAIT: Duration = Duration::from_secs(30);
 /// A job whose grant has less than this left is refused.

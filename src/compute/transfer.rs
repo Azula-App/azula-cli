@@ -9,21 +9,29 @@
 //! digest match, and a changed local or remote file restarts from zero.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use super::broker::FRAME_TIMEOUT;
 use super::client::{run_job, Dialer, Event, ExecRequest, Failure, Outcome, Policy, Session, Start};
-use super::frame::{read_frame, write_frame, Frame, MAX_PAYLOAD};
-use super::grants::write_private_atomic;
+use super::frame::{read_frame, write_frame, write_frame_parts, Frame, MAX_PAYLOAD};
+use super::grants::{fsync_dir, write_private_atomic};
 
 /// Largest data frame we send (the contract allows 1 MiB).
 const CHUNK: usize = 512 * 1024;
+
+/// How long a push keeps a ready session while it is still hashing. The broker
+/// hangs up on one that sends no request within [`FRAME_TIMEOUT`] of `welcome`,
+/// so a longer hash gives its session back and dials again when it is done.
+const HOLD_SESSION: Duration = Duration::from_secs(FRAME_TIMEOUT.as_secs() / 2);
 
 /// Error codes that describe a problem with the file, not the broker.
 const FILE_CODES: &[&str] = &["not_found", "not_a_file", "exists", "is_a_directory", "not_a_directory", "changed", "size_mismatch", "digest_mismatch", "io_error", "upload_conflict"];
@@ -318,6 +326,52 @@ enum PushStep {
     Fail(TransferError),
 }
 
+/// Run `hash` and `dial` at the same time, so the shorter of the two costs
+/// nothing, with the result hashing first and dialing second would give: the
+/// hash's error if it has one, otherwise the dial's outcome as it is. `None`
+/// instead of that outcome means it came more than `hold` before the hash
+/// ended, and is no longer worth using.
+///
+/// A dial that is not returned is not left open either: it is dropped if it
+/// was still under way, and handed to `discard` if it was done.
+pub(super) async fn hash_and_dial<H, E, D>(
+    hash: impl Future<Output = Result<H, E>>,
+    dial: impl Future<Output = D>,
+    hold: Duration,
+    discard: impl FnOnce(D),
+) -> Result<(H, Option<D>), E> {
+    tokio::pin!(hash);
+    let dialed = {
+        tokio::pin!(dial);
+        tokio::select! {
+            biased;
+            hashed = &mut hash => {
+                let hashed = hashed?;
+                return Ok((hashed, Some(dial.await)));
+            }
+            dialed = &mut dial => dialed,
+        }
+    };
+    match tokio::time::timeout(hold, &mut hash).await {
+        Ok(Ok(hashed)) => Ok((hashed, Some(dialed))),
+        Ok(Err(e)) => {
+            discard(dialed);
+            Err(e)
+        }
+        Err(_) => {
+            discard(dialed);
+            Ok((hash.await?, None))
+        }
+    }
+}
+
+/// Close a session that will not be used after all.
+pub(super) fn hang_up(dialed: Result<Session, Failure>) {
+    if let Ok(s) = dialed {
+        s.conn.close(0u32.into(), b"done");
+    }
+}
+
 /// Copy one local file (or stdin, for `-`) to `remote` in the VM.
 pub async fn push(
     dialer: &Dialer,
@@ -337,7 +391,6 @@ pub async fn push(
     let size = meta.len();
     let mtime = mtime_ns(&meta);
     let mode = opts.mode.unwrap_or_else(|| file_mode(&meta));
-    let digest = hex(hash_file(Path::new(local), None).await.map_err(|e| TransferError::file("io_error", format!("{local}: {e}")))?.finalize().as_slice());
 
     let mut remote_path = remote.to_owned();
     if remote_path.ends_with('/') {
@@ -346,7 +399,13 @@ pub async fn push(
     }
     let abs_local = std::fs::canonicalize(local).unwrap_or_else(|_| PathBuf::from(local));
 
-    let mut session = dialer.session().await?;
+    let hash = async { hash_file(Path::new(local), None).await.map_err(|e| TransferError::file("io_error", format!("{local}: {e}"))) };
+    let (hash, dialed) = hash_and_dial(hash, dialer.session(), HOLD_SESSION, hang_up).await?;
+    let digest = hex(hash.finalize().as_slice());
+    let mut session = match dialed {
+        Some(s) => s?,
+        None => dialer.session().await?,
+    };
     let vm = session.resolve_vm(opts.vm.as_deref());
     let host = session.host();
     let mut outage = Outage::new();
@@ -474,6 +533,7 @@ async fn push_once(
         return PushStep::Fail(TransferError::file("io_error", format!("{local}: cannot seek")));
     }
     let mut sent = offset;
+    let data = Frame::of_type("data").header;
     let mut buf = vec![0u8; CHUNK.min(MAX_PAYLOAD)];
     while sent < size {
         let want = (buf.len() as u64).min(size - sent) as usize;
@@ -482,7 +542,7 @@ async fn push_once(
             Ok(n) => n,
             Err(e) => return PushStep::Fail(TransferError::file("io_error", format!("{local}: {e}"))),
         };
-        if let Err(e) = write_frame(&mut s.send, &Frame::with_payload(json!({"t": "data"}), buf[..n].to_vec())).await {
+        if let Err(e) = write_frame_parts(&mut s.send, &data, &buf[..n]).await {
             return PushStep::Dropped(e.to_string());
         }
         sent += n as u64;
@@ -535,6 +595,7 @@ async fn push_stdin(dialer: &Dialer, remote: &str, opts: &PushOptions) -> Result
     let mut stdin = tokio::io::stdin();
     let mut hasher = Sha256::new();
     let mut total = 0u64;
+    let data = Frame::of_type("data").header;
     let mut buf = vec![0u8; CHUNK];
     loop {
         let n = stdin.read(&mut buf).await.map_err(|e| TransferError::file("io_error", format!("stdin: {e}")))?;
@@ -543,7 +604,7 @@ async fn push_stdin(dialer: &Dialer, remote: &str, opts: &PushOptions) -> Result
         }
         hasher.update(&buf[..n]);
         total += n as u64;
-        write_frame(&mut s.send, &Frame::with_payload(json!({"t": "data"}), buf[..n].to_vec())).await.map_err(|e| TransferError::Transport(e.to_string()))?;
+        write_frame_parts(&mut s.send, &data, &buf[..n]).await.map_err(|e| TransferError::Transport(e.to_string()))?;
     }
     let digest = hex(hasher.finalize().as_slice());
     write_frame(&mut s.send, &Frame::new(json!({"t": "eof", "size": total, "sha256": digest}))).await.map_err(|e| TransferError::Transport(e.to_string()))?;
@@ -577,6 +638,86 @@ fn part_path(dest: &Path, id: &str) -> PathBuf {
     dest.with_file_name(format!(".{name}.azula-{short}.part"))
 }
 
+/// The steps that put a finished part in place, so tests can watch each one
+/// happen and make it fail.
+pub(super) trait CommitFs: Send + Sync {
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()>;
+    fn rename(&self, part: &Path, dest: &Path) -> std::io::Result<()>;
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()>;
+}
+
+pub(super) struct OsFs;
+
+impl CommitFs for OsFs {
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        let synced = file.sync_all();
+        // On macOS that was F_FULLFSYNC, which some network volumes refuse; a
+        // plain fsync is then the most they offer.
+        #[cfg(target_vendor = "apple")]
+        let synced = match synced {
+            Err(e) if sync_unsupported(&e) => {
+                use std::os::fd::AsRawFd;
+                match unsafe { libc::fsync(file.as_raw_fd()) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            }
+            r => r,
+        };
+        match synced {
+            Err(e) if sync_unsupported(&e) => Ok(()),
+            r => r,
+        }
+    }
+
+    fn rename(&self, part: &Path, dest: &Path) -> std::io::Result<()> {
+        std::fs::rename(part, dest)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        match fsync_dir(dir) {
+            // A directory we may write but not read cannot be opened to sync it.
+            Err(e) if sync_unsupported(&e) || e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+            r => r,
+        }
+    }
+}
+
+/// Does `e` say that the filesystem cannot sync, rather than that a sync failed?
+/// The destination is wherever the user pointed us, so that must not fail a pull.
+#[cfg(unix)]
+fn sync_unsupported(e: &std::io::Error) -> bool {
+    e.raw_os_error().is_some_and(|n| [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS, libc::ENOTTY].contains(&n))
+}
+
+#[cfg(not(unix))]
+fn sync_unsupported(_: &std::io::Error) -> bool {
+    false
+}
+
+/// Put a complete, verified part in place so that it survives a crash, in the
+/// order the worker uses for `put` (`vm/guest/src/files.rs`): mode, sync the
+/// file, rename it, sync the directory.
+pub(super) async fn commit_part(mut file: tokio::fs::File, part: &Path, dest: &Path, mode: u32, fs: Arc<dyn CommitFs>) -> Result<(), TransferError> {
+    fn io_error(what: String) -> impl FnOnce(std::io::Error) -> TransferError {
+        move |e| TransferError::file("io_error", format!("{what}: {e}"))
+    }
+    // tokio writes behind our back: only this reports whether the last write worked.
+    file.flush().await.map_err(io_error(part.display().to_string()))?;
+    let file = file.into_std().await;
+    let (part, dest) = (part.to_path_buf(), dest.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        set_file_mode(&part, mode);
+        fs.sync_file(&file).map_err(io_error(format!("syncing {}", part.display())))?;
+        drop(file);
+        fs.rename(&part, &dest).map_err(io_error(format!("renaming into {}", dest.display())))?;
+        let dir = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        fs.sync_dir(dir).map_err(io_error(format!("{} is complete, but syncing its directory failed", dest.display())))
+    })
+    .await
+    .unwrap_or_else(|e| Err(TransferError::file("io_error", e.to_string())))
+}
+
 /// Copy `remote` (a file in the VM) to `local` (or stdout, for `-`).
 pub async fn pull(
     dialer: &Dialer,
@@ -587,8 +728,20 @@ pub async fn pull(
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Transfer, TransferError> {
     if local == "-" {
-        return pull_stdout(dialer, remote, opts).await;
+        return pull_to(dialer, remote, opts, &mut tokio::io::stdout()).await;
     }
+    pull_file(dialer, store, remote, local, opts, progress, Arc::new(OsFs)).await
+}
+
+pub(super) async fn pull_file(
+    dialer: &Dialer,
+    store: &TransferStore,
+    remote: &str,
+    local: &str,
+    opts: &PullOptions,
+    progress: &mut dyn FnMut(u64, u64),
+    fs: Arc<dyn CommitFs>,
+) -> Result<Transfer, TransferError> {
     let name = basename(remote).ok_or_else(|| TransferError::file("not_a_file", "the remote path does not name a file"))?;
     let mut dest = PathBuf::from(local);
     if local.ends_with('/') || dest.is_dir() {
@@ -626,7 +779,7 @@ pub async fn pull(
             None => (uuid::Uuid::new_v4().to_string(), None, 0),
         };
         let part = part_path(&dest, &id);
-        let step = pull_once(&mut session, &vm, remote, &dest, &part, &id, etag.as_deref(), offset, store, &key, dialer, &mut tracked, &mut first_offset).await;
+        let step = pull_once(&mut session, &vm, remote, &dest, &part, &id, etag.as_deref(), offset, store, &key, dialer, &mut tracked, &mut first_offset, &fs).await;
         session.conn.close(0u32.into(), b"done");
         match step {
             PullStep::Done(mut t) => {
@@ -684,6 +837,7 @@ async fn pull_once(
     dialer: &Dialer,
     progress: &mut dyn FnMut(u64, u64),
     first_offset: &mut Option<u64>,
+    fs: &Arc<dyn CommitFs>,
 ) -> PullStep {
     let req = Frame::new(json!({"t": "get", "vm": vm, "start": true, "path": remote, "offset": offset, "etag": etag}));
     if let Err(e) = write_frame(&mut s.send, &req).await {
@@ -746,17 +900,14 @@ async fn pull_once(
                 }
             }
             "get_end" => {
-                let _ = file.flush().await;
-                drop(file);
                 let want_size = f.header.get("size").and_then(Value::as_u64).unwrap_or(size);
                 let want_sha = f.str_field("sha256").unwrap_or("").to_owned();
                 let digest = hex(hasher.finalize().as_slice());
                 if got != want_size || digest != want_sha {
                     return PullStep::Restart(TransferError::file("digest_mismatch", format!("downloaded {got} bytes with sha256 {digest}, the host reports {want_size} bytes with {want_sha}")));
                 }
-                set_file_mode(part, mode);
-                if let Err(e) = std::fs::rename(part, dest) {
-                    return PullStep::Fail(TransferError::file("io_error", format!("renaming into {}: {e}", dest.display())));
+                if let Err(e) = commit_part(file, part, dest, mode, fs.clone()).await {
+                    return PullStep::Fail(e);
                 }
                 return PullStep::Done(Transfer { path: dest.display().to_string(), size: got, sha256: digest, resumed_from: 0 });
             }
@@ -766,8 +917,12 @@ async fn pull_once(
     }
 }
 
-/// `pull REMOTE -`: stream to stdout, single attempt (not resumable).
-async fn pull_stdout(dialer: &Dialer, remote: &str, opts: &PullOptions) -> Result<Transfer, TransferError> {
+/// `pull REMOTE -`: stream to `out` (stdout), single attempt (not resumable).
+pub(super) async fn pull_to<W: AsyncWrite + Unpin>(dialer: &Dialer, remote: &str, opts: &PullOptions, out: &mut W) -> Result<Transfer, TransferError> {
+    fn failed(e: std::io::Error) -> TransferError {
+        super::out::exit_on_broken_pipe(&e);
+        TransferError::file("io_error", format!("stdout: {e}"))
+    }
     let mut s = dialer.session().await?;
     let vm = s.resolve_vm(opts.vm.as_deref());
     let req = Frame::new(json!({"t": "get", "vm": vm, "start": true, "path": remote, "offset": 0, "etag": null}));
@@ -776,22 +931,19 @@ async fn pull_stdout(dialer: &Dialer, remote: &str, opts: &PullOptions) -> Resul
     if meta.t() != "get_meta" {
         return Err(TransferError::from_frame(&meta));
     }
-    let mut out = tokio::io::stdout();
     let mut hasher = Sha256::new();
     let mut got = 0u64;
     loop {
         let f = read_reply(&mut s).await.map_err(TransferError::Transport)?;
         match f.t() {
             "data" => {
-                if let Err(e) = out.write_all(&f.payload).await {
-                    super::out::exit_on_broken_pipe(&e);
-                    return Err(TransferError::file("io_error", format!("stdout: {e}")));
-                }
+                out.write_all(&f.payload).await.map_err(failed)?;
                 hasher.update(&f.payload);
                 got += f.payload.len() as u64;
             }
             "get_end" => {
-                let _ = out.flush().await;
+                // As with a file, this is where a failed last write shows up.
+                out.flush().await.map_err(failed)?;
                 let digest = hex(hasher.finalize().as_slice());
                 if digest != f.str_field("sha256").unwrap_or("") {
                     return Err(TransferError::file("digest_mismatch", "the streamed bytes do not match the host's digest"));
@@ -927,6 +1079,114 @@ mod tests {
         assert_eq!(basename("dir/"), Some("dir"));
         assert_eq!(basename("/"), None);
         assert_eq!(basename(".."), None);
+    }
+
+    /// Sets its flag when dropped: a future that owns one shows it was let go.
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn hash_and_dial_overlap() {
+        // Each waits for the other to have started, which one after the other never ends.
+        let both = tokio::sync::Barrier::new(2);
+        let hash = async {
+            both.wait().await;
+            Ok::<_, ()>("hash")
+        };
+        let dial = async {
+            both.wait().await;
+            "session"
+        };
+        let r = tokio::time::timeout(Duration::from_secs(10), hash_and_dial(hash, dial, HOLD_SESSION, |_| panic!("kept"))).await.expect("the two overlap");
+        assert_eq!(r, Ok(("hash", Some("session"))));
+        // And the hash done first still waits for the dial.
+        let late = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            "session"
+        };
+        assert_eq!(hash_and_dial(async { Ok::<_, ()>("hash") }, late, Duration::ZERO, |_| panic!("kept")).await, Ok(("hash", Some("session"))));
+    }
+
+    #[tokio::test]
+    async fn hash_and_dial_fail_as_if_one_came_after_the_other() {
+        let soon = || tokio::time::sleep(Duration::from_millis(30));
+        let gave_back = std::cell::Cell::new(None);
+        let discard = |d| gave_back.set(Some(d));
+
+        // A hash error is the error, and a dial still under way is dropped with it.
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Dropped(flag.clone());
+        let endless = async move {
+            let _guard = guard;
+            std::future::pending::<Result<&str, &str>>().await
+        };
+        let failed_hash = async {
+            soon().await;
+            Err::<(), _>("unreadable")
+        };
+        assert_eq!(hash_and_dial(failed_hash, endless, HOLD_SESSION, discard).await, Err("unreadable"));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "the dial is not left running");
+        assert_eq!(gave_back.take(), None);
+
+        // It stays the error when the dial came first, whatever that gave; a session goes back.
+        for dialed in [Ok("session"), Err("refused")] {
+            let failed_hash = async {
+                soon().await;
+                Err::<(), _>("unreadable")
+            };
+            assert_eq!(hash_and_dial(failed_hash, async { dialed }, HOLD_SESSION, discard).await, Err("unreadable"));
+            assert_eq!(gave_back.take(), Some(dialed));
+        }
+
+        // A dial error is the error only of a push whose file could be hashed, in either order.
+        let slow_hash = async {
+            soon().await;
+            Ok::<_, &str>("hash")
+        };
+        assert_eq!(hash_and_dial(slow_hash, async { Err::<&str, _>("refused") }, HOLD_SESSION, discard).await, Ok(("hash", Some(Err("refused")))));
+        let slow_dial = async {
+            soon().await;
+            Err::<&str, _>("refused")
+        };
+        assert_eq!(hash_and_dial(async { Ok::<_, &str>("hash") }, slow_dial, HOLD_SESSION, discard).await, Ok(("hash", Some(Err("refused")))));
+        assert_eq!(gave_back.take(), None);
+    }
+
+    #[tokio::test]
+    async fn a_session_is_not_held_for_longer_than_the_broker_would() {
+        assert!(HOLD_SESSION > Duration::ZERO && HOLD_SESSION < FRAME_TIMEOUT);
+        let gave_back = std::cell::Cell::new(None);
+        let back_before_the_hash_ended = std::cell::Cell::new(false);
+        let hash = async {
+            while gave_back.get().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            back_before_the_hash_ended.set(true);
+            Ok::<_, ()>("hash")
+        };
+        let r = hash_and_dial(hash, async { "session" }, Duration::from_millis(40), |d| gave_back.set(Some(d)));
+        let r = tokio::time::timeout(Duration::from_secs(10), r).await.expect("the session is given back while the hash goes on");
+        assert_eq!(r, Ok(("hash", None)), "so the caller dials again");
+        assert_eq!(gave_back.get(), Some("session"));
+        assert!(back_before_the_hash_ended.get());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_filesystems_that_cannot_sync_are_excused() {
+        let os = std::io::Error::from_raw_os_error;
+        for e in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS, libc::ENOTTY] {
+            assert!(sync_unsupported(&os(e)), "{e}");
+        }
+        for e in [libc::EIO, libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EBADF, libc::ENOENT, libc::EACCES] {
+            assert!(!sync_unsupported(&os(e)), "{e}");
+        }
+        assert!(!sync_unsupported(&std::io::Error::other("not from the OS")));
     }
 
     #[test]

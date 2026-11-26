@@ -73,26 +73,44 @@ impl Frame {
 
     /// Wire bytes of this frame.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        let h = serde_json::to_vec(&self.header).map_err(|e| FrameError::Protocol(e.to_string()))?;
-        if h.is_empty() || h.len() > MAX_HEADER {
-            return Err(FrameError::Protocol("header length out of range".into()));
-        }
-        if self.payload.len() > MAX_PAYLOAD {
-            return Err(FrameError::Protocol("payload length out of range".into()));
-        }
-        let mut out = Vec::with_capacity(8 + h.len() + self.payload.len());
-        out.extend_from_slice(&(h.len() as u32).to_be_bytes());
-        out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
-        out.extend_from_slice(&h);
+        let mut out = encode_head(&self.header, self.payload.len(), self.payload.len())?;
         out.extend_from_slice(&self.payload);
         Ok(out)
     }
+}
+
+/// Everything before the payload: both lengths and the header. Checks both
+/// limits. `spare` is room to leave for whatever the caller appends.
+fn encode_head(header: &Map<String, Value>, payload_len: usize, spare: usize) -> Result<Vec<u8>, FrameError> {
+    let h = serde_json::to_vec(header).map_err(|e| FrameError::Protocol(e.to_string()))?;
+    if h.is_empty() || h.len() > MAX_HEADER {
+        return Err(FrameError::Protocol("header length out of range".into()));
+    }
+    if payload_len > MAX_PAYLOAD {
+        return Err(FrameError::Protocol("payload length out of range".into()));
+    }
+    let mut out = Vec::with_capacity(8 + h.len() + spare);
+    out.extend_from_slice(&(h.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    out.extend_from_slice(&h);
+    Ok(out)
 }
 
 /// Write one frame (a single `write_all`, so frames never interleave) and flush.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<(), FrameError> {
     let buf = frame.encode()?;
     w.write_all(&buf).await.map_err(FrameError::Io)?;
+    w.flush().await.map_err(FrameError::Io)
+}
+
+/// [`write_frame`] for a payload the caller keeps: the same bytes on the wire,
+/// with `payload` handed to the writer as it is rather than copied into an
+/// encoded frame first. That takes two writes, which the exclusive `w` keeps
+/// together; if a limit is exceeded, neither happens.
+pub async fn write_frame_parts<W: AsyncWrite + Unpin>(w: &mut W, header: &Map<String, Value>, payload: &[u8]) -> Result<(), FrameError> {
+    let head = encode_head(header, payload.len(), 0)?;
+    w.write_all(&head).await.map_err(FrameError::Io)?;
+    w.write_all(payload).await.map_err(FrameError::Io)?;
     w.flush().await.map_err(FrameError::Io)
 }
 
@@ -220,5 +238,143 @@ mod tests {
             assert_eq!(f.payload, vec![i; 100]);
         }
         w.await.unwrap();
+    }
+
+    // --- write_frame_parts ---------------------------------------------------
+
+    /// A writer that takes at most `step` bytes at a time, is not ready every
+    /// other call, and can stop: after `limit` bytes it fails, or accepts nothing.
+    struct Choppy {
+        out: Vec<u8>,
+        step: usize,
+        limit: usize,
+        fail: bool,
+        ready: bool,
+        /// Address of each byte run it was handed (only the part it took).
+        taken: Vec<(usize, usize)>,
+    }
+
+    impl Choppy {
+        fn new(step: usize) -> Self {
+            Choppy { out: Vec::new(), step, limit: usize::MAX, fail: false, ready: false, taken: Vec::new() }
+        }
+    }
+
+    impl AsyncWrite for Choppy {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+            self.ready = !self.ready;
+            if !self.ready {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            let n = buf.len().min(self.step).min(self.limit - self.out.len());
+            if n == 0 && self.fail {
+                return std::task::Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            }
+            self.out.extend_from_slice(&buf[..n]);
+            self.taken.push((buf.as_ptr() as usize, n));
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// xorshift64: random enough for headers and sizes, and the same every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        fn header(&mut self) -> Map<String, Value> {
+            let mut m = Map::new();
+            m.insert("t".into(), json!(["data", "stdin", "eof", "x"][self.below(4)]));
+            for i in 0..self.below(6) {
+                let v = match self.below(5) {
+                    0 => json!(self.0),
+                    1 => json!("\u{1F980} \"quoted\"\n\u{0}".repeat(self.below(4))),
+                    2 => json!([null, true, {"k": self.below(9)}]),
+                    3 => json!("y".repeat(self.below(2000))),
+                    _ => Value::Null,
+                };
+                m.insert(format!("k{i}"), v);
+            }
+            m
+        }
+    }
+
+    #[tokio::test]
+    async fn parts_put_the_same_bytes_on_the_wire_as_encode() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let fixed = [0, 1, 2, 511, 512, 513, 65_536, 512 * 1024, MAX_PAYLOAD - 1, MAX_PAYLOAD];
+        for i in 0..120 {
+            let len = fixed.get(i).copied().unwrap_or_else(|| rng.below(20_000));
+            let payload: Vec<u8> = (0..len).map(|j| (j.wrapping_mul(131) ^ i) as u8).collect();
+            let header = rng.header();
+            let want = Frame { header: header.clone(), payload: payload.clone() }.encode().unwrap();
+            // One byte at a time for small frames, otherwise odd sizes that straddle the header/payload seam.
+            let step = if len < 600 { 1 + rng.below(5) } else { 1 + rng.below(9_000) };
+            for step in [step, usize::MAX] {
+                let mut w = Choppy::new(step);
+                write_frame_parts(&mut w, &header, &payload).await.unwrap();
+                assert!(w.out == want, "frame {i}: {len} byte payload, {step} bytes per write");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parts_hand_over_the_payload_itself_not_a_copy() {
+        let payload = vec![7u8; 512 * 1024];
+        let header = Frame::of_type("data").header;
+        let own = payload.as_ptr() as usize..payload.as_ptr() as usize + payload.len();
+        let from_payload = |w: &Choppy| w.taken.iter().filter(|(at, n)| own.contains(at) && at + n <= own.end).map(|(_, n)| n).sum::<usize>();
+
+        let mut w = Choppy::new(100_000);
+        write_frame_parts(&mut w, &header, &payload).await.unwrap();
+        assert_eq!(from_payload(&w), payload.len(), "every payload byte comes from the caller's buffer");
+
+        // What this replaces: the writer only ever saw the encoded copy.
+        let mut w = Choppy::new(100_000);
+        write_frame(&mut w, &Frame { header, payload: payload.clone() }).await.unwrap();
+        assert_eq!(from_payload(&w), 0);
+    }
+
+    #[tokio::test]
+    async fn parts_refuse_what_encode_refuses_before_writing_anything() {
+        let data = Frame::of_type("data").header;
+        let mut huge = data.clone();
+        huge.insert("pad".into(), json!("x".repeat(MAX_HEADER)));
+        for (header, payload) in [(&data, vec![0; MAX_PAYLOAD + 1]), (&huge, vec![0; 3])] {
+            let mut w = Choppy::new(usize::MAX);
+            assert!(matches!(write_frame_parts(&mut w, header, &payload).await, Err(FrameError::Protocol(_))));
+            assert!(w.out.is_empty(), "a refused frame must not leave a partial one on the stream");
+        }
+    }
+
+    #[tokio::test]
+    async fn parts_report_a_writer_that_fails_or_stops() {
+        let header = Frame::of_type("data").header;
+        let payload = vec![3u8; 100];
+        let whole = Frame { header: header.clone(), payload: payload.clone() }.encode().unwrap();
+        let head = whole.len() - payload.len();
+        // In the header, on the seam, one byte into the payload, one byte short of the end.
+        for limit in [0, 5, head - 1, head, head + 1, whole.len() - 1] {
+            for (fail, kind) in [(true, io::ErrorKind::ConnectionReset), (false, io::ErrorKind::WriteZero)] {
+                let mut w = Choppy { limit, fail, ..Choppy::new(7) };
+                match write_frame_parts(&mut w, &header, &payload).await {
+                    Err(FrameError::Io(e)) => assert_eq!(e.kind(), kind, "stopped at {limit}"),
+                    other => panic!("stopped at {limit}: {other:?}"),
+                }
+                assert_eq!(w.out, whole[..limit]);
+            }
+        }
     }
 }

@@ -5,7 +5,7 @@
 //! internet.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,12 +20,12 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Notify};
 
-use super::broker::Broker;
+use super::broker::{Broker, FRAME_TIMEOUT};
 use super::client::{self, AttachRequest, Dialer, Event, ExecRequest, Failure, Fault, JobRef, Outcome, Policy, Start};
 use super::frame::{read_frame, write_frame, Frame};
 use super::grants::{GrantStore, MintOptions, Token, OP_ADMIN, OP_EXEC, OP_VM};
 use super::local::{AttachOpts, LocalBackend};
-use super::transfer::{self, PullOptions, PushOptions, TransferError, TransferStore};
+use super::transfer::{self, CommitFs, OsFs, PullOptions, PushOptions, TransferError, TransferStore};
 use super::vm::{VmBackend, VmError, VmInfo, VmState};
 use super::ALPN;
 
@@ -1387,6 +1387,364 @@ async fn pull_resumes_and_restarts_when_the_remote_file_changed() {
     h.shutdown().await;
 }
 
+/// The real commit steps, logged, with one of them failing on demand.
+#[derive(Default)]
+struct Watched {
+    dest: PathBuf,
+    fail: Option<&'static str>,
+    /// Each step, and whether the destination existed when it came.
+    log: Mutex<Vec<(&'static str, bool)>>,
+    /// Size and mode of the file handed to `sync_file`.
+    synced: Mutex<Option<(u64, u32)>>,
+    synced_dir: Mutex<Option<PathBuf>>,
+}
+
+impl Watched {
+    fn step(&self, name: &'static str, real: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        self.log.lock().unwrap().push((name, self.dest.exists()));
+        if self.fail == Some(name) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        real()
+    }
+}
+
+impl CommitFs for Watched {
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let m = file.metadata()?;
+        *self.synced.lock().unwrap() = Some((m.len(), m.permissions().mode() & 0o777));
+        self.step("sync_file", || OsFs.sync_file(file))
+    }
+    fn rename(&self, part: &Path, dest: &Path) -> std::io::Result<()> {
+        self.step("rename", || OsFs.rename(part, dest))
+    }
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        *self.synced_dir.lock().unwrap() = Some(dir.to_owned());
+        self.step("sync_dir", || OsFs.sync_dir(dir))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_is_synced_then_renamed_then_its_directory_is_synced() {
+    let h = Harness::new("pullsync").await;
+    h.fake.set_running("a");
+    let t = h.mint(&[OP_EXEC], &["a"]);
+    let dir = tmpdir("pullsync");
+    let store = TransferStore::new(dir.join("transfers.json"));
+    let data = pattern(900_000);
+    h.fake.files.lock().unwrap().insert("art.bin".into(), (data.clone(), 1));
+    let dest = dir.join("art.bin");
+    let opts = PullOptions { policy: fast(), ..Default::default() };
+
+    // Dropped and resumed on the way, like any real one.
+    let fs = Arc::new(Watched { dest: dest.clone(), ..Default::default() });
+    let d = h.dialer(&t).with_fault(Some(Fault::drop_after(200_000)));
+    let res = transfer::pull_file(&d, &store, "art.bin", dest.to_str().unwrap(), &opts, &mut |_, _| {}, fs.clone()).await.unwrap();
+    assert!(res.resumed_from > 0);
+    assert_eq!(*fs.log.lock().unwrap(), [("sync_file", false), ("rename", false), ("sync_dir", true)]);
+    assert_eq!(*fs.synced.lock().unwrap(), Some((data.len() as u64, 0o640)), "whole, and with its mode, before it is synced");
+    assert_eq!(fs.synced_dir.lock().unwrap().as_deref(), Some(dir.as_path()));
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+    std::fs::remove_file(&dest).unwrap();
+
+    // Any step that fails fails the pull, and leaves nothing half-done to find later.
+    for step in ["sync_file", "rename", "sync_dir"] {
+        let fs = Arc::new(Watched { dest: dest.clone(), fail: Some(step), ..Default::default() });
+        let err = transfer::pull_file(&h.dialer(&t), &store, "art.bin", dest.to_str().unwrap(), &opts, &mut |_, _| {}, fs.clone()).await.unwrap_err();
+        assert!(matches!(&err, TransferError::File { code, .. } if code == "io_error"), "{step}: {err:?}");
+        assert_eq!(err.exit_code(), 1, "{step}");
+        assert_eq!(fs.log.lock().unwrap().last().unwrap().0, step, "nothing after the step that failed");
+        assert_eq!(dest.exists(), step == "sync_dir", "{step}: the destination appears by the rename only");
+        assert!(store.is_empty(), "{step}");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".part")), "{step}: no part file left");
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pull_whose_last_write_failed_is_not_put_in_place() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tmpdir("lastwrite");
+    let (part, dest) = (dir.join(".x.part"), dir.join("x"));
+    std::fs::write(&part, b"").unwrap();
+    // tokio accepts a write and does it later, so a handle that cannot write
+    // stands in for a disk that filled up on the last one.
+    let mut f = tokio::fs::File::open(&part).await.unwrap();
+    f.write_all(b"tail").await.expect("accepted for now");
+    let err = transfer::commit_part(f, &part, &dest, 0o600, Arc::new(OsFs)).await.unwrap_err();
+    assert!(matches!(&err, TransferError::File { code, .. } if code == "io_error"), "{err:?}");
+    assert!(!dest.exists(), "a file that is not all there must not get the name");
+}
+
+#[tokio::test]
+async fn a_pull_into_the_current_directory_syncs_it() {
+    struct Inert(Mutex<Vec<PathBuf>>);
+    impl CommitFs for Inert {
+        fn sync_file(&self, _: &std::fs::File) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn rename(&self, _: &Path, _: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(dir.to_owned());
+            Ok(())
+        }
+    }
+    let dir = tmpdir("cwd");
+    for (dest, want) in [("plain.txt", "."), ("sub/x.txt", "sub"), ("/abs/x.txt", "/abs")] {
+        let f = tokio::fs::File::create(dir.join("part")).await.unwrap();
+        let fs = Arc::new(Inert(Mutex::default()));
+        transfer::commit_part(f, &dir.join("part"), Path::new(dest), 0o600, fs.clone()).await.unwrap();
+        assert_eq!(*fs.0.lock().unwrap(), [PathBuf::from(want)], "{dest}");
+    }
+}
+
+#[test]
+fn a_directory_that_cannot_be_opened_does_not_fail_a_finished_pull() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir("dropbox");
+    let drop_box = dir.join("write-only");
+    std::fs::create_dir(&drop_box).unwrap();
+    std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o300)).unwrap();
+    OsFs.sync_dir(&drop_box).unwrap();
+    std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o700)).unwrap();
+    OsFs.sync_dir(&dir).unwrap();
+    assert!(OsFs.sync_dir(&dir.join("missing")).is_err(), "other errors are reported");
+}
+
+/// A stdout that takes everything and then cannot flush it, if so asked.
+struct Out {
+    data: Vec<u8>,
+    flushed: bool,
+    flush_error: Option<std::io::ErrorKind>,
+}
+
+impl tokio::io::AsyncWrite for Out {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        self.data.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        self.flushed = true;
+        std::task::Poll::Ready(self.flush_error.map_or(Ok(()), |k| Err(k.into())))
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_to_stdout_reports_output_that_could_not_be_flushed() {
+    let h = Harness::new("pullout").await;
+    h.fake.set_running("a");
+    let t = h.mint(&[OP_EXEC], &["a"]);
+    let data = pattern(150_000);
+    h.fake.files.lock().unwrap().insert("art.bin".into(), (data.clone(), 1));
+
+    let mut out = Out { data: Vec::new(), flushed: false, flush_error: None };
+    let res = transfer::pull_to(&h.dialer(&t), "art.bin", &PullOptions::default(), &mut out).await.unwrap();
+    assert_eq!((res.size, res.sha256, res.path.as_str()), (data.len() as u64, sha_hex(&data), "-"));
+    assert!(out.data == data && out.flushed);
+
+    let mut full = Out { data: Vec::new(), flushed: false, flush_error: Some(std::io::ErrorKind::StorageFull) };
+    let err = transfer::pull_to(&h.dialer(&t), "art.bin", &PullOptions::default(), &mut full).await.unwrap_err();
+    assert!(matches!(&err, TransferError::File { code, msg } if code == "io_error" && msg.starts_with("stdout: ")), "{err:?}");
+    h.shutdown().await;
+}
+
+// --- push: hashing while dialing --------------------------------------------------------------
+
+/// A broker that answers `hello` and refuses whatever is asked next, counting
+/// its connections.
+#[derive(Default)]
+struct Stub {
+    unauthorized: bool,
+    welcomed: AtomicUsize,
+    refused: AtomicUsize,
+    open: AtomicUsize,
+    requests: Mutex<Vec<String>>,
+    /// The reasons its connections were closed with.
+    closed: Mutex<Vec<String>>,
+}
+
+impl Stub {
+    /// Serve `self`, and a dialer for it.
+    async fn serve(self) -> (Arc<Stub>, Dialer) {
+        let stub = Arc::new(self);
+        let ep = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+        let token = Token { host: ep.id().to_string(), relay: String::new(), grant: "g".into(), secret: "s".into() };
+        let dialer = Dialer::new(Endpoint::bind(presets::Minimal).await.unwrap(), ep.addr(), token);
+        let me = stub.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let me = me.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    me.open.fetch_add(1, SeqCst);
+                    let streams = tokio::select! { s = conn.accept_bi() => s.ok(), _ = conn.closed() => None };
+                    if let Some((mut send, mut recv)) = streams {
+                        me.answer(&mut send, &mut recv).await;
+                    }
+                    let why = conn.closed().await;
+                    me.closed.lock().unwrap().push(why.to_string());
+                    me.open.fetch_sub(1, SeqCst);
+                });
+            }
+        });
+        (stub, dialer)
+    }
+
+    async fn answer(&self, send: &mut iroh::endpoint::SendStream, recv: &mut iroh::endpoint::RecvStream) {
+        if !matches!(read_frame(recv).await, Ok(Some(f)) if f.t() == "hello") {
+            return;
+        }
+        if self.unauthorized {
+            self.refused.fetch_add(1, SeqCst);
+            let _ = write_frame(send, &Frame::new(json!({"t":"error","code":"unauthorized","msg":"unauthorized"}))).await;
+            return;
+        }
+        let _ = write_frame(send, &Frame::new(json!({"t":"welcome","host":"stub","vms":["a"]}))).await;
+        self.welcomed.fetch_add(1, SeqCst);
+        if let Ok(Some(f)) = read_frame(recv).await {
+            self.requests.lock().unwrap().push(f.t().to_owned());
+            let _ = write_frame(send, &Frame::new(json!({"t":"error","code":"exists","msg":"exists"}))).await;
+        }
+    }
+
+    /// Every connection it had is closed, and none follows.
+    async fn settles(&self) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        eventually("the connections to close", || self.open.load(SeqCst) == 0).await;
+    }
+}
+
+/// A file whose hash takes until [`Fifo::end`]: reading a FIFO waits for a writer.
+struct Fifo(PathBuf);
+
+impl Fifo {
+    fn new(path: PathBuf) -> Self {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        Fifo(path)
+    }
+
+    async fn end(&self) {
+        let p = self.0.clone();
+        tokio::task::spawn_blocking(move || drop(std::fs::OpenOptions::new().write(true).open(p).unwrap())).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_dials_while_it_hashes() {
+    let (stub, dialer) = Stub::default().serve().await;
+    let dir = tmpdir("overlap");
+    let src = Fifo::new(dir.join("src"));
+    let store = TransferStore::new(dir.join("transfers.json"));
+    let path = src.0.to_str().unwrap();
+    let opts = PushOptions::default();
+    let mut ignore = |_, _| {};
+    let push = transfer::push(&dialer, &store, path, "x", &opts, &mut ignore);
+    let watch = async {
+        let mut welcomed = false;
+        for _ in 0..200 {
+            welcomed = stub.welcomed.load(SeqCst) == 1;
+            if welcomed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(stub.requests.lock().unwrap().is_empty(), "nothing is asked for before the hash is known");
+        src.end().await;
+        welcomed
+    };
+    let (pushed, welcomed) = tokio::join!(push, watch);
+    let err = pushed.unwrap_err();
+    assert!(welcomed, "the session was up before the hash was done");
+    assert!(matches!(&err, TransferError::File { code, .. } if code == "exists"), "{err:?}");
+    assert_eq!(*stub.requests.lock().unwrap(), ["put"], "the session that was ready is the one that was used");
+    assert_eq!(stub.welcomed.load(SeqCst), 1);
+    stub.settles().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_fails_as_it_did_when_it_hashed_first_and_leaves_no_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir("pusherr");
+    let store = TransferStore::new(dir.join("transfers.json"));
+    let good = dir.join("good");
+    std::fs::write(&good, pattern(300_000)).unwrap();
+    let secret = dir.join("secret");
+    std::fs::write(&secret, b"x").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let root = std::fs::File::open(&secret).is_ok();
+    let opts = PushOptions::default();
+
+    // The file cannot be read: that, whether or not the broker would have had us.
+    for unauthorized in [false, true] {
+        let (stub, d) = Stub { unauthorized, ..Default::default() }.serve().await;
+        let err = transfer::push(&d, &store, secret.to_str().unwrap(), "x", &opts, &mut |_, _| {}).await.unwrap_err();
+        if !root {
+            assert!(matches!(&err, TransferError::File { code, msg } if code == "io_error" && msg.contains("secret")), "{err:?}");
+        }
+        stub.settles().await;
+        assert!(root || stub.requests.lock().unwrap().is_empty());
+    }
+
+    // It can, and the broker refuses, or is not there.
+    let (stub, d) = Stub { unauthorized: true, ..Default::default() }.serve().await;
+    let err = transfer::push(&d, &store, good.to_str().unwrap(), "x", &opts, &mut |_, _| {}).await.unwrap_err();
+    assert_eq!(err, TransferError::Broker { code: "unauthorized".into(), msg: "unauthorized".into() });
+    assert_eq!(err.exit_code(), 125);
+    assert_eq!(stub.refused.load(SeqCst), 1, "asked once");
+    stub.settles().await;
+    d.ep.close().await;
+    let err = transfer::push(&d, &store, good.to_str().unwrap(), "x", &opts, &mut |_, _| {}).await.unwrap_err();
+    assert!(matches!(err, TransferError::Transport(_)), "{err:?}");
+    assert!(store.is_empty(), "no transfer was begun");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hash_that_fails_after_the_dial_closes_the_session() {
+    let (stub, d) = Stub::default().serve().await;
+    let hash = async {
+        eventually("welcome", || stub.welcomed.load(SeqCst) == 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Err::<(), _>("unreadable")
+    };
+    let r = transfer::hash_and_dial(hash, d.session(), Duration::from_secs(5), transfer::hang_up).await;
+    assert!(matches!(r, Err("unreadable")));
+    stub.settles().await;
+    let closed = stub.closed.lock().unwrap().clone();
+    assert!(closed.len() == 1 && closed[0].contains("done"), "closed, rather than left to time out: {closed:?}");
+}
+
+/// The real broker hangs up 10 s after `welcome`, so this takes that long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "takes 12 s; run when changing how a push hashes or dials"]
+async fn a_hash_that_outlasts_the_brokers_patience_does_not_fail_the_push() {
+    let h = Harness::new("slowhash").await;
+    h.fake.set_running("a");
+    let t = h.mint(&[OP_EXEC], &["a"]);
+    let dir = tmpdir("slowhash");
+    let src = Fifo::new(dir.join("src"));
+    h.fake.files.lock().unwrap().insert("x".into(), (Vec::new(), 1));
+    let store = TransferStore::new(dir.join("transfers.json"));
+    let opts = PushOptions { no_clobber: true, policy: no_reconnect(), ..Default::default() };
+    let d = h.dialer(&t);
+    let mut ignore = |_, _| {};
+    let push = transfer::push(&d, &store, src.0.to_str().unwrap(), "x", &opts, &mut ignore);
+    let wait = async {
+        tokio::time::sleep(FRAME_TIMEOUT + Duration::from_secs(2)).await;
+        src.end().await;
+    };
+    // Getting as far as the worker's own answer is the point.
+    let err = tokio::join!(push, wait).0.unwrap_err();
+    assert!(matches!(&err, TransferError::File { code, .. } if code == "exists"), "{err:?}");
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_trees_travel_as_tar_and_pull_extracts_defensively() {
     let h = Harness::new("tree").await;
@@ -1400,8 +1758,9 @@ async fn directory_trees_travel_as_tar_and_pull_extracts_defensively() {
 
     // push -r: the guest's `tar -x` receives a real archive on stdin.
     let res = transfer::push_tree(&h.dialer(&t), &src, "/work/src", None, fast()).await.unwrap();
-    assert!(res.entries >= 3);
     let received = h.fake.last_stdin.lock().unwrap().clone();
+    assert_eq!(res.entries, 4, "`./`, a.txt, sub and sub/b.txt");
+    assert_eq!(res.entries, tar::Archive::new(&received[..]).entries().unwrap().count(), "the count is of the archive that was sent");
     let out = dir.join("roundtrip");
     super::tarx::extract_safe(&received[..], &out).unwrap();
     assert_eq!(std::fs::read(out.join("sub/b.txt")).unwrap(), b"beta");
@@ -1441,4 +1800,74 @@ async fn directory_trees_travel_as_tar_and_pull_extracts_defensively() {
     assert!(err.message().contains("unsafe"), "{err:?}");
     assert!(!dir.join("victim").join("escaped.txt").exists(), "nothing written outside LOCAL");
     h.shutdown().await;
+}
+
+// --- measurements ----------------------------------------------------------------------------
+
+/// What a client that kept its endpoint between requests would save: each round
+/// times a `ping` as every `azula compute` invocation makes it (bind, reach the
+/// relay, dial, `hello`, request, close), and one over an endpoint that has
+/// served a request before. Both ends are in this process, on n0's real relays.
+///
+/// `cargo test --release --lib bench_retained_endpoint -- --ignored --nocapture`,
+/// with `AZULA_RELAY_ONLY=1` to stay on the relay as from a cloud sandbox.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "measures over the internet, through n0's relays"]
+async fn bench_retained_endpoint() {
+    const ROUNDS: usize = 25;
+    let fake = Fake::new("bench");
+    let dir = tmpdir("bench");
+    let store = GrantStore::new(&dir);
+    let broker = Broker::new(Arc::new(FakeBackend(fake)), store.clone(), "bench".into());
+    let broker_ep = client::bind_client(client::RELAY_TIMEOUT, None).await.unwrap();
+    let router = Router::builder(broker_ep.clone()).accept(ALPN, broker).spawn();
+    let (g, secret) = store.mint(&MintOptions { label: "t".into(), ttl: Duration::from_secs(3600), ops: vec![OP_EXEC.into()], vms: vec!["a".into()] }).unwrap();
+    let relay = broker_ep.addr().relay_urls().next().expect("a home relay").to_string();
+    let token = Token { host: broker_ep.id().to_string(), relay: relay.clone(), grant: g.id, secret };
+    let addr = token.addr().unwrap();
+
+    /// Dial, `hello` and `ping`, each in milliseconds.
+    async fn ask(ep: &Endpoint, addr: &iroh::EndpointAddr, token: &Token) -> [f64; 3] {
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let conn = client::dial(ep, addr.clone(), client::DIAL_TIMEOUT).await.unwrap();
+        let dial = ms(t);
+        let t = Instant::now();
+        let s = client::authenticate(conn, token, client::AUTH_TIMEOUT).await.unwrap();
+        let auth = ms(t);
+        let t = Instant::now();
+        client::request_reply(s, &Frame::of_type("ping"), client::AUTH_TIMEOUT).await.unwrap();
+        [dial, auth, ms(t)]
+    }
+
+    let kept = client::bind_client(client::RELAY_TIMEOUT, client::token_relay(&token)).await.unwrap();
+    ask(&kept, &addr, &token).await;
+    let (mut fresh, mut again) = (Vec::new(), Vec::new());
+    for _ in 0..ROUNDS {
+        let t = Instant::now();
+        let ep = client::bind_client(client::RELAY_TIMEOUT, client::token_relay(&token)).await.unwrap();
+        let bind = t.elapsed().as_secs_f64() * 1e3;
+        let [dial, auth, ping] = ask(&ep, &addr, &token).await;
+        let t = Instant::now();
+        let _ = tokio::time::timeout(Duration::from_secs(3), ep.close()).await;
+        let close = t.elapsed().as_secs_f64() * 1e3;
+        fresh.push(vec![bind, dial, auth, ping, close, bind + dial + auth + ping + close]);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let [dial, auth, ping] = ask(&kept, &addr, &token).await;
+        again.push(vec![dial, auth, ping, dial + auth + ping]);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    println!("relay {relay}, relay only: {}, {ROUNDS} rounds, milliseconds", std::env::var_os("AZULA_RELAY_ONLY").is_some());
+    for (what, names, rows) in [
+        ("fresh endpoint", &["bind+relay", "dial", "hello", "ping", "close", "total"][..], fresh),
+        ("kept endpoint", &["dial", "hello", "ping", "total"][..], again),
+    ] {
+        for (i, name) in names.iter().enumerate() {
+            let mut v: Vec<f64> = rows.iter().map(|r| r[i]).collect();
+            v.sort_by(f64::total_cmp);
+            println!("{what:>15} {name:>10}: median {:7.1}  min {:7.1}  max {:7.1}", v[v.len() / 2], v[0], v[v.len() - 1]);
+        }
+    }
+    kept.close().await;
+    let _ = router.shutdown().await;
 }

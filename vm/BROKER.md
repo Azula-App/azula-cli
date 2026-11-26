@@ -147,7 +147,8 @@ Client verbs (any OS). Token from `--token`, else `AZULA_COMPUTE_TOKEN`. VM: `--
     LOCAL (pull) that ends in `/` or names an existing directory gets the source's basename
     appended. LOCAL may be `-` for stdin/stdout (not resumable).
   - Single files use §2.7/2.8: streaming SHA-256 at both ends, size and digest checked before
-    an atomic rename, mode preserved (push sends the local mode unless `--mode`).
+    an atomic rename (the file synced before it, its directory after), mode preserved (push
+    sends the local mode unless `--mode`).
   - Resume: within one invocation, a dropped transfer resumes from the last acknowledged offset
     (same reconnect window as exec). Across invocations, the client keeps
     `~/.azula/compute/transfers.json` (host, vm, local path, size, mtime, remote path → upload id
